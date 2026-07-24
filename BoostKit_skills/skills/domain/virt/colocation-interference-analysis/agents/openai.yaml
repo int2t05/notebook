@@ -1,0 +1,7 @@
+interface:
+  display_name: "混部微架构干扰分析"
+  short_description: "分析离在线混部微架构干扰"
+  default_prompt: "使用 $colocation-interference-analysis 对比我的纯在线和混部 PMU/topdown 指标，分析可能的混部干扰原因。"
+
+policy:
+  allow_implicit_invocation: true

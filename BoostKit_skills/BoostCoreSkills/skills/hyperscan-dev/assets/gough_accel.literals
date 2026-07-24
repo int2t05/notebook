@@ -1,0 +1,7 @@
+# Gough 触发规则集 — NFA 带辅助加速
+# 条件: grey.allowGough, NFA 适合 Gough 加速
+# Gough 为 NFA 构建 aux acceleration tables
+# 中等规模 NFA, 有明确的字符转移
+# goughcompile.cpp
+1:/https?:\/\/[a-zA-Z0-9]+\.[a-z]+/
+2:/mailto:[a-zA-Z0-9._%+-]+@[a-z]+\.com/

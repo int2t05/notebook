@@ -1,0 +1,104 @@
+{
+  "skill_name": "arm64-arch-reference",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "我在给 ARM64 后端加 BFloat16 点积的 codegen。FEAT_BF16 是从哪个 Armv 版本引入的、可选还是强制？另外 SVE 的 BFDOT（向量形态，非索引）的汇编模板是什么、受哪些 FEAT_* 门控？",
+      "expected_output": "准确从手册表格中给出版本/可选强制/汇编模板/门控特性",
+      "files": [],
+      "assertions": [
+        {
+          "text": "标明 FEAT_BF16 引入版本为 Armv8.2",
+          "check": "Armv8.2"
+        },
+        {
+          "text": "标明 FEAT_BF16 为可选(OPTIONAL)",
+          "check_any": [
+            "可选",
+            "OPTIONAL",
+            "optional"
+          ]
+        },
+        {
+          "text": "给出 BFDOT 向量汇编模板 `BFDOT <Zda>.S, <Zn>.H, <Zm>.H`",
+          "check": "BFDOT <Zda>.S, <Zn>.H, <Zm>.H"
+        },
+        {
+          "text": "列出门控特性 FEAT_BF16 与 FEAT_SVE",
+          "check_all": [
+            "FEAT_BF16",
+            "FEAT_SVE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "prompt": "ARM64 上想用 LSE 原子做无锁加法。LDADD 系列有哪几个内存序变体、基本汇编模板是什么？它属于哪个 feature、最低哪个 Armv 版本？",
+      "expected_output": "准确从手册表格中给出版本/可选强制/汇编模板/门控特性",
+      "files": [],
+      "assertions": [
+        {
+          "text": "LDADD 门控为 FEAT_LSE",
+          "check": "FEAT_LSE"
+        },
+        {
+          "text": "LDADD 引入版本 Armv8.0",
+          "check": "Armv8.0"
+        },
+        {
+          "text": "给出 LDADD 基本汇编模板 `LDADD <Ws>, <Wt>, [<Xn|SP>]`",
+          "check": "LDADD <Ws>, <Wt>, [<Xn|SP>]"
+        },
+        {
+          "text": "列出内存序变体 LDADDA/LDADDAL/LDADDL",
+          "check_all": [
+            "LDADDA",
+            "LDADDAL",
+            "LDADDL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "我打算在 ARM64 用 SVE2 的 MATCH 指令做字符串匹配优化。它需要哪个 FEAT_*？那个特性是从哪个 Armv 版本起的？MATCH 的汇编模板是什么？",
+      "expected_output": "准确从手册表格中给出版本/可选强制/汇编模板/门控特性",
+      "files": [],
+      "assertions": [
+        {
+          "text": "MATCH 门控为 FEAT_SVE2",
+          "check": "FEAT_SVE2"
+        },
+        {
+          "text": "FEAT_SVE2 引入版本 Armv9.0",
+          "check": "Armv9.0"
+        },
+        {
+          "text": "给出 MATCH 汇编模板",
+          "check": "MATCH <Pd>.<T>, <Pg>/Z, <Zn>.<T>, <Zm>.<T>"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "给 ARM64 SME 后端加浮点外积。FMOPA（non-widening，非扩展精度）的汇编模板有哪些、需要哪个 FEAT_*？SME 是哪个 Armv 版本引入的？",
+      "expected_output": "准确从手册表格中给出版本/可选强制/汇编模板/门控特性",
+      "files": [],
+      "assertions": [
+        {
+          "text": "FMOPA 门控含 FEAT_SME",
+          "check": "FEAT_SME"
+        },
+        {
+          "text": "SME 引入版本 Armv9.2",
+          "check": "Armv9.2"
+        },
+        {
+          "text": "给出 FMOPA 非扩展精度单精度汇编模板",
+          "check": "FMOPA <ZAda>.S, <Pn>/M, <Pm>/M, <Zn>.S, <Zm>.S"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+# ROSE_RUNTIME_SINGLE_OUTFIX 触发规则集 — 单 NFA 引擎
+# 条件: isSingleOutfix() → outfixes==1, 无 Rose 角色, 无 SOM, 无 EOD
+# 运行时走 soleOutfixBlockExec → 直接 nfaQueueExec
+# rose_build_bytecode.cpp:352 → pickRuntimeImpl
+1:/foobar/

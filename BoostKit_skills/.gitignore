@@ -1,0 +1,21 @@
+# paper-digest runtime output (default location when running the skill
+# from repo root). Curated reference snapshots belong under docs/ instead.
+paper-digest-output/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Secrets (skill .env files)
+.env
+
+# Other files
+.DS_Store
+**/.DS_Store
+
+__pycache__/
+**/__pycache__/

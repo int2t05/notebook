@@ -1,0 +1,7 @@
+# Shufti 触发规则集 — 字符类范围匹配
+# 条件: 字符类 [range] 模式, 可编译为 shufti 双掩码 (lo/hi)
+# Shufti 用 2×16字节掩码并行匹配字符类
+# shufticompile.cpp
+1:/[0-9a-f][0-9a-f][0-9a-f]/
+2:/[aeiou][aeiou][aeiou]/
+3:/[A-Z][A-Z][A-Z]/

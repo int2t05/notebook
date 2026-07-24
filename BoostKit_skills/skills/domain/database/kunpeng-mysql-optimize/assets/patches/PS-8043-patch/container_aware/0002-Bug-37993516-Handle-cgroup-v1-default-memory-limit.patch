@@ -1,0 +1,117 @@
+From 4a7016807fb19c6baf84df0b07b10688619e2e8e Mon Sep 17 00:00:00 2001
+From: Ramakrishnan Kamalakannan <ramakrishnan.kamalakannan@oracle.com>
+Date: Mon, 2 Jun 2025 08:54:57 +0200
+Subject: [PATCH 2/3] Bug#37993516  Handle cgroup v1 default memory limit
+
+Description:
+  The MySQL Server discovers the amount of physical memory and total
+number of logical CPUs it can access. This is used to calculate the
+default values of its configuration parameters enabling it to auto-tune
+the defaults based on the system.
+  This information may come from the cgroup limits or the system
+hardware. The server discovers the cgroup limits by reading the
+respective config files.
+  In cgroup v1, the memory limit of `LONG_MAX - (LONG_MAX % PAGE_SIZE)`
+is written to the config file by default. In cgroup v2, the string "max"
+is written to the config file by default.
+
+Issue:
+  The APIs used to fetch this information did not account for the
+default memory limits configured by cgroup v1.
+
+Fix:
+  The APIs are modified to report 0 as the memory limit if the default
+memory limit is read from the cgroup config file. It returns 0 to be
+consistent with the design choice of using the value of 0 to indicate no
+limits being set.
+
+Note:
+  The cgroup v2 is not affected as the APIs parse the contents of the
+text into an unsigned integer field. This parse fails when reading the
+string "max", thus reporting no limits being set.
+
+Change-Id: I67fa1a7d06c5a2e9ac5e53d9516f6ac3b037ea66
+(cherry picked from commit 55012cdb34f2a19fb70b1c2485c370e89720a64e)
+---
+ .../my_system_api/my_system_api_cgroup.cc     | 25 +++++++++++++++----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/components/library_mysys/my_system_api/my_system_api_cgroup.cc b/components/library_mysys/my_system_api/my_system_api_cgroup.cc
+index d96ec25a6..77e953617 100644
+--- a/components/library_mysys/my_system_api/my_system_api_cgroup.cc
++++ b/components/library_mysys/my_system_api/my_system_api_cgroup.cc
+@@ -21,13 +21,20 @@
+    along with this program; if not, write to the Free Software
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+ 
++#include <cassert>
++#include <climits>
+ #include <cstdint>
+ #include <fstream>
+ #include <optional>
+ #include <string_view>
+ 
++#include "my_config.h"  // HAVE_UNISTD_H
+ #include "my_system_api.h"
+ 
++#ifdef HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
+ /**
+   @file components/library_mysys/my_system_api/my_system_api_cgroup.cc
+   Functions to retrieve total physical memory and total number of logical CPUs
+@@ -75,7 +82,7 @@ bool read_line_from_file(const std::string_view &path, Args &...args) {
+ /**
+   Read CPU limits as if it were set by cgroup v1
+   @return CPU limits set by cgroup v1 or std::nullopt on failure
+-  @note Return value of 0.0 implies no limits are set
++  @note Return value of 0 implies no limits are set
+ */
+ std::optional<uint32_t> cgroup_v1_cpu() {
+   int32_t quota;
+@@ -95,7 +102,7 @@ std::optional<uint32_t> cgroup_v1_cpu() {
+ /**
+   Read memory limits as if it were set by cgroup v1
+   @return Memory limits set by cgroup v1 or std::nullopt on failure
+-  @note Return value of 0.0 implies no limits are set
++  @note Return value of 0 implies no limits are set
+ */
+ std::optional<uint64_t> cgroup_v1_memory() {
+   uint64_t memory;
+@@ -103,13 +110,21 @@ std::optional<uint64_t> cgroup_v1_memory() {
+   if (!read_line_from_file(mem_path_v1, memory)) {
+     return std::nullopt;
+   }
+-  return memory;
++
++  const long page_size = sysconf(_SC_PAGESIZE);
++  assert(page_size > 0);
++
++  /* Default value of memory limit in cgroup v1 */
++  const uint64_t default_limit = LONG_MAX - (LONG_MAX % page_size);
++
++  /* Treat default value as no limits and return 0 */
++  return (memory == default_limit) ? 0 : memory;
+ }
+ 
+ /**
+   Read CPU limits as if it were set by cgroup v2
+   @return CPU limits set by cgroup v2 or std::nullopt on failure
+-  @note Return value of 0.0 implies no limits are set
++  @note Return value of 0 implies no limits are set
+ */
+ std::optional<uint32_t> cgroup_v2_cpu() {
+   uint32_t quota, period;
+@@ -127,7 +142,7 @@ std::optional<uint32_t> cgroup_v2_cpu() {
+ /**
+   Read Memory limits as if it were set by cgroup v2
+   @return Memory limits set by cgroup v2 or std::nullopt on failure
+-  @note Return value of 0.0 implies no limits are set
++  @note Return value of 0 implies no limits are set
+ */
+ std::optional<uint64_t> cgroup_v2_memory() {
+   uint64_t memory;
+-- 
+2.34.1
+

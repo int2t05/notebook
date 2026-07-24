@@ -1,0 +1,7 @@
+# Limex 触发规则集 — 复杂 NFA
+# 条件: 大型 NFA (>64状态), 超出 Sheng/McClellan 范围
+# 多分支交替 + 重复产生大型 NFA → Limex 大引擎
+# ng_limex.cpp: allowLimExNFA
+1:/a(b|c)d(e|f)g(h|i)j(k|l)m/
+2:/one|two|three|four|five|six|seven|eight|nine|ten/
+3:/colou?r|behaviou?r|analogue?|catalog(ue)?/

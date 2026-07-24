@@ -1,0 +1,7 @@
+# Truffle 触发规则集 — 单字符匹配
+# 条件: 单字符匹配, NFA 极小, grey 未禁用
+# Truffle 处理单个字符的精确匹配 /x/
+# trufflecompile.cpp
+1:/x/
+2:/y/
+3:/z/

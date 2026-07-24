@@ -1,0 +1,6 @@
+# knowledge-base Skill 配置
+
+# 知识库根目录：所有知识卡片与索引的存放位置。
+# 解析优先级：环境变量 KB_ROOT > 本文件 knowledge_root > 默认 ~/knowledge
+# 支持 ~ 展开为当前用户家目录。
+knowledge_root: "~/knowledge"

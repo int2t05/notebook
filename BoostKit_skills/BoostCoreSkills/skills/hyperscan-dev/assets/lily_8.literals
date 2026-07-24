@@ -1,0 +1,16 @@
+# Lily (单字节短规则) 触发规则集 — 8条
+# 触发条件 (shortcut_literal.cpp:205-212 → rose_build_add.cpp:addChar):
+#   1. 纯字面量, 长度 == 1
+#   2. grey.allowLily == true (config.txt: allowLily:1)
+#   3. Block 模式 (!streaming)
+#   4. 不被逻辑组合规则引用
+#   5. addChar 成功: lily map size < 8, 首字符不重复
+# 每个字符各不相同, 确保 map::insert 不冲突
+1:/a/
+2:/b/
+3:/c/
+4:/d/
+5:/e/
+6:/0/
+7:/1/
+8:/2/

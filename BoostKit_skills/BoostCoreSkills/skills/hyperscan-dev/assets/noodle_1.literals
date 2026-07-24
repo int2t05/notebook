@@ -1,0 +1,5 @@
+# Noodle 触发规则集 — 1条
+# 条件: isNoodleable(lits, cc) → lits.size() == 1, grey.allowNoodle
+# Noodle 是单字面量的特化引擎
+# hwlm_build.cpp:202
+1:/helloWorld/

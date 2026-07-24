@@ -1,0 +1,7 @@
+# Castle 触发规则集 — dot-star 重复模式
+# 条件: 规则以 .* 或 [^x]* 开头, grey.allowCastle
+# Castle 引擎处理前导大跨度重复: .* → castle repeat
+# ./.*foo/ 中的 .* 被 castlecompile.cpp 处理
+1:/.*foo/
+2:/.*bar/
+3:/[^x]*hello/

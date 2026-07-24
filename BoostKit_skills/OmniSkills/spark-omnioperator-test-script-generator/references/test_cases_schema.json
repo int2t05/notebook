@@ -1,0 +1,19 @@
+[
+  {
+    "用例_编号": "Spark_OmniRuntime_Operator_001",
+    "用例_名称": "Operator test case name",
+    "用例_级别": "Level1",
+    "用例_测试步骤": {
+      "step1": {
+        "description": "S1.原生和Omni执行SQL语句",
+        "sql_statement": "DROP TABLE IF EXISTS test_table;\nCREATE TABLE test_table (id int, value int) STORED AS ORC;\nINSERT INTO test_table VALUES (1, 100), (2, 200);\nSELECT * FROM test_table ORDER BY id;",
+        "expected_result": "E1.原生和Omni执行结果一致"
+      },
+      "step2": {
+        "description": "S2.查看执行计划",
+        "sql_statement": "EXPLAIN EXTENDED INSERT INTO test_table VALUES (3, 300);",
+        "expected_result": "E2.执行计划可以查看到OmniInsertIntoHadoopFsRelationCommand"
+      }
+    }
+  }
+]

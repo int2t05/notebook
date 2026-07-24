@@ -1,0 +1,221 @@
+From 1aa81198a0970b2cf94821afb67f28e2c0075268 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Tue, 3 Mar 2026 16:04:42 +0800
+Subject: [PATCH]   LOCK_TABLE CAN BE OPTIMIZED IF UPDATING THE SAME TABLE
+ CONCURRENTLY
+
+  lock table optmization: backport from 8490c65ee4bb9b103a700352aba9519e2a42e500
+
+  BUG#18955152 LOCK_TABLE CAN BE OPTIMIZED IF UPDATING THE SAME TABLE CONCURRENTLY
+  This is based on the contribution of Zhai Weixiang from MySQL Bug #72948, except
+  - I've renamed the new field to count_by_mode
+  - added some comments
+  - fixed a bug with asserting that ulong is non-negative by moving the assert above decrement
+  - removed the sysvar, as this change seems to be benefitial and I see no reason for disabling it
+  - used similar approach in two other places (during table lock realesing)
+
+  The change bypasses costly iteration over table locks queue, in cases, where
+  there is a lot of DML queries, but not much DDL queries, so intention locks
+  can be granted (as intention locks only conflict with LOCK_X or LOCK_S on whole table),
+  by counting how many locks of various modes (LOCK_X, LOCK_S in particular) are currently
+  in the queue.
+---
+ storage/innobase/dict/dict0mem.cc     |  4 --
+ storage/innobase/handler/ha_innodb.cc |  2 +-
+ storage/innobase/include/dict0mem.h   | 22 +++++----
+ storage/innobase/lock/lock0lock.cc    | 67 ++++++++++++++++++++++++---
+ 4 files changed, 75 insertions(+), 20 deletions(-)
+
+diff --git a/storage/innobase/dict/dict0mem.cc b/storage/innobase/dict/dict0mem.cc
+index 70381e075..69f7f1cd8 100644
+--- a/storage/innobase/dict/dict0mem.cc
++++ b/storage/innobase/dict/dict0mem.cc
+@@ -164,10 +164,6 @@ dict_mem_table_create(
+ 	table->sess_row_id = 0;
+ 	table->sess_trx_id = 0;
+ 
+-	/* The number of transactions that are either waiting on the
+-	AUTOINC lock or have been granted the lock. */
+-	table->n_waiting_or_granted_auto_inc_locks = 0;
+-
+ 	/* If the table has an FTS index or we are in the process
+ 	of building one, create the table->fts */
+ 	if (dict_table_has_fts_index(table)
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index fc9712943..dfc8c1dc8 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -8628,7 +8628,7 @@ ha_innobase::innobase_lock_autoinc(void)
+ 
+ 			/* We need to check that another transaction isn't
+ 			already holding the AUTOINC lock on the table. */
+-			if (ib_table->n_waiting_or_granted_auto_inc_locks) {
++			if (ib_table->count_by_mode[LOCK_AUTO_INC]) {
+ 				/* Release the mutex to avoid deadlocks. */
+ 				dict_table_autoinc_unlock(ib_table);
+ 			} else {
+diff --git a/storage/innobase/include/dict0mem.h b/storage/innobase/include/dict0mem.h
+index ac1c9f17d..925d43f6c 100644
+--- a/storage/innobase/include/dict0mem.h
++++ b/storage/innobase/include/dict0mem.h
+@@ -1705,14 +1705,6 @@ struct dict_table_t {
+ 	/** Autoinc counter value to give to the next inserted row. */
+ 	ib_uint64_t				autoinc;
+ 
+-	/** This counter is used to track the number of granted and pending
+-	autoinc locks on this table. This value is set after acquiring the
+-	lock_sys_t::mutex but we peek the contents to determine whether other
+-	transactions have acquired the AUTOINC lock or not. Of course only one
+-	transaction can be granted the lock but there can be multiple
+-	waiters. */
+-	ulong					n_waiting_or_granted_auto_inc_locks;
+-
+ 	/** The transaction that currently holds the the AUTOINC lock on this
+ 	table. Protected by lock_sys->mutex. */
+ 	const trx_t*				autoinc_trx;
+@@ -1756,6 +1748,20 @@ public:
+ 	/** List of locks on the table. Protected by lock_sys->mutex. */
+ 	table_lock_list_t			locks;
+ 
++	/** count_by_mode[M] = number of locks in this->locks with
++	lock->type_mode&LOCK_MODE_MASK == M.
++	Used to quickly verify that there are no LOCK_S or LOCK_X, which are
++	the only modes incompatible with LOCK_IS and LOCK_IX, to avoid costly
++	iteration over this->locks when adding LOCK_IS or LOCK_IX.
++	We use count_by_mode[LOCK_AUTO_INC] to track the number of granted
++	and pending autoinc locks on this table. This value is set after
++	acquiring the lock_sys_t::mutex but we peek the contents to determine
++	whether other transactions have acquired the AUTOINC lock or not.
++	Of course only one transaction can be granted the lock but there can
++	be multiple waiters.
++	Protected by lock_sys->mutex. */
++	ulong					count_by_mode[LOCK_NUM];
++
+ 	/** Timestamp of the last modification of this table. */
+ 	time_t					update_time;
+ 
+diff --git a/storage/innobase/lock/lock0lock.cc b/storage/innobase/lock/lock0lock.cc
+index f3bf97c66..0f555cb70 100644
+--- a/storage/innobase/lock/lock0lock.cc
++++ b/storage/innobase/lock/lock0lock.cc
+@@ -3697,9 +3697,7 @@ lock_table_create(
+ 
+ 	check_trx_state(trx);
+ 
+-	if ((type_mode & LOCK_MODE_MASK) == LOCK_AUTO_INC) {
+-		++table->n_waiting_or_granted_auto_inc_locks;
+-	}
++	++table->count_by_mode[type_mode & LOCK_MODE_MASK];
+ 
+ 	/* For AUTOINC locking we reuse the lock instance only if
+ 	there is no wait involved else we allocate the waiting lock
+@@ -3839,10 +3837,11 @@ lock_table_remove_low(
+ 
+ 	trx = lock->trx;
+ 	table = lock->un_member.tab_lock.table;
++	const lock_mode	lock_mode = lock_get_mode(lock);
+ 
+ 	/* Remove the table from the transaction's AUTOINC vector, if
+ 	the lock that is being released is an AUTOINC lock. */
+-	if (lock_get_mode(lock) == LOCK_AUTO_INC) {
++	if (lock_mode == LOCK_AUTO_INC) {
+ 
+ 		/* The table's AUTOINC lock can get transferred to
+ 		another transaction before we get here. */
+@@ -3864,11 +3863,11 @@ lock_table_remove_low(
+ 
+ 			lock_table_remove_autoinc_lock(lock, trx);
+ 		}
+-
+-		ut_a(table->n_waiting_or_granted_auto_inc_locks > 0);
+-		table->n_waiting_or_granted_auto_inc_locks--;
+ 	}
+ 
++	ut_a(0 < table->count_by_mode[lock_mode]);
++	--table->count_by_mode[lock_mode];
++
+ 	UT_LIST_REMOVE(trx->lock.trx_locks, lock);
+ 	ut_list_remove(table->locks, lock, TableLockGetNode());
+ 
+@@ -3979,6 +3978,21 @@ lock_table_other_has_incompatible(
+ 
+ 	ut_ad(lock_mutex_own());
+ 
++	/* According to lock_compatibility_matrix, an intention lock can wait
++	only for LOCK_S or LOCK_X. If there are no LOCK_S nor LOCK_X locks
++	in the queue, then we can avoid iterating through the list and return
++	immediately. This might help in OLTP scenarios, with no DDL queries,
++	as then there are almost no LOCK_S nor LOCK_X, but many DML queries
++	still need to get an intention lock to perform their action - while
++	this never causes them to wait for a "data lock", it might cause them
++	to wait for lock_sys->mutex if the operation takes Omega(n). */
++	if ((mode == LOCK_IS || mode == LOCK_IX)
++	    && table->count_by_mode[LOCK_S] == 0
++	    && table->count_by_mode[LOCK_X] == 0) {
++
++		return(NULL);
++	}
++
+ 	for (lock = UT_LIST_GET_LAST(table->locks);
+ 	     lock != NULL;
+ 	     lock = UT_LIST_GET_PREV(un_member.tab_lock.locks, lock)) {
+@@ -4124,6 +4138,25 @@ lock_table_has_to_wait_in_queue(
+ 
+ 	table = wait_lock->un_member.tab_lock.table;
+ 
++	const lock_mode	mode = lock_get_mode(wait_lock);
++
++	/* According to lock_compatibility_matrix, an intention lock can wait
++	only for LOCK_S or LOCK_X. If there are no LOCK_S nor LOCK_X locks
++	in the queue, then we can avoid iterating through the list and return
++	immediately. This might help in OLTP scenarios, with no DDL queries,
++	as then there are almost no LOCK_S nor LOCK_X, but many DML queries
++	still need to get an intention lock to perform their action. When an
++	occasional DDL finishes and releases the LOCK_S or LOCK_X, it has to
++	scan the queue and grant any locks which were blocked by it. This can
++	take Omega(n^2) if each of intention locks has to verify that all
++	the other locks. */
++	if ((mode == LOCK_IS || mode == LOCK_IX)
++	    && table->count_by_mode[LOCK_S] == 0
++	    && table->count_by_mode[LOCK_X] == 0) {
++
++		return(false);
++	}
++
+ 	for (lock = UT_LIST_GET_FIRST(table->locks);
+ 	     lock != wait_lock;
+ 	     lock = UT_LIST_GET_NEXT(un_member.tab_lock.locks, lock)) {
+@@ -4152,10 +4185,30 @@ lock_table_dequeue(
+ 	ut_ad(lock_mutex_own());
+ 	ut_a(lock_get_type_low(in_lock) == LOCK_TABLE);
+ 
++	const lock_mode		mode = lock_get_mode(in_lock);
++	const dict_table_t*	table = in_lock->un_member.tab_lock.table;
++
+ 	lock_t*	lock = UT_LIST_GET_NEXT(un_member.tab_lock.locks, in_lock);
+ 
+ 	lock_table_remove_low(in_lock);
+ 
++	/* According to lock_compatibility_matrix, an intention lock can block
++	only LOCK_S or LOCK_X from being granted, and thus, releasing of an
++	intention lock can help in granting only LOCK_S or LOCK_X. If there
++	are no LOCK_S nor LOCK_X locks in the queue, then we can avoid
++	iterating through the list and return immediately. This might help
++	in OLTP scenarios, with no DDL queries, as then there are almost no
++	LOCK_S nor LOCK_X, but many DML queries still need to get an intention
++	lock to perform their action - while this never causes them to wait
++	for a "data lock", it might cause them to wait for lock_sys->mutex
++	if the operation takes Omega(n) or even Omega(n^2). */
++	if ((mode == LOCK_IS || mode == LOCK_IX)
++	    && table->count_by_mode[LOCK_S] == 0
++	    && table->count_by_mode[LOCK_X] == 0) {
++
++		return;
++	}
++
+ 	/* Check if waiting locks in the queue can now be granted: grant
+ 	locks if there are no conflicting locks ahead. */
+ 
+-- 
+2.34.1
+

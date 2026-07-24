@@ -1,0 +1,32 @@
+# Omni 文件索引忽略规则（gitignore 语法，相对各项目根目录匹配路径）
+# 内置已忽略：.git target build dist node_modules third_party .vscode figures secDTFuzz 等
+
+# 测试数据 / 用例数据（非源码）
+*.sql
+**/testdata/**
+**/test_data/**
+**/testData/**
+
+# 生成代码（非手写）
+**/generated/**
+**/gen/**
+**/auto_gen/**
+
+# 性能基准测试
+**/benchmark/**
+**/bench/**
+**/benchmarks/**
+
+# 二进制 / 图片资源（无源码意义）
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+*.bmp
+*.pdf
+
+# 按需继续添加，例如：
+# **/test/**          # 测试源码目录
+# omnihelper/tests/

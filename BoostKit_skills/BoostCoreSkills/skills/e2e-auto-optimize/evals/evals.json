@@ -1,0 +1,75 @@
+{
+  "skill_name": "e2e-auto-optimize",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use e2e-auto-optimize on this C++ library, but there is no e2e-auto-optimize.config.json yet.",
+      "expected_output": "The skill tells the user to create the config from templates/config.example.json and stops without attempting SSH, tests, commits, or optimization.",
+      "files": [],
+      "assertions": [
+        "Output says the default config file is missing.",
+        "Output does not proceed to optimization.",
+        "Output points to templates/config.example.json."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Run the skill with a config whose SSH host is unreachable.",
+      "expected_output": "The skill validates the config, attempts check-environment, reports SSH reachability failure, and stops.",
+      "files": [],
+      "assertions": [
+        "Output includes a connection failure reason.",
+        "Output does not run UT or perftest.",
+        "Output does not commit."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run an iteration where UT passes and perftest output contains parseable baseline and optimized metrics above the threshold.",
+      "expected_output": "The skill runs the configured build command before UT and perftest, generates required reports, computes improvement from the configured metric, accepts the candidate, and commits locally with optimization_overview as the commit message.",
+      "files": [],
+      "assertions": [
+        "The configured build command runs before UT/functest.",
+        "Four report filenames match the required pattern.",
+        "The optimized summary includes a brief optimization overview.",
+        "The baseline summary does not include an optimization overview.",
+        "Improvement percent is computed according to metric.direction.",
+        "Commit message is derived from optimization_overview instead of the generic perf: optimize template.",
+        "Each accepted iteration is committed separately and is not squashed into the last accepted commit."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Run an iteration where optimized performance is below the configured 5 percent threshold.",
+      "expected_output": "The skill rejects the candidate, restores the previous accepted baseline, writes reports explaining the rejection, and continues only if iterations remain.",
+      "files": [],
+      "assertions": [
+        "Output marks the candidate as rejected.",
+        "Output states the threshold and measured improvement.",
+        "Output does not commit the rejected candidate."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Run the skill with an empty kb/menu.md, then with a menu that lists an architecture-specific optimization note.",
+      "expected_output": "The skill records autonomous mode when the menu is empty and reads only relevant knowledge-base entries when the menu is populated.",
+      "files": [],
+      "assertions": [
+        "Empty menu produces an autonomous optimization note.",
+        "Non-empty menu is read before optimization.",
+        "Irrelevant knowledge-base entries are not loaded."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Use a config that sets git.username and git.email before running an accepted optimization iteration.",
+      "expected_output": "The skill keeps git.username and git.email as optional config values, uses them only for script-managed Git commands, and does not write global Git config.",
+      "files": [],
+      "assertions": [
+        "Config validation accepts empty git.username and git.email defaults.",
+        "Non-empty git.username and git.email are passed as command-scoped Git options.",
+        "The skill does not run git config --global for identity."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,262 @@
+From ec5e7e928b2ae65ee407d1fb7565d8e5a01734e5 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 11 Nov 2025 21:09:04 +0800
+Subject: [PATCH] optimize Item_func_like with neon
+
+---
+ strings/ctype-utf8.c | 225 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 225 insertions(+)
+
+diff --git a/strings/ctype-utf8.c b/strings/ctype-utf8.c
+index 564ec7513..1fec3f103 100644
+--- a/strings/ctype-utf8.c
++++ b/strings/ctype-utf8.c
+@@ -4872,6 +4872,7 @@ my_tosort_unicode(const MY_UNICASE_INFO *uni_plane, my_wc_t *wc, uint flags)
+ }
+ 
+ 
++#if defined(__aarch64__)
+ /*
+ ** Compare string against string with wildcard
+ ** This function is used in UTF8 and UCS2
+@@ -5002,6 +5003,71 @@ my_wildcmp_unicode_impl(const CHARSET_INFO *cs,
+         /* Skip until the first character from wildstr is found */
+         while (str != str_end)
+         {
++          if ((cs->state & MY_CS_UNICODE) && !(cs->state & MY_CS_NONASCII))
++          {
++            if (weights)
++            {
++              my_tosort_unicode(weights, &w_wc, cs->state);
++            }
++
++            const size_t neon_vector_length = 16;
++            const unsigned char max_ascii = 0x7F;
++            const uint8x16_t diff = vdupq_n_u8(0x20);
++            uint8x16_t vec_max_ascii = vdupq_n_u8(max_ascii);
++            uint8x16_t vec_wild = vdupq_n_u8(w_wc & 0xFF);
++            while (str + neon_vector_length < str_end && w_wc <= max_ascii)
++            {
++              uint8x16_t vec_src = vld1q_u8((const uchar *) str);
++              // check if exists non-ascii character
++              // ascii -> non zero, non-ascii -> zero
++              uint8x16_t ascii_check = vcleq_u8(vec_src, vec_max_ascii);
++              if (vminvq_u8(ascii_check) == 0)
++              {
++                // have non-ascii character
++                break;
++              }
++
++              if (weights)
++              {
++                if (cs->state & MY_CS_LOWER_SORT)
++                {
++                  uint8x16_t mask = vcgeq_u8(vec_src, vdupq_n_u8('A')) &
++                                      vcleq_u8(vec_src, vdupq_n_u8('Z'));
++                  vec_src = vbslq_u8(mask, vaddq_u8(vec_src, diff), vec_src);
++                }
++                else
++                {
++                  uint8x16_t mask = vcgeq_u8(vec_src, vdupq_n_u8('a')) &
++                                      vcleq_u8(vec_src, vdupq_n_u8('z'));
++                  vec_src = vbslq_u8(mask, vsubq_u8(vec_src, diff), vec_src);
++                }
++              }
++
++              uint8x16_t comparison_result_vec = vceqq_u8(vec_src, vec_wild);
++              uint8_t comparison_result[16];
++              vst1q_u8(comparison_result, comparison_result_vec);
++              for (int i = 0; i < neon_vector_length; i++)
++              {
++                if (comparison_result[i])
++                {
++                  result = my_wildcmp_unicode_impl(cs, str + i + 1, str_end,
++                                                   wildstr, wildend, escape,
++                                                   w_one, w_many, weights,
++                                                   recurse_level + 1);
++                  if (result <= 0)
++                  {
++                    return result;
++                  }
++                }
++              }
++              str += neon_vector_length;
++            }
++            if (str == str_end)
++            {
++              return -1;
++            }
++          }
++
+           if ((scan= mb_wc(cs, &s_wc, (const uchar*)str,
+                            (const uchar*)str_end)) <=0)
+             return 1;
+@@ -5029,6 +5095,165 @@ my_wildcmp_unicode_impl(const CHARSET_INFO *cs,
+   }
+   return (str != str_end ? 1 : 0);
+ }
++#else
++/*
++** Compare string against string with wildcard
++** This function is used in UTF8 and UCS2
++**
++**	0 if matched
++**	-1 if not matched with wildcard
++**	 1 if matched with wildcard
++*/
++
++static
++int
++my_wildcmp_unicode_impl(const CHARSET_INFO *cs,
++                        const char *str,const char *str_end,
++                        const char *wildstr,const char *wildend,
++                        int escape, int w_one, int w_many,
++                        const MY_UNICASE_INFO *weights, int recurse_level)
++{
++  int result= -1;                             /* Not found, using wildcards */
++  my_wc_t s_wc, w_wc;
++  int scan;
++  int (*mb_wc)(const struct charset_info_st *, my_wc_t *,
++               const uchar *, const uchar *);
++  mb_wc= cs->cset->mb_wc;
++
++ if (my_string_stack_guard && my_string_stack_guard(recurse_level))
++   return 1;
++  while (wildstr != wildend)
++  {
++    while (1)
++    {
++      my_bool escaped= 0;
++      if ((scan= mb_wc(cs, &w_wc, (const uchar*)wildstr,
++                       (const uchar*)wildend)) <= 0)
++        return 1;
++
++      if (w_wc == (my_wc_t) w_many)
++      {
++        result= 1;                                /* Found an anchor char */
++        break;
++      }
++
++      wildstr+= scan;
++      if (w_wc ==  (my_wc_t) escape && wildstr < wildend)
++      {
++        if ((scan= mb_wc(cs, &w_wc, (const uchar*)wildstr,
++                         (const uchar*)wildend)) <= 0)
++          return 1;
++        wildstr+= scan;
++        escaped= 1;
++      }
++      
++      if ((scan= mb_wc(cs, &s_wc, (const uchar*)str,
++                       (const uchar*)str_end)) <= 0)
++        return 1;
++      str+= scan;
++      
++      if (!escaped && w_wc == (my_wc_t) w_one)
++      {
++        result= 1;                                /* Found an anchor char */
++      }
++      else
++      {
++        if (weights)
++        {
++          my_tosort_unicode(weights, &s_wc, cs->state);
++          my_tosort_unicode(weights, &w_wc, cs->state);
++        }
++        if (s_wc != w_wc)
++          return 1;                               /* No match */
++      }
++      if (wildstr == wildend)
++        return (str != str_end);                  /* Match if both are at end */
++    }
++    
++    
++    if (w_wc == (my_wc_t) w_many)
++    {                                             /* Found w_many */
++    
++      /* Remove any '%' and '_' from the wild search string */
++      for ( ; wildstr != wildend ; )
++      {
++        if ((scan= mb_wc(cs, &w_wc, (const uchar*)wildstr,
++                         (const uchar*)wildend)) <= 0)
++          return 1;
++        
++        if (w_wc == (my_wc_t)w_many)
++        {
++          wildstr+= scan;
++          continue;
++        } 
++        
++        if (w_wc == (my_wc_t)w_one)
++        {
++          wildstr+= scan;
++          if ((scan= mb_wc(cs, &s_wc, (const uchar*)str,
++                           (const uchar*)str_end)) <=0)
++            return 1;
++          str+= scan;
++          continue;
++        }
++        break;                                        /* Not a wild character */
++      }
++      
++      if (wildstr == wildend)
++        return 0;                                /* Ok if w_many is last */
++      
++      if (str == str_end)
++        return -1;
++      
++      if ((scan= mb_wc(cs, &w_wc, (const uchar*)wildstr,
++                       (const uchar*)wildend)) <=0)
++        return 1;
++      wildstr+= scan;
++      
++      if (w_wc ==  (my_wc_t)escape)
++      {
++        if (wildstr < wildend)
++        {
++          if ((scan= mb_wc(cs, &w_wc, (const uchar*)wildstr,
++                           (const uchar*)wildend)) <=0)
++            return 1;
++          wildstr+= scan;
++        }
++      }
++      
++      while (1)
++      {
++        /* Skip until the first character from wildstr is found */
++        while (str != str_end)
++        {
++          if ((scan= mb_wc(cs, &s_wc, (const uchar*)str,
++                           (const uchar*)str_end)) <=0)
++            return 1;
++          if (weights)
++          {
++            my_tosort_unicode(weights, &s_wc, cs->state);
++            my_tosort_unicode(weights, &w_wc, cs->state);
++          }
++          
++          if (s_wc == w_wc)
++            break;
++          str+= scan;
++        }
++        if (str == str_end)
++          return -1;
++        
++        str+= scan;
++        result= my_wildcmp_unicode_impl(cs, str, str_end, wildstr, wildend,
++                                        escape, w_one, w_many,
++                                        weights, recurse_level + 1);
++        if (result <= 0)
++          return result;
++      } 
++    }
++  }
++  return (str != str_end ? 1 : 0);
++}
++#endif
+ 
+ int
+ my_wildcmp_unicode(const CHARSET_INFO *cs,
+-- 
+2.31.1.windows.1
+

@@ -1,0 +1,10 @@
+# ROSE_RUNTIME_FULL_ROSE 触发规则集 — 混合复杂规则
+# 条件: 既不是 PURE_LITERAL 也不是 SINGLE_OUTFIX
+# 混合字面量 + 正则 + 锚定规则 → 完整 ROSE 解释器
+# roseBlockExec → runAnchoredTable + runRoseProgram
+# rose_build_bytecode.cpp:356 → pickRuntimeImpl (fallback)
+1:/hello/
+2:/foo.*bar/
+3:/^anchored/
+4:/cat|dog/
+5:/[0-9]+\.[0-9]+/

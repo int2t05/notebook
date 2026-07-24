@@ -1,0 +1,53 @@
+{
+  "software": {
+    "name": "my-library",
+    "local_repo_path": "../my-library",
+    "repo_path": "/home/user/my-library",
+    "baseline_ref": "HEAD"
+  },
+  "git": {
+    "username": "",
+    "email": ""
+  },
+  "environment": {
+    "host": "192.168.0.10",
+    "port": 22,
+    "user": "user",
+    "auth_method": "private_key",
+    "private_key_path": "~/.ssh/id_rsa",
+    "connect_timeout_seconds": 10
+  },
+  "workspace": {
+    "work_dir": "/home/user/my-library",
+    "test_report_dir": "/home/user/e2e-auto-optimize/my-library/test-reports",
+    "summary_report_dir": "/home/user/e2e-auto-optimize/my-library/summary-reports",
+    "data_dir": "/home/user/e2e-auto-optimize/my-library/data",
+    "perf_data_dir": "/home/user/e2e-auto-optimize/my-library/perf-data"
+  },
+  "commands": {
+    "build": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j",
+    "ut": "bash scripts/unittest.sh",
+    "perftest": "bazel run :benchmark --compilation_mode=opt"
+  },
+  "analysis": {
+    "bottleneck_summary": "",
+    "topdown_file": "",
+    "perf_file": ""
+  },
+  "optimization": {
+    "kb_dir": "kb",
+    "kb_menu": "kb/menu.md",
+    "candidate_directions": [],
+    "iterations": 3,
+    "threshold_percent": 5
+  },
+  "metric": {
+    "name": "benchmark_time_ns",
+    "direction": "lower_is_better",
+    "parse_regex": "software[^\\n]*?\\s+(?P<value>[0-9]+(?:\\.[0-9]+)?)\\s+ns",
+    "value_group": "value",
+    "occurrence": "median",
+    "repeat": 1
+  },
+  "notes": ""
+}

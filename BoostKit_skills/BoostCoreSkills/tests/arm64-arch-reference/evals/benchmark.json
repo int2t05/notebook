@@ -1,0 +1,350 @@
+{
+  "metadata": {
+    "skill_name": "arm64-arch-reference",
+    "skill_path": "<path/to/skill>",
+    "executor_model": "<model-name>",
+    "analyzer_model": "<model-name>",
+    "timestamp": "2026-06-01T08:26:21Z",
+    "evals_run": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_id": 0,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 42.4,
+        "tokens": 20592,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "\u6807\u660e FEAT_BF16 \u5f15\u5165\u7248\u672c\u4e3a Armv8.2",
+          "passed": true,
+          "evidence": "\u542b:Armv8.2"
+        },
+        {
+          "text": "\u6807\u660e FEAT_BF16 \u4e3a\u53ef\u9009(OPTIONAL)",
+          "passed": true,
+          "evidence": "\u547d\u4e2d:\u53ef\u9009,OPTIONAL"
+        },
+        {
+          "text": "\u7ed9\u51fa BFDOT \u5411\u91cf\u6c47\u7f16\u6a21\u677f `BFDOT <Zda>.S, <Zn>.H, <Zm>.H`",
+          "passed": true,
+          "evidence": "\u542b:BFDOT <Zda>.S, <Zn>.H, <Zm>.H"
+        },
+        {
+          "text": "\u5217\u51fa\u95e8\u63a7\u7279\u6027 FEAT_BF16 \u4e0e FEAT_SVE",
+          "passed": true,
+          "evidence": "\u5168\u542b"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 64.4,
+        "tokens": 21214,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "LDADD \u95e8\u63a7\u4e3a FEAT_LSE",
+          "passed": true,
+          "evidence": "\u542b:FEAT_LSE"
+        },
+        {
+          "text": "LDADD \u5f15\u5165\u7248\u672c Armv8.0",
+          "passed": true,
+          "evidence": "\u542b:Armv8.0; \u65e0\u9519\u8bef\u58f0\u660e"
+        },
+        {
+          "text": "\u7ed9\u51fa LDADD \u57fa\u672c\u6c47\u7f16\u6a21\u677f `LDADD <Ws>, <Wt>, [<Xn|SP>]`",
+          "passed": true,
+          "evidence": "\u542b:LDADD <Ws>, <Wt>, [<Xn|SP>]"
+        },
+        {
+          "text": "\u5217\u51fa\u5185\u5b58\u5e8f\u53d8\u4f53 LDADDA/LDADDAL/LDADDL",
+          "passed": true,
+          "evidence": "\u5168\u542b"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 3,
+        "failed": 0,
+        "total": 3,
+        "time_seconds": 42.1,
+        "tokens": 19725,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "MATCH \u95e8\u63a7\u4e3a FEAT_SVE2",
+          "passed": true,
+          "evidence": "\u542b:FEAT_SVE2"
+        },
+        {
+          "text": "FEAT_SVE2 \u5f15\u5165\u7248\u672c Armv9.0",
+          "passed": true,
+          "evidence": "\u542b:Armv9.0"
+        },
+        {
+          "text": "\u7ed9\u51fa MATCH \u6c47\u7f16\u6a21\u677f",
+          "passed": true,
+          "evidence": "\u542b:MATCH <Pd>.<T>, <Pg>/Z, <Zn>.<T>, <Zm>.<T>"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 3,
+        "failed": 0,
+        "total": 3,
+        "time_seconds": 48.9,
+        "tokens": 21099,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "FMOPA \u95e8\u63a7\u542b FEAT_SME",
+          "passed": true,
+          "evidence": "\u542b:FEAT_SME"
+        },
+        {
+          "text": "SME \u5f15\u5165\u7248\u672c Armv9.2",
+          "passed": true,
+          "evidence": "\u542b:Armv9.2"
+        },
+        {
+          "text": "\u7ed9\u51fa FMOPA \u975e\u6269\u5c55\u7cbe\u5ea6\u5355\u7cbe\u5ea6\u6c47\u7f16\u6a21\u677f",
+          "passed": true,
+          "evidence": "\u542b:FMOPA <ZAda>.S, <Pn>/M, <Pm>/M, <Zn>.S, <Zm>.S"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 0,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 4,
+        "failed": 0,
+        "total": 4,
+        "time_seconds": 42.2,
+        "tokens": 16312,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "\u6807\u660e FEAT_BF16 \u5f15\u5165\u7248\u672c\u4e3a Armv8.2",
+          "passed": true,
+          "evidence": "\u542b:Armv8.2"
+        },
+        {
+          "text": "\u6807\u660e FEAT_BF16 \u4e3a\u53ef\u9009(OPTIONAL)",
+          "passed": true,
+          "evidence": "\u547d\u4e2d:\u53ef\u9009,OPTIONAL"
+        },
+        {
+          "text": "\u7ed9\u51fa BFDOT \u5411\u91cf\u6c47\u7f16\u6a21\u677f `BFDOT <Zda>.S, <Zn>.H, <Zm>.H`",
+          "passed": true,
+          "evidence": "\u542b:BFDOT <Zda>.S, <Zn>.H, <Zm>.H"
+        },
+        {
+          "text": "\u5217\u51fa\u95e8\u63a7\u7279\u6027 FEAT_BF16 \u4e0e FEAT_SVE",
+          "passed": true,
+          "evidence": "\u5168\u542b"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 1,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.5,
+        "passed": 2,
+        "failed": 2,
+        "total": 4,
+        "time_seconds": 42.0,
+        "tokens": 16432,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "LDADD \u95e8\u63a7\u4e3a FEAT_LSE",
+          "passed": true,
+          "evidence": "\u542b:FEAT_LSE"
+        },
+        {
+          "text": "LDADD \u5f15\u5165\u7248\u672c Armv8.0",
+          "passed": false,
+          "evidence": "\u542b:Armv8.0; \u51fa\u73b0\u9519\u8bef\u58f0\u660e:Armv8.1"
+        },
+        {
+          "text": "\u7ed9\u51fa LDADD \u57fa\u672c\u6c47\u7f16\u6a21\u677f `LDADD <Ws>, <Wt>, [<Xn|SP>]`",
+          "passed": false,
+          "evidence": "\u7f3a:LDADD <Ws>, <Wt>, [<Xn|SP>]"
+        },
+        {
+          "text": "\u5217\u51fa\u5185\u5b58\u5e8f\u53d8\u4f53 LDADDA/LDADDAL/LDADDL",
+          "passed": true,
+          "evidence": "\u5168\u542b"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 2,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 3,
+        "failed": 0,
+        "total": 3,
+        "time_seconds": 36.0,
+        "tokens": 16064,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "MATCH \u95e8\u63a7\u4e3a FEAT_SVE2",
+          "passed": true,
+          "evidence": "\u542b:FEAT_SVE2"
+        },
+        {
+          "text": "FEAT_SVE2 \u5f15\u5165\u7248\u672c Armv9.0",
+          "passed": true,
+          "evidence": "\u542b:Armv9.0"
+        },
+        {
+          "text": "\u7ed9\u51fa MATCH \u6c47\u7f16\u6a21\u677f",
+          "passed": true,
+          "evidence": "\u542b:MATCH <Pd>.<T>, <Pg>/Z, <Zn>.<T>, <Zm>.<T>"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": 3,
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 3,
+        "failed": 0,
+        "total": 3,
+        "time_seconds": 55.5,
+        "tokens": 16869,
+        "tool_calls": 0,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "FMOPA \u95e8\u63a7\u542b FEAT_SME",
+          "passed": true,
+          "evidence": "\u542b:FEAT_SME"
+        },
+        {
+          "text": "SME \u5f15\u5165\u7248\u672c Armv9.2",
+          "passed": true,
+          "evidence": "\u542b:Armv9.2"
+        },
+        {
+          "text": "\u7ed9\u51fa FMOPA \u975e\u6269\u5c55\u7cbe\u5ea6\u5355\u7cbe\u5ea6\u6c47\u7f16\u6a21\u677f",
+          "passed": true,
+          "evidence": "\u542b:FMOPA <ZAda>.S, <Pn>/M, <Pm>/M, <Zn>.S, <Zm>.S"
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 49.45,
+        "stddev": 10.4488,
+        "min": 42.1,
+        "max": 64.4
+      },
+      "tokens": {
+        "mean": 20657.5,
+        "stddev": 677.8547,
+        "min": 19725,
+        "max": 21214
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.875,
+        "stddev": 0.25,
+        "min": 0.5,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 43.925,
+        "stddev": 8.2354,
+        "min": 36.0,
+        "max": 55.5
+      },
+      "tokens": {
+        "mean": 16419.25,
+        "stddev": 336.7208,
+        "min": 16064,
+        "max": 16869
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.12",
+      "time_seconds": "+5.5",
+      "tokens": "+4238"
+    }
+  },
+  "notes": []
+}

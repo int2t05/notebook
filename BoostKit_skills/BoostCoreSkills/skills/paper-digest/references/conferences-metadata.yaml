@@ -1,0 +1,419 @@
+# Conference static metadata for Phase 4 render enrichment.
+#
+# Sources:
+#   - CCF 2022 推荐目录（第六版）
+#   - CORE 2023 Portal
+#   - Google Scholar Metrics 2025
+#   - Conference 官网（接收率 / Best Paper）
+#
+# Fields are direction-agnostic conference attributes. Direction-specific
+# overlays (e.g. how strongly a given direction cares about ISMM vs. ICFP)
+# live in `references/profiles/<name>.yaml` under `direction_match:`.
+#
+# tier:
+#   S = top venues (core target across many directions)
+#   A = strong / high-quality
+#   B = specialized
+#
+# Add a new conference by giving at least: tier, ccf, core, h5, full_name.
+# Per-year sub-entry is filled after the conference is announced or held.
+# Use `status: skipped` / `stopped` / `postponed` to suppress an off-year
+# from rendering as a generic placeholder.
+
+PLDI:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 50
+  full_name: ACM SIGPLAN Conference on Programming Language Design and Implementation
+  years:
+    2025:
+      dates: 2025-06-16~20
+      venue: Seoul, South Korea
+      acceptance_rate: ''
+      best_papers: []
+      outstanding_papers: []
+    2026:
+      dates: 2026-06-15~19
+      venue: Boulder, CO, USA
+ASPLOS:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 77
+  full_name: International Conference on Architectural Support for Programming Languages
+    and Operating Systems
+  years:
+    2025:
+      dates: 2025-03-30~04-03
+      venue: Rotterdam, Netherlands
+      best_papers: []
+    2026:
+      dates: 2026-03-22~26
+      venue: Pittsburgh, PA, USA
+      best_papers: []
+OOPSLA:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 45
+  full_name: ACM SIGPLAN Conference on Object-Oriented Programming, Systems, Languages,
+    and Applications
+  years:
+    2025:
+      dates: 2025-10-12~17
+      venue: Singapore
+    2026:
+      dates: 2026-10-03~09
+      venue: Oakland, CA, USA
+POPL:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 50
+  full_name: ACM SIGPLAN Symposium on Principles of Programming Languages
+  years:
+    2026:
+      dates: 2026-01-18~24
+      venue: Rapallo, Italy
+SOSP:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 60
+  full_name: ACM Symposium on Operating Systems Principles
+  cadence: biennial
+  years:
+    2025:
+      dates: 2025-10-13~16
+      venue: Seoul, South Korea
+    2026:
+      status: skipped
+      reason: 双年制 · 2026 不办（OSDI 占 2026 slot）
+OSDI:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 68
+  full_name: USENIX Symposium on Operating Systems Design and Implementation
+  years:
+    2025:
+      dates: 2025-07-07~09
+      venue: Boston, MA, USA
+      acceptance_rate: 14.6%
+      best_papers:
+      - Tiered Memory Management Beyond Hotness
+      outstanding_papers:
+      - 'FineMem: Breaking the Allocation Overhead vs. Memory Waste Dilemma in Fine-Grained
+        Disaggregated Memory Management'
+    2026:
+      dates: 2026-07-13~15
+      venue: Seattle, WA, USA
+ISCA:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 64
+  full_name: International Symposium on Computer Architecture
+  years:
+    2025:
+      dates: 2025-06-21~25
+      venue: Tokyo, Japan
+    2026:
+      dates: 2026-06-27~07-01
+      venue: Raleigh, NC, USA
+MICRO:
+  tier: S
+  ccf: A
+  core: A
+  h5: 58
+  full_name: IEEE/ACM International Symposium on Microarchitecture
+  years:
+    2025:
+      dates: 2025-10-18~22
+      venue: Seoul, South Korea
+    2026:
+      dates: 2026-10-31~11-04
+      venue: Athens, Greece
+ATC:
+  tier: S
+  ccf: A
+  core: A
+  h5: 57
+  full_name: USENIX Annual Technical Conference
+  years:
+    2025:
+      dates: 2025-07-07~09
+      venue: Boston, MA, USA
+    2026:
+      dates: 2026-11-15~18
+      venue: Hong Kong, Sha Tin
+ISMM:
+  tier: A
+  ccf: ''
+  core: A
+  h5: 25
+  full_name: ACM SIGPLAN International Symposium on Memory Management
+  years:
+    2025:
+      dates: '2025-06-17'
+      venue: Seoul, South Korea
+      best_papers: []
+    2026:
+      dates: '2026-06-16'
+      venue: Boulder, CO, USA
+CGO:
+  tier: A
+  ccf: B
+  core: A
+  h5: 30
+  full_name: International Symposium on Code Generation and Optimization
+  years:
+    2026:
+      dates: 2026-01-31~02-04
+      venue: Sydney, Australia
+CC:
+  tier: A
+  ccf: B
+  core: A
+  h5: 20
+  full_name: International Conference on Compiler Construction
+  years:
+    2026:
+      dates: 2026-01-31~02-01
+      venue: Sydney, Australia
+HPCA:
+  tier: A
+  ccf: A
+  core: A*
+  h5: 59
+  full_name: IEEE International Symposium on High-Performance Computer Architecture
+  years:
+    2026:
+      dates: 2026-01-31~02-04
+      venue: Sydney, Australia
+EuroSys:
+  tier: A
+  ccf: A
+  core: A
+  h5: 52
+  full_name: European Conference on Computer Systems
+  years:
+    2026:
+      dates: 2026-04-27~30
+      venue: Edinburgh, UK
+FAST:
+  tier: A
+  ccf: A
+  core: A
+  h5: 50
+  full_name: USENIX Conference on File and Storage Technologies
+  years:
+    2026:
+      dates: 2026-02-24~26
+      venue: Santa Clara, CA, USA
+ICFP:
+  tier: A
+  ccf: B
+  core: A*
+  h5: 30
+  full_name: ACM SIGPLAN International Conference on Functional Programming
+  years:
+    2025:
+      dates: 2025-10-12~18
+      venue: Singapore
+    2026:
+      dates: 2026-08-24~29
+      venue: Indianapolis, IN, USA
+PACT:
+  tier: B
+  ccf: B
+  core: A
+  h5: 25
+  full_name: International Conference on Parallel Architectures and Compilation Techniques
+  years:
+    2025:
+      dates: 2025-11-03~06
+      venue: UC Irvine, CA, USA
+    2026:
+      dates: 2026-10-19~22
+      venue: Chicago, IL, USA
+LCTES:
+  tier: B
+  ccf: B
+  core: A
+  h5: 15
+  full_name: ACM SIGPLAN/SIGBED Conference on Languages, Compilers, Tools and Theory
+    for Embedded Systems
+  years:
+    2025:
+      dates: 2025-06-16~17
+      venue: Seoul, South Korea
+    2026:
+      dates: 2026-06-15~16
+      venue: Boulder, CO, USA
+SC:
+  tier: B
+  ccf: A
+  core: A
+  h5: 44
+  full_name: International Conference for High Performance Computing, Networking,
+    Storage and Analysis
+  years:
+    2025:
+      dates: 2025-11-16~21
+      venue: St. Louis, MO, USA
+    2026:
+      dates: 2026-11-15~20
+      venue: Chicago, IL, USA
+PPoPP:
+  tier: B
+  ccf: A
+  core: A
+  h5: 30
+  full_name: ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming
+  years:
+    2026:
+      dates: 2026-01-31~02-04
+      venue: Sydney, Australia
+SAS:
+  tier: B
+  ccf: ''
+  core: A
+  h5: 15
+  full_name: International Static Analysis Symposium
+  years:
+    2025:
+      dates: 2025-10-12~13
+      venue: Bilbao, Spain
+    2026:
+      dates: 2026-10-06~08
+      venue: Oakland, CA, USA
+
+# ============================================================
+# Cross-cutting venues — added after 2026-05 sanity-check pass for
+# AI-compiler / ML-systems / IR / recommendation / advertising directions.
+# `years:` left empty so Phase 1A.1 LLM still picks the actual edition;
+# tier/ccf/core/h5 only exist to keep composite_score from being depressed
+# by missing metadata when the LLM proposes these for matching directions.
+# ============================================================
+
+# ---- ML systems ----
+MLSys:
+  tier: S
+  ccf: ''
+  core: A
+  h5: 35
+  full_name: Conference on Machine Learning and Systems
+NSDI:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 71
+  full_name: USENIX Symposium on Networked Systems Design and Implementation
+
+# ---- General ML / AI ----
+NeurIPS:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 372
+  full_name: Conference on Neural Information Processing Systems
+ICML:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 268
+  full_name: International Conference on Machine Learning
+ICLR:
+  tier: S
+  ccf: ''
+  core: A*
+  h5: 304
+  full_name: International Conference on Learning Representations
+AAAI:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 220
+  full_name: AAAI Conference on Artificial Intelligence
+
+# ---- IR / search / recommendation ----
+SIGIR:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 90
+  full_name: ACM SIGIR Conference on Research and Development in Information Retrieval
+RecSys:
+  tier: A
+  ccf: B
+  core: A
+  h5: 50
+  full_name: ACM Conference on Recommender Systems
+WWW:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 115
+  full_name: The Web Conference (formerly International World Wide Web Conference)
+WSDM:
+  tier: A
+  ccf: B
+  core: A*
+  h5: 60
+  full_name: ACM International Conference on Web Search and Data Mining
+CIKM:
+  tier: A
+  ccf: B
+  core: A
+  h5: 60
+  full_name: ACM International Conference on Information and Knowledge Management
+ECIR:
+  tier: B
+  ccf: C
+  core: B
+  h5: 30
+  full_name: European Conference on Information Retrieval
+
+# ---- Data mining / KDD ----
+KDD:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 124
+  full_name: ACM SIGKDD Conference on Knowledge Discovery and Data Mining
+ICDM:
+  tier: B
+  ccf: B
+  core: A*
+  h5: 40
+  full_name: IEEE International Conference on Data Mining
+
+# ---- Database (vector retrieval / embedding store) ----
+SIGMOD:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 80
+  full_name: ACM SIGMOD International Conference on Management of Data
+VLDB:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 95
+  full_name: International Conference on Very Large Data Bases
+
+# ---- NLP (query understanding / LLM-based search) ----
+ACL:
+  tier: S
+  ccf: A
+  core: A*
+  h5: 233
+  full_name: Annual Meeting of the Association for Computational Linguistics
+EMNLP:
+  tier: S
+  ccf: B
+  core: A*
+  h5: 168
+  full_name: Conference on Empirical Methods in Natural Language Processing

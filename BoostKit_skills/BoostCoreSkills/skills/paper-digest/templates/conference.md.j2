@@ -1,0 +1,104 @@
+# {{ conference }} {{ year }} - 论文列表
+
+> 📅 **会议日期**: {{ dates or "—" }}
+> 📍 **地点**: {{ venue or "—" }}
+> 📊 **接收论文数**: {{ total_papers }}{% if acceptance_rate %}（接收率 {{ acceptance_rate }}）{% endif +%}
+> 🔗 **完整 program**: {{ program_url }}
+> 📥 **数据收集日期**: {{ fetch_date }}
+{% if ccf or core or h5 -%}
+> 🏷️ **CCF/CORE/h5**: {{ ccf or "未" }} / {{ core or "—" }} / {{ h5 or "—" }} · 方向匹配 {{ direction_match or "—" }}
+{% endif -%}
+{% if full_name -%}
+> 📚 **全称**: {{ full_name }}
+{% endif %}
+
+---
+
+## 图例
+
+### 相关性
+🟢 强相关 · 🟡 中相关 · 🔴 弱相关
+
+### 突出标记
+🏆 Best Paper · 🥇 Outstanding Paper · 🎖️ Distinguished Artifact
+
+### 判断标签
+| 维度 | 标签 |
+|------|------|
+| **工业合作** | 🏭 工业主导 · 🤝 学+工合作 · 🏛️ 纯学术 |
+| **开源** | 📦 已开源 · 📋 部分开源 · 🔒 未开源 |
+| **可落地性** | 🚀 高（产品级/已上生产）· 🔬 中（PoC/原型）· 📐 低（理论/形式化）|
+
+---
+
+{% macro award_badge(p) -%}
+{%- if p.award == "best" %} 🏆 **Best Paper**{% elif p.award == "outstanding" %} 🥇 **Outstanding Paper**{% elif p.award == "artifact" %} 🎖️ **Distinguished Artifact**{% endif -%}
+{%- endmacro %}
+
+{% macro abstract_badge(p) -%}
+{%- set src = p.abstract_source or "unknown" -%}
+{%- if src == "usenix" %}📄 USENIX
+{%- elif src == "arxiv" %}📄 arXiv
+{%- elif src == "semantic_scholar_doi" %}📄 S2/DOI
+{%- elif src == "semantic_scholar_title" %}📄 S2/title
+{%- elif src == "missing" %}⚠️ abstract 未获取
+{%- else %}📄 {{ src }}
+{%- endif -%}
+{%- endmacro %}
+
+{% set greens = papers|selectattr("relevance","equalto","green")|list %}
+{% set yellows = papers|selectattr("relevance","equalto","yellow")|list %}
+
+{% if greens %}
+## 🟢 强相关
+{% for p in greens %}
+
+### [ ] {{ p.id }}. {{ p.title }}{{ award_badge(p) }}
+🟢 · [PDF]({{ p.pdf }}) · {{ p.date or "—" }} · {{ p.affiliation or "—" }} · {{ abstract_badge(p) }}
+
+**背景**：{{ p.summary.background }}
+**核心**：{{ p.summary.core }}
+**效果**：{{ p.summary.effect }}
+**启发**：{{ p.summary.insight }}
+
+{{ tag_emoji.industry[p.tags.industry] }} · {{ tag_emoji.opensource[p.tags.opensource] }} · {{ tag_emoji.deployability[p.tags.deployability] }}
+
+📌 _<>_
+
+---
+{% endfor %}
+{% endif %}
+
+{% if yellows %}
+## 🟡 中相关
+{% for p in yellows %}
+
+### [ ] {{ p.id }}. {{ p.title }}{{ award_badge(p) }}
+🟡 · [PDF]({{ p.pdf }}) · {{ p.date or "—" }} · {{ p.affiliation or "—" }} · {{ abstract_badge(p) }}
+
+{% if p.summary and p.summary.core and p.summary.core|length > 0 -%}
+{{ p.summary.core }}
+{%- elif p.relevance_reason and p.relevance_reason|length > 0 -%}
+**一句话判断**：{{ p.relevance_reason }}
+{%- else -%}
+_一句话描述待补充（Phase 2 reason 与 Phase 3 摘要均缺失）_
+{%- endif %}
+
+{% if p.tags %}{{ tag_emoji.industry[p.tags.industry] }} · {{ tag_emoji.opensource[p.tags.opensource] }} · {{ tag_emoji.deployability[p.tags.deployability] }}{% endif %}
+
+📌 _<>_
+{% endfor %}
+{% endif %}
+
+---
+
+## 📊 统计
+- 总论文数: {{ papers|length }}
+- 🟢: {{ papers|selectattr("relevance","equalto","green")|list|length }}
+- 🟡: {{ papers|selectattr("relevance","equalto","yellow")|list|length }}
+- 🔴: {{ papers|selectattr("relevance","equalto","red")|list|length }} _（弱相关明细已省略；详见 `intermediate/phase2-classified.json` 的 `relevance="red"` 列）_
+{% set best_count = papers|selectattr("award","equalto","best")|list|length %}
+{% set outstanding_count = papers|selectattr("award","equalto","outstanding")|list|length %}
+{% if best_count or outstanding_count -%}
+- 🏆 Best Paper: {{ best_count }} · 🥇 Outstanding: {{ outstanding_count }}
+{%- endif %}

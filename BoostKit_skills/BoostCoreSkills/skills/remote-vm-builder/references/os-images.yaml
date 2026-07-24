@@ -1,0 +1,248 @@
+schema_version: 1
+defaults:
+  arch: auto
+  vm_user: builder
+  vcpus: 4
+  memory_mb: 8192
+  disk_gb: 80
+  network: default
+  storage_pool: default
+  cpu_mode: host-passthrough
+
+images:
+  ubuntu-24.04:
+    name: Ubuntu 24.04 LTS
+    family: ubuntu
+    version: "24.04"
+    aliases: ["ubuntu 24", "ubuntu noble", "noble"]
+    default_user: ubuntu
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+        format: qcow2
+        compressed: none
+        available: true
+      aarch64:
+        url: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+        format: qcow2
+        compressed: none
+        available: true
+
+  ubuntu-22.04:
+    name: Ubuntu 22.04 LTS
+    family: ubuntu
+    version: "22.04"
+    aliases: ["ubuntu 22", "ubuntu jammy", "jammy"]
+    default_user: ubuntu
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+        format: qcow2
+        compressed: none
+        available: true
+      aarch64:
+        url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img
+        format: qcow2
+        compressed: none
+        available: true
+
+  debian-12:
+    name: Debian 12
+    family: debian
+    version: "12"
+    aliases: ["debian bookworm", "bookworm"]
+    default_user: debian
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+        format: qcow2
+        compressed: none
+        available: true
+      aarch64:
+        url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.qcow2
+        format: qcow2
+        compressed: none
+        available: true
+
+  centos-stream-9:
+    name: CentOS Stream 9
+    family: centos
+    version: "9"
+    aliases: ["centos 9", "centos stream 9", "cs9"]
+    default_user: cloud-user
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2
+        format: qcow2
+        compressed: none
+        available: true
+      aarch64:
+        url: https://cloud.centos.org/centos/9-stream/aarch64/images/CentOS-Stream-GenericCloud-9-latest.aarch64.qcow2
+        format: qcow2
+        compressed: none
+        available: true
+
+  openeuler-22.03-lts-sp1:
+    name: openEuler 22.03 LTS SP1
+    family: openeuler
+    version: "22.03"
+    service_pack: SP1
+    aliases: ["openeuler 22.03 sp1", "openEuler 22.03 SP1", "oe 22.03 sp1"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP1/virtual_machine_img/x86_64/openEuler-22.03-LTS-SP1-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP1/virtual_machine_img/aarch64/openEuler-22.03-LTS-SP1-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-22.03-lts-sp2:
+    name: openEuler 22.03 LTS SP2
+    family: openeuler
+    version: "22.03"
+    service_pack: SP2
+    aliases: ["openeuler 22.03 sp2", "openEuler 22.03 SP2", "oe 22.03 sp2"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP2/virtual_machine_img/x86_64/openEuler-22.03-LTS-SP2-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP2/virtual_machine_img/aarch64/openEuler-22.03-LTS-SP2-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-22.03-lts-sp3:
+    name: openEuler 22.03 LTS SP3
+    family: openeuler
+    version: "22.03"
+    service_pack: SP3
+    aliases: ["openeuler 22.03 sp3", "openEuler 22.03 SP3", "oe 22.03 sp3"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP3/virtual_machine_img/x86_64/openEuler-22.03-LTS-SP3-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP3/virtual_machine_img/aarch64/openEuler-22.03-LTS-SP3-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-22.03-lts-sp4:
+    name: openEuler 22.03 LTS SP4
+    family: openeuler
+    version: "22.03"
+    service_pack: SP4
+    aliases: ["openeuler 22.03 sp4", "openEuler 22.03 SP4", "oe 22.03 sp4"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP4/virtual_machine_img/x86_64/openEuler-22.03-LTS-SP4-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-22.03-LTS-SP4/virtual_machine_img/aarch64/openEuler-22.03-LTS-SP4-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-24.03-lts-sp1:
+    name: openEuler 24.03 LTS SP1
+    family: openeuler
+    version: "24.03"
+    service_pack: SP1
+    aliases: ["openeuler 24.03 sp1", "openEuler 24.03 SP1", "oe 24.03 sp1"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP1/virtual_machine_img/x86_64/openEuler-24.03-LTS-SP1-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP1/virtual_machine_img/aarch64/openEuler-24.03-LTS-SP1-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-24.03-lts-sp2:
+    name: openEuler 24.03 LTS SP2
+    family: openeuler
+    version: "24.03"
+    service_pack: SP2
+    aliases: ["openeuler 24.03 sp2", "openEuler 24.03 SP2", "oe 24.03 sp2"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP2/virtual_machine_img/x86_64/openEuler-24.03-LTS-SP2-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP2/virtual_machine_img/aarch64/openEuler-24.03-LTS-SP2-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-24.03-lts-sp3:
+    name: openEuler 24.03 LTS SP3
+    family: openeuler
+    version: "24.03"
+    service_pack: SP3
+    aliases: ["openeuler 24.03 sp3", "openEuler 24.03 SP3", "oe 24.03 sp3"]
+    default_user: openeuler
+    cloud_init: true
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP3/virtual_machine_img/x86_64/openEuler-24.03-LTS-SP3-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP3/virtual_machine_img/aarch64/openEuler-24.03-LTS-SP3-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: true
+
+  openeuler-24.03-lts-sp4:
+    name: openEuler 24.03 LTS SP4
+    family: openeuler
+    version: "24.03"
+    service_pack: SP4
+    aliases: ["openeuler 24.03 sp4", "openEuler 24.03 SP4", "oe 24.03 sp4"]
+    default_user: openeuler
+    cloud_init: true
+    note: Official repo URLs returned 404 when checked on 2026-06-02; use --os custom --image-url with a mirror if needed.
+    architectures:
+      x86_64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP4/virtual_machine_img/x86_64/openEuler-24.03-LTS-SP4-x86_64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: false
+      aarch64:
+        url: https://repo.openeuler.org/openEuler-24.03-LTS-SP4/virtual_machine_img/aarch64/openEuler-24.03-LTS-SP4-aarch64.qcow2.xz
+        format: qcow2
+        compressed: xz
+        available: false

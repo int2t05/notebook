@@ -1,0 +1,4 @@
+# 不触发 FDR — 单条纯正则规则
+# 无纯字面量 → 不进 floating literal matcher → 无 FDR/Teddy/HWLM
+# 直接走 NFA 构建路径 (buildGraph → NGHolder → NFA engine)
+1:/foo.*bar/

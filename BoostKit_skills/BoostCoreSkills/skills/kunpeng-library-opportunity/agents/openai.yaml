@@ -1,0 +1,4 @@
+interface:
+  display_name: "鲲鹏库使能机会"
+  short_description: "分析C/C++服务依赖并发现鲲鹏BoostKit使能机会"
+  default_prompt: "使用 $kunpeng-library-opportunity 分析一个 C/C++ 服务的库依赖和鲲鹏 BoostKit 使能机会。"

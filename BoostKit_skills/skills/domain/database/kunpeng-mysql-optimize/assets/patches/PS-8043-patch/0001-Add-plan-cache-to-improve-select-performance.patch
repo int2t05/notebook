@@ -1,0 +1,4062 @@
+From 3463869ac030d0ddf2ab856f863a7574a6402849 Mon Sep 17 00:00:00 2001
+From: zhengyuanyue <im_zyy@hotmail.com>
+Date: Mon, 30 Mar 2026 21:56:54 +0800
+Subject: [PATCH] Add plan cache to improve select performance
+
+---
+ mysql-test/r/mysqld--help-notwin.result       |    9 +
+ .../opt_trace/r/general_no_prot_all.result    |    9 +-
+ .../opt_trace/r/general_no_prot_none.result   |    9 +-
+ .../r/memory_key_descriptions.result          |    1 +
+ .../perfschema/t/memory_key_descriptions.test |    2 +-
+ mysql-test/suite/sys_vars/r/all_vars.result   |    4 +
+ .../r/plan_cache_allow_change_ratio.result    |  120 +
+ .../t/plan_cache_allow_change_ratio.test      |  134 +
+ sql/CMakeLists.txt                            |    1 +
+ sql/item.cc                                   |    3 +-
+ sql/item_cmpfunc.cc                           |    5 +
+ sql/item_func.cc                              |    2 +
+ sql/item_func.h                               |   14 +-
+ sql/mysqld.cc                                 |   23 +
+ sql/opt_hints.cc                              |    4 +-
+ sql/parse_tree_nodes.cc                       |    2 +
+ sql/psi_memory_key.cc                         |    4 +
+ sql/psi_memory_key.h                          |    1 +
+ sql/range_optimizer/index_skip_scan_plan.cc   |    6 +-
+ sql/sql_class.cc                              |    9 +
+ sql/sql_class.h                               |    8 +
+ sql/sql_const.h                               |   11 +
+ sql/sql_executor.cc                           |   45 +-
+ sql/sql_executor.h                            |    8 +
+ sql/sql_lex.cc                                |    4 +-
+ sql/sql_lex.h                                 |   11 +
+ sql/sql_opt_exec_shared.h                     |   22 +
+ sql/sql_optimizer.cc                          |   58 +-
+ sql/sql_optimizer.h                           |   21 +
+ sql/sql_plan_cache.cc                         | 2360 +++++++++++++++++
+ sql/sql_plan_cache.h                          |  139 +
+ sql/sql_prepare.cc                            |    2 +
+ sql/sql_select.cc                             |   72 +-
+ sql/sql_select.h                              |   16 +-
+ sql/sql_union.cc                              |   25 +-
+ sql/sys_vars.cc                               |   15 +
+ sql/system_variables.h                        |   10 +
+ sql/table.h                                   |    2 +
+ sql/temp_table_param.h                        |    2 +
+ 39 files changed, 3116 insertions(+), 77 deletions(-)
+ create mode 100644 mysql-test/suite/sys_vars/r/plan_cache_allow_change_ratio.result
+ create mode 100644 mysql-test/suite/sys_vars/t/plan_cache_allow_change_ratio.test
+ create mode 100644 sql/sql_plan_cache.cc
+ create mode 100644 sql/sql_plan_cache.h
+
+diff --git a/mysql-test/r/mysqld--help-notwin.result b/mysql-test/r/mysqld--help-notwin.result
+index dcb6d79f2..b851efef6 100644
+--- a/mysql-test/r/mysqld--help-notwin.result
++++ b/mysql-test/r/mysqld--help-notwin.result
+@@ -1139,6 +1139,13 @@ The following options may be given as the first argument:
+  even if present.
+  (Defaults to on; use --skip-persisted-globals-load to disable.)
+  --pid-file=name     Pid file used by safe_mysqld
++ --plan-cache        Allows the server to store query plans into a cache and
++ to reuse them for next queries.
++ (Defaults to on; use --skip-plan-cache to disable.)
++ --plan-cache-allow-change-ratio=# 
++ If the number of rows in the table is changed more than
++ this fraction, cached plan will be invalidated. A value
++ of 0 means the cached plan is always valid.
+  --plugin-dir=name   Directory for plugins
+  --plugin-load=name  Optional semicolon-separated list of plugins to load,
+  where each plugin is identified as name=library, where
+@@ -2102,6 +2109,8 @@ performance-schema-users-size -1
+ persist-only-admin-x509-subject 
+ persist-sensitive-variables-in-plaintext TRUE
+ persisted-globals-load TRUE
++plan-cache TRUE
++plan-cache-allow-change-ratio 0.2
+ port ####
+ port-open-timeout 0
+ preload-buffer-size 32768
+diff --git a/mysql-test/suite/opt_trace/r/general_no_prot_all.result b/mysql-test/suite/opt_trace/r/general_no_prot_all.result
+index 85798d354..808dcdf59 100644
+--- a/mysql-test/suite/opt_trace/r/general_no_prot_all.result
++++ b/mysql-test/suite/opt_trace/r/general_no_prot_all.result
+@@ -11202,6 +11202,11 @@ select @trace;
+               }
+             ] /* refine_plan */
+           },
++          {
++            "cache_plan": {
++              "cached": true
++            } /* cache_plan */
++          },
+           {
+             "considering_tmp_tables": [
+             ] /* considering_tmp_tables */
+@@ -11225,15 +11230,13 @@ count(*)
+ Warnings:
+ Warning	1292	Truncated incorrect INTEGER value: 'c'
+ Warning	1292	Truncated incorrect INTEGER value: 'c'
+-Warning	1292	Truncated incorrect INTEGER value: 'c'
+-Warning	1292	Truncated incorrect INTEGER value: 'c'
+ select count(*) from information_schema.OPTIMIZER_TRACE;
+ count(*)
+ 1
+ select TRACE into @trace2 from information_schema.OPTIMIZER_TRACE;
+ select @trace=@trace2;
+ @trace=@trace2
+-1
++0
+ drop procedure p1;
+ create temporary table optt like information_schema.OPTIMIZER_TRACE;
+ create procedure p1(arg char(1) charset utf8mb4)
+diff --git a/mysql-test/suite/opt_trace/r/general_no_prot_none.result b/mysql-test/suite/opt_trace/r/general_no_prot_none.result
+index b29a3dd0f..122caca76 100644
+--- a/mysql-test/suite/opt_trace/r/general_no_prot_none.result
++++ b/mysql-test/suite/opt_trace/r/general_no_prot_none.result
+@@ -9857,6 +9857,11 @@ select @trace;
+               }
+             ] /* refine_plan */
+           },
++          {
++            "cache_plan": {
++              "cached": true
++            } /* cache_plan */
++          },
+           {
+             "considering_tmp_tables": [
+             ] /* considering_tmp_tables */
+@@ -9880,15 +9885,13 @@ count(*)
+ Warnings:
+ Warning	1292	Truncated incorrect INTEGER value: 'c'
+ Warning	1292	Truncated incorrect INTEGER value: 'c'
+-Warning	1292	Truncated incorrect INTEGER value: 'c'
+-Warning	1292	Truncated incorrect INTEGER value: 'c'
+ select count(*) from information_schema.OPTIMIZER_TRACE;
+ count(*)
+ 1
+ select TRACE into @trace2 from information_schema.OPTIMIZER_TRACE;
+ select @trace=@trace2;
+ @trace=@trace2
+-1
++0
+ drop procedure p1;
+ create temporary table optt like information_schema.OPTIMIZER_TRACE;
+ create procedure p1(arg char(1) charset utf8mb4)
+diff --git a/mysql-test/suite/perfschema/r/memory_key_descriptions.result b/mysql-test/suite/perfschema/r/memory_key_descriptions.result
+index 13b05e558..40599cfe3 100644
+--- a/mysql-test/suite/perfschema/r/memory_key_descriptions.result
++++ b/mysql-test/suite/perfschema/r/memory_key_descriptions.result
+@@ -36,6 +36,7 @@ memory/sql/Partition::syntax_buffer	Buffer used for formatting the partition exp
+ memory/sql/Persisted_variables::memroot	Memory allocated to process persisted variables during server start-up and plugin/component initialization.
+ memory/sql/Persisted_variables::unordered_map	Memory allocated for in-memory maps for persisted variables
+ memory/sql/Persisted_variables::unordered_set	Memory allocated for in-memory sets for persisted variables
++memory/sql/plan_cache_mem_root	Memory allocated for caching optimizer's plans
+ memory/sql/Prepared_statement::infrastructure	Map infrastructure for prepared statements per session.
+ memory/sql/Prepared_statement::main_mem_root	Mem root for each prepared statement for items etc.
+ memory/sql/rm_db::mdl_reqs_root	Mem root for allocating MDL requests while dropping datbase.
+diff --git a/mysql-test/suite/perfschema/t/memory_key_descriptions.test b/mysql-test/suite/perfschema/t/memory_key_descriptions.test
+index eae828009..d6c671001 100644
+--- a/mysql-test/suite/perfschema/t/memory_key_descriptions.test
++++ b/mysql-test/suite/perfschema/t/memory_key_descriptions.test
+@@ -8,6 +8,6 @@ let $query_clause = FROM performance_schema.setup_instruments
+ eval SELECT NAME, DOCUMENTATION $query_clause;
+ eval SET @rows = (SELECT COUNT(NAME) $query_clause);
+ 
+-let $assert_cond = @rows = 61;
++let $assert_cond = @rows = 62;
+ let $assert_text = The number of documented P_S memory keys in the SQL category is as expected.;
+ source include/assert.inc;
+diff --git a/mysql-test/suite/sys_vars/r/all_vars.result b/mysql-test/suite/sys_vars/r/all_vars.result
+index ab906a8ce..2f69410f4 100644
+--- a/mysql-test/suite/sys_vars/r/all_vars.result
++++ b/mysql-test/suite/sys_vars/r/all_vars.result
+@@ -70,6 +70,10 @@ partial_revokes
+ partial_revokes
+ password_require_current
+ password_require_current
++plan_cache
++plan_cache
++plan_cache_allow_change_ratio
++plan_cache_allow_change_ratio
+ pseudo_slave_mode
+ regexp_stack_limit
+ regexp_stack_limit
+diff --git a/mysql-test/suite/sys_vars/r/plan_cache_allow_change_ratio.result b/mysql-test/suite/sys_vars/r/plan_cache_allow_change_ratio.result
+new file mode 100644
+index 000000000..acd164fba
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/plan_cache_allow_change_ratio.result
+@@ -0,0 +1,120 @@
++SET @start_plan_cache_allow_change_ratio = @@session.plan_cache_allow_change_ratio;
++SELECT @start_plan_cache_allow_change_ratio;
++@start_plan_cache_allow_change_ratio
++0.2
++SET @@session.plan_cache_allow_change_ratio = 2;
++SET @@session.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.200000
++SET @@plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@plan_cache_allow_change_ratio = 0.2;
++@@plan_cache_allow_change_ratio = 0.2
++1
++SET @@session.plan_cache_allow_change_ratio = 0;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.000000
++SET @@session.plan_cache_allow_change_ratio = 1;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++1.000000
++SET @@session.plan_cache_allow_change_ratio = 0.5;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.500000
++SET @@session.plan_cache_allow_change_ratio = 100;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++100.000000
++SET @@session.plan_cache_allow_change_ratio = -1;
++Warnings:
++Warning	1292	Truncated incorrect plan_cache_allow_change_ratio value: '-1'
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.000000
++SET @@session.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.200000
++SET @@global.plan_cache_allow_change_ratio = 0;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.000000
++SET @@global.plan_cache_allow_change_ratio = 1;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++1.000000
++SET @@global.plan_cache_allow_change_ratio = 0.5;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.500000
++SET @@global.plan_cache_allow_change_ratio = 100;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++100.000000
++SET @@global.plan_cache_allow_change_ratio = -1;
++Warnings:
++Warning	1292	Truncated incorrect plan_cache_allow_change_ratio value: '-1'
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.000000
++SET @@global.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.200000
++SET @@global.plan_cache_allow_change_ratio = ON;
++ERROR 42000: Incorrect argument type to variable 'plan_cache_allow_change_ratio'
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.200000
++SET @@global.plan_cache_allow_change_ratio = 'test';
++ERROR 42000: Incorrect argument type to variable 'plan_cache_allow_change_ratio'
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.200000
++SET @@session.plan_cache_allow_change_ratio = ' ';
++ERROR 42000: Incorrect argument type to variable 'plan_cache_allow_change_ratio'
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.200000
++SELECT @@global.plan_cache_allow_change_ratio = VARIABLE_VALUE
++FROM performance_schema.global_variables
++WHERE VARIABLE_NAME='plan_cache_allow_change_ratio';
++@@global.plan_cache_allow_change_ratio = VARIABLE_VALUE
++1
++SELECT @@session.plan_cache_allow_change_ratio = VARIABLE_VALUE
++FROM performance_schema.session_variables
++WHERE VARIABLE_NAME='plan_cache_allow_change_ratio';
++@@session.plan_cache_allow_change_ratio = VARIABLE_VALUE
++1
++SET @@session.plan_cache_allow_change_ratio = TRUE;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++1.000000
++SET @@session.plan_cache_allow_change_ratio = FALSE;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.000000
++SET @@global.plan_cache_allow_change_ratio = 100;
++SELECT @@plan_cache_allow_change_ratio = @@global.plan_cache_allow_change_ratio;
++@@plan_cache_allow_change_ratio = @@global.plan_cache_allow_change_ratio
++0
++SET local.plan_cache_allow_change_ratio = 7;
++ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'local.plan_cache_allow_change_ratio = 7' at line 1
++SELECT local.plan_cache_allow_change_ratio;
++ERROR 42S02: Unknown table 'local' in field list
++SET global.plan_cache_allow_change_ratio = 8;
++ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'global.plan_cache_allow_change_ratio = 8' at line 1
++SELECT global.plan_cache_allow_change_ratio;
++ERROR 42S02: Unknown table 'global' in field list
++SELECT plan_cache_allow_change_ratio = @@session.plan_cache_allow_change_ratio;
++ERROR 42S22: Unknown column 'plan_cache_allow_change_ratio' in 'field list'
++SET @@global.plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@global.plan_cache_allow_change_ratio;
++@@global.plan_cache_allow_change_ratio
++0.200000
++SET @@session.plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@session.plan_cache_allow_change_ratio;
++@@session.plan_cache_allow_change_ratio
++0.200000
+diff --git a/mysql-test/suite/sys_vars/t/plan_cache_allow_change_ratio.test b/mysql-test/suite/sys_vars/t/plan_cache_allow_change_ratio.test
+new file mode 100644
+index 000000000..65b1d0a07
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/plan_cache_allow_change_ratio.test
+@@ -0,0 +1,134 @@
++############## mysql-test\t\plan_cache_allow_change_ratio.test ################
++#                                                                             #
++# Variable Name: plan_cache_allow_change_ratio                                #
++# Scope: GLOBAL                                                               #
++# Access Type: Session                                                        #
++# Data Type: double                                                           #
++# Default Value:0.2                                                           #
++# Range: 0-DBL_MAX                                                            #
++#                                                                             #
++# Description: Test Cases of Dynamic System Variable                          #
++#              plan_cache_allow_change_ratio that checks the behavior         #
++#              of this variable in the following ways                         #
++#              * Default Value                                                #
++#              * Valid & Invalid values                                       #
++#              * Scope & Access method                                        #
++#              * Data Intergrity                                              #
++#                                                                             #
++###############################################################################
++
++--source include/load_sysvars.inc
++
++########################################################################
++#              START OF plan_cache_allow_change_ratio TESTS            #
++########################################################################
++SET @start_plan_cache_allow_change_ratio = @@session.plan_cache_allow_change_ratio;
++SELECT @start_plan_cache_allow_change_ratio;
++
++########################################################################
++#      Display the DEFAULT value of plan_cache_allow_change_ratio      #
++########################################################################
++SET @@session.plan_cache_allow_change_ratio = 2;
++SET @@session.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@session.plan_cache_allow_change_ratio;
++
++###############################################
++#     Verify default value of variable        #
++###############################################
++SET @@plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@plan_cache_allow_change_ratio = 0.2;
++
++############################################################################
++#    Change the value of plan_cache_allow_change_ratio to a valid value    #
++############################################################################
++SET @@session.plan_cache_allow_change_ratio = 0;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = 1;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = 0.5;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = 100;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = -1;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@session.plan_cache_allow_change_ratio;
++
++SET @@global.plan_cache_allow_change_ratio = 0;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@global.plan_cache_allow_change_ratio = 1;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@global.plan_cache_allow_change_ratio = 0.5;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@global.plan_cache_allow_change_ratio = 100;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@global.plan_cache_allow_change_ratio = -1;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@global.plan_cache_allow_change_ratio = DEFAULT;
++SELECT @@global.plan_cache_allow_change_ratio;
++
++############################################################################
++#    Change the value of plan_cache_allow_change_ratio to invalid value    #
++############################################################################
++--Error ER_WRONG_TYPE_FOR_VAR
++SET @@global.plan_cache_allow_change_ratio = ON;
++SELECT @@global.plan_cache_allow_change_ratio;
++--Error ER_WRONG_TYPE_FOR_VAR
++SET @@global.plan_cache_allow_change_ratio = 'test';
++SELECT @@global.plan_cache_allow_change_ratio;
++--Error ER_WRONG_TYPE_FOR_VAR
++SET @@session.plan_cache_allow_change_ratio = ' ';
++SELECT @@session.plan_cache_allow_change_ratio;
++
++############################################################################
++#     Check if the value in GLOBAL & SESSION Tables values in variable     #
++############################################################################
++--disable_warnings
++SELECT @@global.plan_cache_allow_change_ratio = VARIABLE_VALUE
++FROM performance_schema.global_variables
++WHERE VARIABLE_NAME='plan_cache_allow_change_ratio';
++
++SELECT @@session.plan_cache_allow_change_ratio = VARIABLE_VALUE
++FROM performance_schema.session_variables
++WHERE VARIABLE_NAME='plan_cache_allow_change_ratio';
++--enable_warnings
++
++############################################################################
++#          Check if TRUE and FALSE values can be used on variable          #
++############################################################################
++SET @@session.plan_cache_allow_change_ratio = TRUE;
++SELECT @@session.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = FALSE;
++SELECT @@session.plan_cache_allow_change_ratio;
++
++###################################################################################################################
++#        Check if accessing variable with SESSION,LOCAL and without SCOPE points to same session variable         #
++###################################################################################################################
++SET @@global.plan_cache_allow_change_ratio = 100;
++SELECT @@plan_cache_allow_change_ratio = @@global.plan_cache_allow_change_ratio;
++
++#################################################################################################
++#        Check if plan_cache_allow_change_ratio can be accessed with and without @@ sign        #
++#################################################################################################
++--Error ER_PARSE_ERROR
++SET local.plan_cache_allow_change_ratio = 7;
++--Error ER_UNKNOWN_TABLE
++SELECT local.plan_cache_allow_change_ratio;
++--Error ER_PARSE_ERROR
++SET global.plan_cache_allow_change_ratio = 8;
++--Error ER_UNKNOWN_TABLE
++SELECT global.plan_cache_allow_change_ratio;
++--Error ER_BAD_FIELD_ERROR
++SELECT plan_cache_allow_change_ratio = @@session.plan_cache_allow_change_ratio;
++
++###########################################
++#          Restore initial value          #
++###########################################
++SET @@global.plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@global.plan_cache_allow_change_ratio;
++SET @@session.plan_cache_allow_change_ratio = @start_plan_cache_allow_change_ratio;
++SELECT @@session.plan_cache_allow_change_ratio;
++
++############################################################
++#        END OF plan_cache_allow_change_ratio TESTS        #
++############################################################
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index ff16877c9..0a17fe593 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -571,6 +571,7 @@ SET(SQL_SHARED_SOURCES
+   sql_partition.cc
+   sql_partition_admin.cc
+   sql_planner.cc
++  sql_plan_cache.cc
+   sql_plugin.cc
+   sql_plugin_var.cc
+   sql_prepare.cc
+diff --git a/sql/item.cc b/sql/item.cc
+index 53fe5d0cf..032fa498c 100644
+--- a/sql/item.cc
++++ b/sql/item.cc
+@@ -3153,7 +3153,8 @@ bool Item_field::eq(const Item *item, bool) const {
+ 
+ table_map Item_field::used_tables() const {
+   if (!table_ref) return 1;  // Temporary table; always table 0
+-  if (table_ref->table->const_table) return 0;  // const item
++  // const item
++  if (table_ref->table && table_ref->table->const_table) return 0;
+   return depended_from ? OUTER_REF_TABLE_BIT : table_ref->map();
+ }
+ 
+diff --git a/sql/item_cmpfunc.cc b/sql/item_cmpfunc.cc
+index 77f622ef7..96cda1d52 100644
+--- a/sql/item_cmpfunc.cc
++++ b/sql/item_cmpfunc.cc
+@@ -7090,6 +7090,11 @@ bool Item_equal::walk(Item_processor processor, enum_walk walk, uchar *arg) {
+     if (item->walk(processor, walk, arg)) return true;
+   }
+ 
++  if (current_thd && current_thd->walk_const_item && m_const_arg &&
++      m_const_arg->walk(processor, walk, arg)) {
++    return true;
++  }
++
+   return (walk & enum_walk::POSTFIX) && (this->*processor)(arg);
+ }
+ 
+diff --git a/sql/item_func.cc b/sql/item_func.cc
+index 987eb010b..0a4b6b33b 100644
+--- a/sql/item_func.cc
++++ b/sql/item_func.cc
+@@ -10006,3 +10006,5 @@ longlong Item_func_internal_is_enabled_role::val_int() {
+ 
+   return 0;
+ }
++
++void Item_var_func::init() { current_thd->lex->set_has_user_or_system_var(); }
+diff --git a/sql/item_func.h b/sql/item_func.h
+index ea575b821..cb11e373a 100644
+--- a/sql/item_func.h
++++ b/sql/item_func.h
+@@ -2922,13 +2922,17 @@ class Item_func_internal_tablespace_data_free : public Item_int_func {
+ */
+ class Item_var_func : public Item_func {
+  public:
+-  Item_var_func() : Item_func() {}
+-  explicit Item_var_func(const POS &pos) : Item_func(pos) {}
++  Item_var_func() : Item_func() { init(); }
++  explicit Item_var_func(const POS &pos) : Item_func(pos) { init(); }
+ 
+-  Item_var_func(THD *thd, Item_var_func *item) : Item_func(thd, item) {}
++  Item_var_func(THD *thd, Item_var_func *item) : Item_func(thd, item) {
++    init();
++  }
++
++  Item_var_func(Item *a) : Item_func(a) { init(); }
++  Item_var_func(const POS &pos, Item *a) : Item_func(pos, a) { init(); }
+ 
+-  Item_var_func(Item *a) : Item_func(a) {}
+-  Item_var_func(const POS &pos, Item *a) : Item_func(pos, a) {}
++  void init();
+ 
+   bool get_date(MYSQL_TIME *ltime, my_time_flags_t fuzzydate) override {
+     return get_date_from_non_temporal(ltime, fuzzydate);
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index 9e00bc391..4dd7da2c8 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -817,6 +817,7 @@ MySQL clients support the protocol:
+ #include "sql/range_optimizer/range_optimizer.h"    // range_optimizer_init
+ #include "sql/replication.h"                        // thd_enter_cond
+ #include "sql/resourcegroups/resource_group_mgr.h"  // init, post_init
++#include "sql/sql_plan_cache.h"                     // cached_plan_count
+ #include "sql/sql_profile.h"
+ #ifdef _WIN32
+ #include "sql/restart_monitor_win.h"
+@@ -10306,6 +10307,22 @@ static int show_deprecated_use_i_s_processlist_last_timestamp(THD *,
+   return 0;
+ }
+ 
++static int show_cached_plan_invalidations(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_LONG;
++  var->value = buff;
++  *((long *)buff) = (long)plan_cache::cached_plan_invalidations.load(
++      std::memory_order_relaxed);
++  return 0;
++}
++
++static int show_cached_plan_count(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_LONG;
++  var->value = buff;
++  *((long *)buff) =
++      (long)plan_cache::cached_plan_count.load(std::memory_order_relaxed);
++  return 0;
++}
++
+ /*
+   Variables shown by SHOW STATUS in alphabetical order
+ */
+@@ -10695,6 +10712,12 @@ SHOW_VAR status_vars[] = {
+     {"Deprecated_use_i_s_processlist_last_timestamp",
+      (char *)&show_deprecated_use_i_s_processlist_last_timestamp, SHOW_FUNC,
+      SHOW_SCOPE_GLOBAL},
++    {"Cached_plan_invalidations", (char *)&show_cached_plan_invalidations,
++     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++    {"Cached_plan_count", (char *)&show_cached_plan_count, SHOW_FUNC,
++     SHOW_SCOPE_GLOBAL},
++    {"Cached_plan_hits", (char *)offsetof(System_status_var, cached_plan_hits),
++     SHOW_LONGLONG_STATUS, SHOW_SCOPE_ALL},
+     {NullS, NullS, SHOW_FUNC, SHOW_SCOPE_ALL}};
+ 
+ void add_terminator(vector<my_option> *options) {
+diff --git a/sql/opt_hints.cc b/sql/opt_hints.cc
+index b889b37f0..6baa09a41 100644
+--- a/sql/opt_hints.cc
++++ b/sql/opt_hints.cc
+@@ -46,6 +46,7 @@
+ #include "sql/sql_const.h"
+ #include "sql/sql_error.h"      // Sql_condition
+ #include "sql/sql_optimizer.h"  // JOIN class
++#include "sql/sql_plan_cache.h"  // emulates_hint
+ #include "sql/sql_select.h"
+ #include "sql/table.h"
+ 
+@@ -914,7 +915,8 @@ bool hint_table_state(const THD *thd, const Table_ref *table_list,
+       return ret_val;
+   }
+ 
+-  return thd->optimizer_switch_flag(optimizer_switch);
++  return thd->optimizer_switch_flag(optimizer_switch) ||
++         plan_cache::emulates_hint(thd, type_arg);
+ }
+ 
+ void append_table_name(const THD *thd, String *str, const LEX_CSTRING *qb_name,
+diff --git a/sql/parse_tree_nodes.cc b/sql/parse_tree_nodes.cc
+index 3bb6a1b5f..7ba9374c3 100644
+--- a/sql/parse_tree_nodes.cc
++++ b/sql/parse_tree_nodes.cc
+@@ -2171,6 +2171,8 @@ bool PT_create_table_default_collation::contextualize(
+ bool PT_locking_clause::contextualize(Parse_context *pc) {
+   LEX *lex = pc->thd->lex;
+ 
++  lex->locking_clause = true;
++
+   if (lex->is_explain()) return false;
+ 
+   if (m_locked_row_action == Locked_row_action::SKIP)
+diff --git a/sql/psi_memory_key.cc b/sql/psi_memory_key.cc
+index ca32ae45d..f6cf12a8f 100644
+--- a/sql/psi_memory_key.cc
++++ b/sql/psi_memory_key.cc
+@@ -145,6 +145,7 @@ PSI_memory_key key_memory_user_var_entry;
+ PSI_memory_key key_memory_user_var_entry_value;
+ PSI_memory_key key_memory_sp_cache;
+ PSI_memory_key key_memory_write_set_extraction;
++PSI_memory_key key_memory_plan_cache_mem_root;
+ 
+ // Percona Server PSI memory keys
+ PSI_memory_key key_memory_userstat_table_stats;
+@@ -381,6 +382,9 @@ static PSI_memory_info all_server_memory[] = {
+     {&key_memory_hash_join, "hash_join", PSI_FLAG_MEM_COLLECT, 0,
+      PSI_DOCUMENT_ME},
+ 
++    {&key_memory_plan_cache_mem_root, "plan_cache_mem_root", 0, 0,
++     "Memory allocated for caching optimizer's plans"},
++
+     {&key_memory_userstat_table_stats, "userstat_table_stats",
+      PSI_FLAG_ONLY_GLOBAL_STAT, 0, PSI_DOCUMENT_ME},
+     {&key_memory_userstat_index_stats, "userstat_index_stats",
+diff --git a/sql/psi_memory_key.h b/sql/psi_memory_key.h
+index 4ddfc484f..adb825528 100644
+--- a/sql/psi_memory_key.h
++++ b/sql/psi_memory_key.h
+@@ -171,6 +171,7 @@ extern PSI_memory_key key_memory_user_var_entry;
+ extern PSI_memory_key key_memory_user_var_entry_value;
+ extern PSI_memory_key key_memory_sp_cache;
+ extern PSI_memory_key key_memory_write_set_extraction;
++extern PSI_memory_key key_memory_plan_cache_mem_root;
+ 
+ // Percona PSI memory keys
+ 
+diff --git a/sql/range_optimizer/index_skip_scan_plan.cc b/sql/range_optimizer/index_skip_scan_plan.cc
+index 147e691c6..2d39e04bb 100644
+--- a/sql/range_optimizer/index_skip_scan_plan.cc
++++ b/sql/range_optimizer/index_skip_scan_plan.cc
+@@ -679,14 +679,16 @@ void dbug_dump_index_skip_scan(int indent, bool verbose,
+       append_range_all_keyparts(nullptr, &range_result, &range_so_far,
+                                 param->index_range_tree,
+                                 param->index_info->key_part, false);
+-      fprintf(DBUG_FILE, "Prefix ranges: %s\n", range_result.c_ptr());
++      fprintf(DBUG_FILE, "Prefix ranges: %.*s\n",
++              static_cast<int>(range_result.length()), range_result.ptr());
+     }
+ 
+     {
+       range_result.length(0);
+       append_range(&range_result, param->range_key_part, param->min_range_key,
+                    param->max_range_key, param->range_cond_flag);
+-      fprintf(DBUG_FILE, "Range: %s\n", range_result.c_ptr());
++      fprintf(DBUG_FILE, "Range: %.*s\n",
++              static_cast<int>(range_result.length()), range_result.ptr());
+     }
+   }
+ }
+diff --git a/sql/sql_class.cc b/sql/sql_class.cc
+index 1fbbb29e9..7cf4a896a 100644
+--- a/sql/sql_class.cc
++++ b/sql/sql_class.cc
+@@ -96,6 +96,7 @@
+ #include "sql/sql_handler.h"  // mysql_ha_cleanup
+ #include "sql/sql_lex.h"
+ #include "sql/sql_parse.h"    // is_update_query
++#include "sql/sql_plan_cache.h"  // cached_plan_count
+ #include "sql/sql_plugin.h"   // plugin_thdvar_init
+ #include "sql/sql_prepare.h"  // Prepared_statement
+ #include "sql/sql_profile.h"
+@@ -1227,6 +1228,8 @@ void THD::cleanup_connection(void) {
+     assert(server_status == SERVER_STATUS_AUTOCOMMIT);
+     /* check prepared stmts are cleaned up */
+     assert(prepared_stmt_count == 0);
++    /* check prepared stmts cached are cleaned up */
++    assert(plan_cache::cached_plan_count.load(std::memory_order_relaxed) == 0);
+     /* check diagnostic area is cleaned up */
+     assert(get_stmt_da()->status() == Diagnostics_area::DA_EMPTY);
+     /* check if temp tables are deleted */
+@@ -2174,6 +2177,12 @@ void THD::rollback_item_tree_changes() {
+   while ((change = it++)) {
+     if (change->m_cancel) continue;
+ 
++    // Note that this printing may provoke Valgrind errors. Indeed, if
++    // *change->place is a pointer to an object which has later been destroyed
++    // (example: the change was recorded by a transformation by the optimizer,
++    // and it was a change to the m_where_cond of a JOIN, which JOIN has been
++    // disposed of), then printing it is an error ; but restoring this pointer
++    // to its previous value is ok.
+     DBUG_PRINT("info", ("rollback_item_tree_changes "
+                         "place %p curr_value %p old_value %p",
+                         change->place, *change->place, change->old_value));
+diff --git a/sql/sql_class.h b/sql/sql_class.h
+index 96d2f68c4..537e67cd8 100644
+--- a/sql/sql_class.h
++++ b/sql/sql_class.h
+@@ -449,6 +449,9 @@ class Query_arena {
+   void free_items();
+   void set_state(enum_state state_arg) { state = state_arg; }
+   enum_state get_state() const { return state; }
++  bool is_stmt_prepared_or_executed() const {
++    return state == STMT_PREPARED || state == STMT_EXECUTED;
++  }
+   bool is_stmt_prepare() const { return state == STMT_INITIALIZED; }
+   bool is_stmt_prepare_or_first_sp_execute() const {
+     return (int)state < (int)STMT_PREPARED;
+@@ -5079,6 +5082,11 @@ class THD : public MDL_context_owner,
+   bool add_external(unsigned int slot, void *data);
+   void *fetch_external(unsigned int slot);
+ 
++  // Only be used in plan_cache::collect_item_params function. If
++  // walk_const_item is set to true, const_item->walk will be called in
++  // Item_equal::walk.
++  bool walk_const_item{false};
++
+  private:
+   std::unordered_map<unsigned int, void *> external_store_;
+ };  // End of class THD
+diff --git a/sql/sql_const.h b/sql/sql_const.h
+index 8d5d53050..5fc945244 100644
+--- a/sql/sql_const.h
++++ b/sql/sql_const.h
+@@ -316,4 +316,15 @@ enum class enum_condition_context {
+ 
+ /// Used to uniquely name expressions in derived tables
+ #define SYNTHETIC_FIELD_NAME "Name_exp_"
++namespace plan_cache {
++/// State of plan cache.
++enum class plan_cache_state {
++  NONE,   ///< Initial state.
++  START,  ///< We are copying a plan for storing into the cache
++  READY,  ///< We have stored a plan in the cache, it can be reused by later
++          ///< queries
++  UNCACHEABLE  ///< The plan which the optimizer is making now cannot be cached
++};
++}  // namespace plan_cache
++
+ #endif /* SQL_CONST_INCLUDED */
+diff --git a/sql/sql_executor.cc b/sql/sql_executor.cc
+index a905c1f0b..7810c90a0 100644
+--- a/sql/sql_executor.cc
++++ b/sql/sql_executor.cc
+@@ -122,7 +122,6 @@ using std::string;
+ using std::unique_ptr;
+ using std::vector;
+ 
+-static int read_system(TABLE *table);
+ static bool alloc_group_fields(JOIN *join, ORDER *group);
+ 
+ /// The minimum size of the record buffer allocated by set_record_buffer().
+@@ -2240,7 +2239,7 @@ static bool UseHashJoin(QEP_TAB *qep_tab) {
+   return qep_tab->op_type == QEP_TAB::OT_BNL;
+ }
+ 
+-static bool UseBKA(QEP_TAB *qep_tab) {
++bool UseBKA(QEP_TAB *qep_tab) {
+   if (qep_tab->op_type != QEP_TAB::OT_BKA) {
+     // Not BKA.
+     return false;
+@@ -3569,16 +3568,8 @@ int join_read_const_table(JOIN_TAB *tab, POSITION *pos) {
+ 
+   if (tab->type() == JT_SYSTEM)
+     error = read_system(table);
+-  else {
+-    if (!table->key_read && table->covering_keys.is_set(tab->ref().key) &&
+-        !table->no_keyread &&
+-        (int)table->reginfo.lock_type <= (int)TL_READ_HIGH_PRIORITY) {
+-      table->set_keyread(true);
+-      tab->set_index(tab->ref().key);
+-    }
+-    error = read_const(table, &tab->ref());
+-    table->set_keyread(false);
+-  }
++  else
++    error = read_const_maybe_key_read(tab);
+ 
+   if (error) {
+     // Promote error to fatal if an actual error was reported
+@@ -3628,7 +3619,7 @@ int join_read_const_table(JOIN_TAB *tab, POSITION *pos) {
+   @retval  -1 Row was not found
+   @retval  1  Got an error (other than row not found) during read
+ */
+-static int read_system(TABLE *table) {
++int read_system(TABLE *table) {
+   int error;
+   if (!table->is_started())  // If first read
+   {
+@@ -3660,6 +3651,34 @@ static int read_system(TABLE *table) {
+   return table->has_row() ? 0 : -1;
+ }
+ 
++/**
++   This is a wrapper around read_const() ; it encapsulates logic which used to
++   be in join_read_const_table() around its call to read_const(). As this
++   logic (which is: enable index read then disable it) is also needed for plan
++   cache, it is now in a function.
++
++   @param qs_owner  JOIN_TAB or QEP_TAB pointer, depending on the execution
++   stage.
++
++   @returns same error code as read_const().
++*/
++int read_const_maybe_key_read(QEP_shared_owner *qs_owner) {
++  auto table = qs_owner->table();
++  auto ref = &qs_owner->ref();
++
++  if (!table->key_read && table->covering_keys.is_set(ref->key) &&
++      !table->no_keyread &&
++      (int)table->reginfo.lock_type <= (int)TL_READ_HIGH_PRIORITY) {
++    table->set_keyread(true);
++    qs_owner->set_index(ref->key);
++  }
++
++  auto rc = read_const(table, ref);
++  table->set_keyread(false);
++  return rc;
++}
++
++/// @See also read_const_maybe_key_read().
+ int read_const(TABLE *table, Index_lookup *ref) {
+   int error;
+   DBUG_TRACE;
+diff --git a/sql/sql_executor.h b/sql/sql_executor.h
+index a9b54c19a..363a1a11c 100644
+--- a/sql/sql_executor.h
++++ b/sql/sql_executor.h
+@@ -255,7 +255,9 @@ bool setup_sum_funcs(THD *thd, Item_sum **func_ptr);
+ bool make_group_fields(JOIN *main_join, JOIN *curr_join);
+ bool check_unique_constraint(TABLE *table);
+ ulonglong unique_hash(const Field *field, ulonglong *hash);
++int read_system(TABLE *table);
+ int read_const(TABLE *table, Index_lookup *ref);
++int read_const_maybe_key_read(QEP_shared_owner *qs_owner);
+ 
+ class QEP_TAB : public QEP_shared_owner {
+  public:
+@@ -282,6 +284,10 @@ class QEP_TAB : public QEP_shared_owner {
+   // Cleans up.
+   void cleanup();
+ 
++  bool replace_cache_key();
++
++  void rerun_constructor_for_tmp_table();
++
+   // Getters and setters
+ 
+   Item *condition_optim() const { return m_condition_optim; }
+@@ -349,6 +355,8 @@ class QEP_TAB : public QEP_shared_owner {
+ 
+   bool pfs_batch_update(const JOIN *join) const;
+ 
++  bool copy_for_plan_cache(THD *thd, QEP_TAB *qep_tab);
++
+  public:
+   /// Pointer to table reference
+   Table_ref *table_ref;
+diff --git a/sql/sql_lex.cc b/sql/sql_lex.cc
+index 14c2de988..ea869d28e 100644
+--- a/sql/sql_lex.cc
++++ b/sql/sql_lex.cc
+@@ -66,6 +66,7 @@
+ #include "sql/sql_lex_hints.h"
+ #include "sql/sql_optimizer.h"  // JOIN
+ #include "sql/sql_parse.h"      // add_to_list
++#include "sql/sql_plan_cache.h"  // plan_cache:is_ready
+ #include "sql/sql_plugin.h"     // plugin_unlock_list
+ #include "sql/sql_profile.h"
+ #include "sql/sql_show.h"   // append_identifier
+@@ -502,6 +503,7 @@ void LEX::reset() {
+   ignore_unknown_user = false;
+   m_has_external_tables = false;
+   reset_rewrite_required();
++  locking_clause = false;
+ }
+ 
+ /**
+@@ -4826,7 +4828,7 @@ void Query_block::restore_cmd_properties() {
+     tbl->restore_properties();
+     tbl->table->m_record_buffer = Record_buffer{0, 0, nullptr};
+   }
+-  assert(join == nullptr);
++  assert(join == nullptr || plan_cache::is_ready(this));
+ 
+   cond_count = saved_cond_count;
+ 
+diff --git a/sql/sql_lex.h b/sql/sql_lex.h
+index 9324e3d5d..f2f0f75a3 100644
+--- a/sql/sql_lex.h
++++ b/sql/sql_lex.h
+@@ -1973,6 +1973,7 @@ class Query_block : public Query_term {
+     should be changed only when THD::LOCK_query_plan mutex is taken.
+   */
+   JOIN *join{nullptr};
++  JOIN *cached_plan{nullptr};
+   /// Set of table references contained in outer-most join nest
+   mem_root_deque<Table_ref *> m_table_nest;
+   /// Pointer to the set of table references in the currently active join
+@@ -2193,6 +2194,9 @@ class Query_block : public Query_term {
+   /// @note that using this means we modify resolved data during optimization
+   uint hidden_items_from_optimization{0};
+ 
++  plan_cache::plan_cache_state plan_cache_state{
++    plan_cache::plan_cache_state::NONE};
++
+  private:
+   friend class Query_expression;
+   friend class Condition_context;
+@@ -4039,6 +4043,8 @@ struct LEX : public Query_tables_list {
+   bool ignore;
+   /// True if query has at least one external table
+   bool m_has_external_tables{false};
++  /// True means this LEX references a user or system variable.
++  bool m_has_user_or_system_var{false};
+ 
+  public:
+   bool is_ignore() const { return ignore; }
+@@ -4048,6 +4054,8 @@ struct LEX : public Query_tables_list {
+   void reset_has_external_tables() { m_has_external_tables = false; }
+   void set_has_external_tables() { m_has_external_tables = true; }
+   bool has_external_tables() const { return m_has_external_tables; }
++  void set_has_user_or_system_var() { m_has_user_or_system_var = true; }
++  bool has_user_or_system_var() const { return m_has_user_or_system_var; }
+   st_parsing_options parsing_options;
+   Alter_info *alter_info;
+   /* Prepared statements SQL syntax:*/
+@@ -4488,6 +4496,9 @@ struct LEX : public Query_tables_list {
+ 
+   bool set_channel_name(LEX_CSTRING name = {});
+ 
++  /* select .. for share/update */
++  bool locking_clause{false};
++
+  private:
+   bool rewrite_required{false};
+ 
+diff --git a/sql/sql_opt_exec_shared.h b/sql/sql_opt_exec_shared.h
+index fca770253..cc474375b 100644
+--- a/sql/sql_opt_exec_shared.h
++++ b/sql/sql_opt_exec_shared.h
+@@ -173,6 +173,8 @@ struct Index_lookup {
+     }
+     return false;
+   }
++
++  bool copy_for_plan_cache(JOIN *join, Index_lookup *ref, QEP_TAB *qep_tab);
+ };
+ 
+ struct CACHE_FIELD;
+@@ -302,6 +304,9 @@ class QEP_shared {
+   void mark_condition_as_pushed_to_sort() {
+     m_condition_is_pushed_to_sort = true;
+   }
++  void reset_condition_as_pushed_to_sort() {
++    m_condition_is_pushed_to_sort = false;
++  }
+   Key_map &keys() { return m_keys; }
+   ha_rows records() const { return m_records; }
+   void set_records(ha_rows r) { m_records = r; }
+@@ -355,6 +360,14 @@ class QEP_shared {
+ 
+   bool skip_records_in_range() const { return m_skip_records_in_range; }
+ 
++  void set_prefix_tables_map(table_map prefix_map) {
++    prefix_tables_map = prefix_map;
++  }
++
++  void set_added_tables_map(table_map added_map) {
++    added_tables_map = added_map;
++  }
++
+  private:
+   JOIN *m_join;
+ 
+@@ -531,6 +544,9 @@ class QEP_shared_owner {
+   void mark_condition_as_pushed_to_sort() {
+     m_qs->mark_condition_as_pushed_to_sort();
+   }
++  void reset_condition_as_pushed_to_sort() {
++    m_qs->reset_condition_as_pushed_to_sort();
++  }
+   Key_map &keys() const { return m_qs->keys(); }
+   ha_rows records() const { return m_qs->records(); }
+   void set_records(ha_rows r) { return m_qs->set_records(r); }
+@@ -570,6 +586,12 @@ class QEP_shared_owner {
+ 
+   void qs_cleanup();
+ 
++  void set_prefix_tables_map(table_map tmp) {
++    m_qs->set_prefix_tables_map(tmp);
++  }
++
++  void set_added_tables_map(table_map tmp) { m_qs->set_added_tables_map(tmp); }
++
+  protected:
+   QEP_shared *m_qs;  // qs stands for Qep_Shared
+ };
+diff --git a/sql/sql_optimizer.cc b/sql/sql_optimizer.cc
+index 3737df585..9d2011af9 100644
+--- a/sql/sql_optimizer.cc
++++ b/sql/sql_optimizer.cc
+@@ -104,6 +104,7 @@
+ #include "sql/sql_const_folding.h"
+ #include "sql/sql_error.h"
+ #include "sql/sql_join_buffer.h"  // JOIN_CACHE
++#include "sql/sql_plan_cache.h"   // PLAN_CACHE
+ #include "sql/sql_planner.h"      // calculate_condition_filter
+ #include "sql/sql_test.h"         // print_where
+ #include "sql/sql_tmp_table.h"
+@@ -201,6 +202,8 @@ JOIN::JOIN(THD *thd_arg, Query_block *select)
+     send_group_parts++;
+ }
+ 
++JOIN::~JOIN() { ::destroy(plan_cache_exec_context); }
++
+ bool JOIN::alloc_ref_item_slice(THD *thd_arg, int sliceno) {
+   assert(sliceno > 0);
+   assert(ref_items[sliceno].is_null());
+@@ -341,14 +344,6 @@ bool JOIN::optimize(bool finalize_access_paths) {
+   Query_block *const set_operand_block =
+       query_expression()->non_simple_result_query_block();
+ 
+-  assert(query_block->leaf_table_count == 0 ||
+-         thd->lex->is_query_tables_locked() ||
+-         query_block == set_operand_block);
+-  assert(tables == 0 && primary_tables == 0 && tables_list == (Table_ref *)1);
+-
+-  // to prevent double initialization on EXPLAIN
+-  if (optimized) return false;
+-
+   DEBUG_SYNC(thd, "before_join_optimize");
+ 
+   THD_STAGE_INFO(thd, stage_optimizing);
+@@ -358,14 +353,31 @@ bool JOIN::optimize(bool finalize_access_paths) {
+   Opt_trace_object trace_optimize(trace, "join_optimization");
+   trace_optimize.add_select_number(query_block->select_number);
+   Opt_trace_array trace_steps(trace, "steps");
++  const bool has_windows = m_windows.elements != 0;
++
++  /// If plan cache is used for this execution, do whatever it needs.
++  if (this == query_block->cached_plan) {
++    m_root_access_path = nullptr;
++    if (zero_result_cause) {
++      create_access_paths_for_zero_rows();
++      goto setup_subq_exit;
++    }
++    goto do_make_tmp_tables_info;
++  }
++
++  assert(query_block->leaf_table_count == 0 ||
++         thd->lex->is_query_tables_locked() ||
++         query_block == set_operand_block);
++  assert(tables == 0 && primary_tables == 0 && tables_list == (Table_ref *)1);
++
++  // to prevent double initialization on EXPLAIN
++  if (optimized) return false;
+ 
+   count_field_types(query_block, &tmp_table_param, *fields, false, false);
+ 
+   assert(tmp_table_param.sum_func_count == 0 || !group_list.empty() ||
+          implicit_grouping);
+ 
+-  const bool has_windows = m_windows.elements != 0;
+-
+   if (has_windows && Window::setup_windows2(thd, &m_windows))
+     return true; /* purecov: inspected */
+ 
+@@ -1036,6 +1048,9 @@ bool JOIN::optimize(bool finalize_access_paths) {
+   if (make_join_readinfo(this, no_jbuf_after))
+     return true; /* purecov: inspected */
+ 
++  plan_cache::cache_plan(this);
++
++do_make_tmp_tables_info:
+   if (make_tmp_tables_info()) return true;
+ 
+   /*
+@@ -10430,6 +10445,7 @@ bool optimize_cond(THD *thd, Item **cond, COND_EQUAL **cond_equal,
+   /*
+     change field = field to field = const for each found field = const
+    */
++  std::set<Item *> params1;
+   if (*cond) {
+     Opt_trace_object step_wrapper(trace);
+     step_wrapper.add_alnum("transformation", "constant_propagation");
+@@ -10440,6 +10456,9 @@ bool optimize_cond(THD *thd, Item **cond, COND_EQUAL **cond_equal,
+       if (propagate_cond_constants(thd, nullptr, *cond, *cond)) return true;
+     }
+     step_wrapper.add("resulting_condition", *cond);
++    // Save initial state before upcoming transformations. If we are not
++    // going to cache the plan, we skip this, to save CPU and memory.
++    plan_cache::collect_item_params(*cond, params1);
+   }
+ 
+   /*
+@@ -10457,6 +10476,7 @@ bool optimize_cond(THD *thd, Item **cond, COND_EQUAL **cond_equal,
+       Opt_trace_array trace_subselect(trace, "subselect_evaluation");
+       if (remove_eq_conds(thd, *cond, cond, cond_value)) return true;
+     }
++    plan_cache::cmp_item_params_after_reduce_cond(thd, params1, *cond);
+     step_wrapper.add("resulting_condition", *cond);
+   }
+   if (thd->is_error()) return true;
+@@ -10511,15 +10531,21 @@ bool remove_eq_conds(THD *thd, Item *cond, Item **retcond,
+     bool should_fix_fields = false;
+     *cond_value = Item::COND_UNDEF;
+     Item *item;
+-    while ((item = li++)) {
+-      Item *new_item;
++    while ((item = li++) != nullptr) {
++      Item **item_ptr = li.ref();
+       Item::cond_result tmp_cond_value;
+-      if (remove_eq_conds(thd, item, &new_item, &tmp_cond_value)) return true;
++      /*
++        Notice that remove_eq_conds() may call fold_condition(), which may
++        call THD::change_item_tree(), which may record the address of the
++        existing item. Passing item_ptr ensures the address persists as long as
++        optimization is valid.
++      */
++      if (remove_eq_conds(thd, item, item_ptr, &tmp_cond_value)) return true;
+ 
+-      if (new_item == nullptr)
++      if (*item_ptr == nullptr)
+         li.remove();
+-      else if (item != new_item) {
+-        (void)li.replace(new_item);
++      else if (*item_ptr != item) {
++       // Pointer to item was replaced in-place
+         should_fix_fields = true;
+       }
+       if (*cond_value == Item::COND_UNDEF) *cond_value = tmp_cond_value;
+diff --git a/sql/sql_optimizer.h b/sql/sql_optimizer.h
+index 681055cc2..61429f20c 100644
+--- a/sql/sql_optimizer.h
++++ b/sql/sql_optimizer.h
+@@ -67,6 +67,11 @@ class Item_equal;
+ template <class T>
+ class mem_root_deque;
+ 
++namespace plan_cache {
++struct Exec_context;
++bool exec_cached_plan(Query_block *sl);
++}  // namespace plan_cache
++
+ // Key_use has a trivial destructor, no need to run it from Mem_root_array.
+ typedef Mem_root_array<Key_use> Key_use_array;
+ 
+@@ -136,6 +141,8 @@ class JOIN {
+   JOIN(const JOIN &rhs) = delete;
+   JOIN &operator=(const JOIN &rhs) = delete;
+ 
++  ~JOIN();
++
+   /// Query expression referring this query block
+   Query_expression *query_expression() const {
+     return query_block->master_query_expression();
+@@ -827,6 +834,10 @@ class JOIN {
+   /// Final execution plan state. Currently used only for EXPLAIN
+   enum_plan_state plan_state{NO_PLAN};
+ 
++  /// False means cached plan has never been hit in any past execution of this
++  /// prepared statement. Otherwise, True.
++  bool cached_plan_hit{false};
++
+  public:
+   /*
+     When join->select_count is set, tables will not be optimized away.
+@@ -1042,6 +1053,11 @@ class JOIN {
+   void create_access_paths();
+ 
+  public:
++  /// Clone for plan cache
++  bool shallow_clone(JOIN *orig);
++  void set_cached_plan_hit() { cached_plan_hit = true; }
++  bool is_cached_plan_hit() const { return cached_plan_hit; }
++
+   /**
+     Create access paths with the knowledge that there are going to be zero rows
+     coming from tables (before aggregation); typically because we know that
+@@ -1072,6 +1088,11 @@ class JOIN {
+     See comments in JOIN::optimize().
+    */
+   AccessPath *m_root_access_path_no_in2exists = nullptr;
++
++ public:
++  plan_cache::Exec_context *plan_cache_exec_context{nullptr};
++  /// Friend functions for plan cache
++  friend bool plan_cache::exec_cached_plan(Query_block *sl);
+ };
+ 
+ /**
+diff --git a/sql/sql_plan_cache.cc b/sql/sql_plan_cache.cc
+new file mode 100644
+index 000000000..6b1b5058d
+--- /dev/null
++++ b/sql/sql_plan_cache.cc
+@@ -0,0 +1,2360 @@
++/* Copyright (c) 2026, Huawei and/or its affiliates. All rights reserved.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is also distributed with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have included with MySQL.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include "sql/sql_plan_cache.h"
++#include "scope_guard.h"  // create_scope_guard
++#include "sql/auth/auth_acls.h"
++#include "sql/item_timefunc.h"  // Item_typecast
++#include "sql/join_optimizer/access_path.h"
++#include "sql/opt_trace.h"  // Opt_trace_object
++#include "sql/range_optimizer/path_helpers.h"
++#include "sql/range_optimizer/range_optimizer.h"
++#include "sql/sql_base.h"
++#include "sql/sql_class.h"
++#include "sql/sql_executor.h"
++#include "sql/sql_optimizer.h"
++#include "sql/sql_parse.h"
++#include "sql/sql_resolver.h"
++#include "sql/sql_select.h"
++#include "sql/temp_table_param.h"
++#include "sql/thd_raii.h"
++#include "sql/window.h"
++
++/*
++  Plan cache works as following process:
++    Prepared_statement::execute_loop
++       Prepared_statement::execute
++       ...
++       make_join_readinfo
++       if (cache_plan)
++         Query_block::cached_plan points to cached plan
++       cached plan start its life
++
++    =======================================
++       Next Prepared_statement::execute
++       ...
++       exec_cached_plan
++         if apply_cached_plan_if_suitable says it cannot
++           if (cached plan needs to be invalidated)
++             invalidate_cached_plan
++             if (cached plan has been hit)
++               executor has freed parts of cached plan (JOIN::destroy()) when
++               previous execution ended, do nothing
++             else
++               call JOIN::destroy() on the cached plan
++             call destructor on cached plan
++         else
++           apply_cached_plan (rebuild freed parts above)
++             Query_block::join == Query_block::cached_plan
++       execute cached plan
++       Query_block::cleanup
++         Query_block::join->destroy;
++         if (using cached plan)
++           reset cached plan status
++         else
++           call destructor on Query_block::join
++
++    =======================================
++       Life end time for cached plan
++       Prepared_statement::~Prepared_statement
++         Lex::destroy
++          ...
++          JOIN::~JOIN
++          cached plan ends life
++
++  Notes (PLAN_CACHE_PORT this is just precisions, not something changed by the
++  porting):
++
++  - when the optimizer thinks a plan cannot be cached, it marks it as
++  UNCACHEABLE and this is a final decision which will apply to all future
++  optimizations of it, even with different values of PS parameters: no plan
++  will be cached. This is probably to avoid possibly-useless
++  can-this-be-cached tests in next optimizations.
++
++  - when the optimizer has a cached plan from before but fails to use it for a
++  new execution, it invalidates this plan, makes a new optimization, and
++  possibly makes a new cached plan.
++
++  New features in the porting:
++
++  - the cached plan is allocated in a dedicated MEM_ROOT, to stop memory
++  growth in the permanent MEM_ROOT (that was an old problem).
++
++  - When caching a plan (cache_plan()) we do not allocate and open a
++  Table_ref anymore; this object was not much used, f.ex. when the plan was
++  later used the JOIN's tables_list was (of course) re-pointed to the instance
++  used by _that_ execution. And it was using memory, also in the engine (as we
++  did open_table()); it caused most of the memory usage of plan cache in simple
++  queries.
++
++  - We added a count of plan cache invalidations in SHOW GLOBAL STATUS.
++
++  - subqueries are supported, in a very restricted scenario (which covers what
++  is used in TPC-C): it has to be a non-correlated scalar subquery, plus some
++  other restrictions.
++*/
++
++// PLAN_CACHE_PORT: pc_[...] refers to plan_cache specific functions
++
++/////////////////// Dependencies
++
++// simple Item-cloning function capable to handle single-table queries
++static Item *clone_if_transient(THD *thd, Item *i);
++
++/*
++ * clone order structure
++ */
++static ORDER *pc_dup_order(THD *thd, Query_block *select [[maybe_unused]],
++                           ORDER *orig) {
++  ORDER *order = new (thd->mem_root) ORDER();
++  if (!order) return nullptr;
++  order->next = nullptr;
++
++  // PLAN_CACHE_PORT By adding a small restriction (see
++  // hidden_items_from_optimization in this file), we ensure that orig->item
++  // points into the Query_block's ref_item_array, and that such array contains
++  // only permanent items. This makes it much simpler to clone an Item used by
++  // an ORDER object: we do not need to clone it: it's a permanent Item, at a
++  // permanent place in the array.
++
++  order->item_initial = orig->item_initial;
++  order->item = orig->item;
++
++#ifndef NDEBUG
++  // check they're permanent indeed
++  auto &transient_items =
++      thd->lex->current_query_block()
++          ->cached_plan->plan_cache_exec_context->transient_items;
++  assert(transient_items.count(order->item_initial) == 0);
++  assert(transient_items.count(*order->item) == 0);
++#endif
++
++  order->direction = orig->direction;
++  order->in_field_list = orig->in_field_list;
++  order->used_alias = orig->used_alias;
++  order->field_in_tmp_table = nullptr;
++  order->buff = nullptr;
++  order->used = 0;
++  order->depend_map = 0;
++  order->is_explicit = orig->is_explicit;
++
++  return order;
++}
++
++void Temp_table_param::copy_for_plan_cache(Temp_table_param *orig) {
++  assert(orig);
++
++  end_write_records = orig->end_write_records;
++  func_count = orig->func_count;
++  sum_func_count = orig->sum_func_count;
++  hidden_field_count = orig->hidden_field_count;
++  group_parts = orig->group_parts;
++  group_length = orig->group_length;
++  group_null_parts = orig->group_null_parts;
++  outer_sum_func_count = orig->outer_sum_func_count;
++  using_outer_summary_function = orig->using_outer_summary_function;
++  schema_table = orig->schema_table;
++  precomputed_group_by = orig->precomputed_group_by;
++  force_copy_fields = orig->force_copy_fields;
++  skip_create_table = orig->skip_create_table;
++  bit_fields_as_long = orig->bit_fields_as_long;
++  can_use_pk_for_unique = orig->can_use_pk_for_unique;
++  hidden_field_count = orig->hidden_field_count;
++  m_window = orig->m_window;
++  allow_group_via_temp_table = orig->allow_group_via_temp_table;
++}
++
++store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
++                         table_map const_tables, const KEY_PART_INFO *key_part,
++                         uchar *key_buff, uint maybe_null);
++
++/*
++ * copy table_ref info.
++ *
++ * @retval:
++ *    false if copy successfully, and otherwise true.
++ */
++bool Index_lookup::copy_for_plan_cache(JOIN *join, Index_lookup *ref,
++                                       QEP_TAB *qep_tab) {
++  THD *thd = join->thd;
++  key_parts = ref->key_parts;
++  key_length = ref->key_length;
++  key_err = ref->key_err;
++  key = ref->key;
++  null_rejecting = ref->null_rejecting;
++  depend_map = ref->depend_map;
++  use_count = ref->use_count;
++  disable_cache = ref->disable_cache;
++
++  assert(key_parts && ref->key_buff);
++  if (!(key_buff = (uchar *)thd->mem_calloc(ALIGN_SIZE(key_length))) ||
++      // key_buff and key_buff2 are not contiguous
++      // anymore see init_ref(), so we need two memcpy (ASAN caught it!)
++      !(key_buff2 = (uchar *)thd->mem_calloc(ALIGN_SIZE(key_length))) ||
++      !(key_copy = (store_key **)thd->mem_calloc(
++            (sizeof(store_key *) * (key_parts)))) ||
++      !(items = (Item **)thd->mem_calloc(sizeof(Item *) * key_parts)) ||
++      !(cond_guards = (bool **)thd->mem_calloc(sizeof(uint *) * key_parts)))
++    return true;
++
++  if (ref->null_ref_key) {
++    null_ref_key = key_buff + (ref->null_ref_key - ref->key_buff);
++  }
++
++  if (key_length > 0) {
++    assert(ref->key_buff != nullptr);
++    auto cpy_size = ALIGN_SIZE(key_length);
++    memcpy(key_buff, ref->key_buff, cpy_size);
++    memcpy(key_buff2, ref->key_buff2, cpy_size);
++  }
++
++  assert(ref->items && ref->cond_guards);
++  Key_use *keyuse = qep_tab->position()->key;
++
++  for (uint i = 0; i < key_parts; i++, keyuse++) {
++    assert(ref->items[i]);
++    items[i] = clone_if_transient(thd, ref->items[i]);
++    if (!items[i]) return true;
++
++    keyuse->val = items[i];
++    keyuse->table_ref = nullptr;  // set later when applying the cached plan.
++    cond_guards[i] = ref->cond_guards[i];
++  }
++  return false;
++}
++
++bool UseBKA(QEP_TAB *qep_tab);
++
++/**
++ * duplicate QEP_TABs of a JOIN
++ *
++ * @param join     target top JOIN
++ * @param top_orig original top JOIN
++ *
++ */
++static bool pc_dup_tabs(JOIN *join, JOIN *top_orig) {
++  auto orig = top_orig;
++  assert(orig == orig->query_block->join);
++#ifndef NDEBUG
++  auto thd = join->thd;
++#endif
++
++  {
++    if (!join) {
++      // At this stage, query block clones normally have a JOIN. But there are
++      // corner cases. It can happen that refix_fields() for the top query's
++      // clone does not go as it did for the top query's original, leading to
++      // more always-false-condition simplification, leading to the subquery's
++      // clone disappearance (Item_subselect::cleanup_after_removal). In that
++      // case, there may be no JOIN anymore in this clone. We thus have
++      // inconsistency between the original and clone of the subquery, and
++      // cannot continue.
++      return true;
++    }
++    SJ_TMP_TABLE *sjtbl = nullptr, *orig_sjtbl = nullptr;
++    join->const_tables = orig->const_tables;
++    join->primary_tables = orig->primary_tables;
++    assert(thd == join->thd);
++    //  It can happen that orig->qep_tab==nullptr if this is a correlated
++    //  subquery executed by a worker and having a zero_result_cause. In this
++    //  case, the clone shouldn't get QEP_TABs either.
++    if (orig->qep_tab) {
++      // create qep_tab
++      QEP_shared *qs = new (join->thd->mem_root) QEP_shared[join->tables + 1];
++      if (!qs) return true;
++      join->qep_tab = new (join->thd->mem_root) QEP_TAB[join->tables + 1];
++      if (!join->qep_tab) return true;
++      join->qep_tab = join->qep_tab;
++
++      for (uint i = 0; i < join->tables; i++) {
++        join->qep_tab[i].set_qs(&qs[i]);
++        join->qep_tab[i].set_join(join);
++        join->qep_tab[i].set_idx(i);
++      }
++
++      for (uint i = 0; i < join->tables; i++) {
++        QEP_TAB *tab = &join->qep_tab[i];
++        QEP_TAB *orig_tab = &orig->qep_tab[i];
++
++        Table_ref *orig_tbl = orig_tab->table_ref;
++        if (!orig_tbl) continue;
++        tab->copy_for_plan_cache(join->thd, orig_tab);
++
++        // set sj-mat-exec structure
++        if (orig_tab->sj_mat_exec()) {
++          assert(false);  // PLAN_CACHE_PORT plan cache => one single table =>
++                          // no semijoin
++        }
++
++        // setup physic table object
++        assert(orig_tbl->table == orig_tab->table());
++        assert(tab->table() == nullptr && tab->table_ref == nullptr);
++
++        if (orig_tab->ref().key_parts &&  // ref access is used
++            tab->ref().copy_for_plan_cache(join, &orig_tab->ref(), tab))
++          return true;
++        // set read key
++        tab->set_keyread_optim();
++      }
++
++      for (uint i = 0; i < join->tables; i++) {
++        QEP_TAB *tab = &join->qep_tab[i];
++        QEP_TAB *orig_tab = &orig->qep_tab[i];
++
++        /**
++           Clone conditions in qep_tab. The attached condition will form
++           FilterIterator above these tables. However, if this table is a tmp
++           table for group-by, we need not clone the condition as it will anyway
++           be built when generating this tmp table in make_tmp_tables_info().
++        */
++        Item *condition = orig_tab->condition();
++        if (condition &&
++            // not a group-by tmp table
++            orig_tab->table_ref) {
++          Item *cond = clone_if_transient(join->thd, condition);
++          if (!cond || DBUG_EVALUATE_IF("pc_dup_tabs_error0", true, false))
++            return true;
++          tab->set_condition(cond);
++          tab->set_condition_optim();
++        }
++
++        /*
++          copy the description of any SJ_TMP_TABLE used for Duplicate
++          Weedout (DW) semi-join strategy.
++
++          Each worker will get its own DW tmp table, thus eliminating duplicates
++          among the rows it processes. Duplicates are NOT eliminated across
++          workers. That is correct, as long as no semi-join-inner table is used
++          as divided table. Proof: all rows of worker 1 (W1) are different from
++          rows of W2, as they include different rows of the divided table which
++          are not considered duplicates (the table not being inner to a
++          semi-join). So there cannot be duplicates between W1 and W2. There can
++          be duplicates generated in W1 by joining with the semi-join-inner
++          table but they are eliminated by W1's tmp table.
++        */
++        if (orig_tab->flush_weedout_table)  // entering a dups-weedout range
++        {
++          /*
++            Make tab->flush_weedout_table point to a copy of
++            orig->flush_weedout_table, with its own temporary table. We'll also
++            store this copy in 'sjtbl', so it can be picked up by the last
++            QEP_TAB in the range.
++
++            This copying cannot be done earlier, like in
++            QEP_TAB::copy_for_plan_cache(), as we need all new QEP_TABs to be
++            set up before we can define the temporary table.
++          */
++          assert(!sjtbl);  // no copy made yet
++          orig_sjtbl = orig_tab->flush_weedout_table;
++          std::array<SJ_TMP_TABLE_TAB, MAX_TABLES> sjtabs;
++          // Transform the list of orig's QEP_TABs used in the original
++          // temporary table, into a list of corresponding new QEP_TABs:
++          auto last_sjtab = std::transform(
++              orig_sjtbl->tabs, orig_sjtbl->tabs_end, sjtabs.begin(),
++              [join, orig](auto &orig_sj_tab) {
++                return SJ_TMP_TABLE_TAB{
++                    join->qep_tab + (orig_sj_tab.qep_tab - orig->qep_tab), 0, 0,
++                    0};
++              });
++
++          sjtbl =
++              create_sj_tmp_table(join->thd, join, sjtabs.begin(), last_sjtab);
++          if (sjtbl == nullptr) {
++            return true;
++          }
++          tab->flush_weedout_table = sjtbl;
++        }
++        if (orig_tab->check_weed_out_table)  // last table in range
++        {
++          // should still point at orig's, and the copy should already exist
++          assert((orig_sjtbl == orig_tab->check_weed_out_table) && sjtbl);
++          tab->check_weed_out_table = sjtbl;
++          sjtbl = orig_sjtbl = nullptr;  // leaving range, use the copy no more
++        }
++      }
++
++    }  // end of if(orig->qep_tab)
++  }    // end of for()
++
++  return false;
++}
++
++Key_use *Key_use::pc_clone(Key_use *new_key_use) {
++  *new_key_use = Key_use(nullptr, nullptr, used_tables, key, keypart, optimize,
++                         keypart_map, ref_table_rows, null_rejecting,
++                         cond_guard, sj_pred_no);
++
++  new_key_use->bound_keyparts = bound_keyparts;
++  new_key_use->fanout = fanout;
++  new_key_use->read_cost = read_cost;
++  return new_key_use;
++}
++
++inline bool null_terminate_key_use_list(Key_use_array *array) {
++  return array->push_back(
++      Key_use(nullptr, nullptr, 0, 0, 0, 0, 0, 0, false, nullptr, 0));
++}
++
++bool POSITION::copy_for_plan_cache(THD *thd, QEP_TAB *orig_tab) {
++  POSITION *orig = orig_tab->position();
++  rows_fetched = orig->rows_fetched;
++  read_cost = orig->read_cost;
++  filter_effect = orig->filter_effect;
++  prefix_rowcount = orig->prefix_rowcount;
++  prefix_cost = orig->prefix_cost;
++  table = nullptr;
++  Key_use *chosen_keyuses[MAX_REF_PARTS];
++  // Clone all of Key_use objects. When clone Index_lookup, value of Key_use
++  // will be cloned and assigned because TABLE is not ready by here and
++  // key_use->val can't be fixed correctly. Note: here we use ref().key to
++  // check instead of orig->key is because RANGE_SCAN might result in
++  // orig->key is not null but ref().key == -1.
++  assert(orig_tab->ref().key != -1 ||
++         (orig_tab->ref().key == -1 && orig_tab->ref().key_parts == 0));
++  // If this is not a REF access, we think that POSITION::key is not necessary
++  // in the clone (RANGE access won't use it) so we don't clone it.
++  if (orig_tab->ref().key != -1) {
++    Key_use_array *key_uses = new (thd->mem_root) Key_use_array(thd->mem_root);
++    if (!key_uses) return true;
++    uint keyparts, length;
++    // JOIN::set_prefix_tables() skips const tables which thus have
++    // prefix_tables()==0, and const tables with bit field record in
++    // join->found_const_table_map, whose initialized value is INNER_TABLE_BIT.
++    table_map used_tables;
++    if (orig_tab->join())
++      used_tables =
++          orig_tab->prefix_tables() | orig_tab->join()->found_const_table_map;
++    else
++      used_tables = orig_tab->prefix_tables() | INNER_TABLE_BIT;
++
++    Key_use *keyuse = orig->key;
++    // calc_length_and_keypart() expects the first Key_use passed in argument
++    // to belong to the key number passed in argument (see the do...while()
++    // loop there). So we advance key_use to satisfy this requirement.
++    while (keyuse->key != (uint)orig_tab->ref().key) keyuse++;
++    // Here we need call this function to recollect chosen_keyuses because we
++    // must make sure POSITION::key are same as Index_lookup::items. Details can
++    // be checked in create_ref_for_key. For example, in a join of table
++    // A with table B with WHERE A.col1=val1 AND A.col1=B.colX AND
++    // A.col2=val2, if table A is first in plan, A.col1=B.colX will be
++    // filtered out because B is not available yet for the REF access
++    // . orig->key will be different from chosen_keyuses after function
++    // filter. So we have to call this function here.
++    calc_length_and_keyparts(keyuse, orig_tab, orig_tab->ref().key, used_tables,
++                             chosen_keyuses, &length, &keyparts, nullptr,
++                             nullptr);
++    assert(keyparts == orig_tab->ref().key_parts);
++    for (size_t i = 0; i < keyparts; i++) {
++      Key_use key_use;
++      chosen_keyuses[i]->pc_clone(&key_use);
++      key_uses->push_back(key_use);
++    }
++    if (null_terminate_key_use_list(key_uses)) return true;
++    key = key_uses->begin();
++  }
++
++  ref_depend_map = orig->ref_depend_map;
++  use_join_buffer = orig->use_join_buffer;
++  sj_strategy = orig->sj_strategy;
++  n_sj_tables = orig->n_sj_tables;
++  dups_producing_tables = orig->dups_producing_tables;
++  first_loosescan_table = orig->first_loosescan_table;
++  loosescan_need_tables = orig->loosescan_need_tables;
++  loosescan_key = orig->loosescan_key;
++  loosescan_parts = orig->loosescan_parts;
++  first_firstmatch_table = orig->first_firstmatch_table;
++  first_firstmatch_rtbl = orig->first_firstmatch_rtbl;
++  firstmatch_need_tables = orig->firstmatch_need_tables;
++  first_dupsweedout_table = orig->first_dupsweedout_table;
++  dupsweedout_tables = orig->dupsweedout_tables;
++  sjm_scan_last_inner = orig->sjm_scan_last_inner;
++  sjm_scan_need_tables = orig->sjm_scan_need_tables;
++
++  return false;
++}
++
++bool QEP_TAB::copy_for_plan_cache(THD *thd, QEP_TAB *orig) {
++  m_reversed_access = orig->m_reversed_access;
++  using_dynamic_range = orig->using_dynamic_range;
++
++  set_type(orig->type());
++  set_index(orig->index());
++  keys().merge(orig->keys());
++  set_prefix_tables_map(orig->prefix_tables());
++  set_added_tables_map(orig->added_tables());
++
++  JOIN *join = this->join();
++  if (!join) return true;
++
++  if (orig->position()) {
++    POSITION *position = new (thd->mem_root) POSITION;
++    if (!position || position->copy_for_plan_cache(thd, orig)) return true;
++    set_position(position);
++  }
++
++  // support semi-join
++  set_first_inner(orig->first_inner());
++  set_last_inner(orig->last_inner());
++  set_first_upper(orig->first_upper());
++  set_first_sj_inner(orig->first_sj_inner());
++  set_last_sj_inner(orig->last_sj_inner());
++  set_skip_records_in_range(orig->skip_records_in_range());
++
++  // semi-join with FirstMatch
++  firstmatch_return = orig->firstmatch_return;
++
++  // semi-join with DuplicateWeedout is handled later
++
++  // semi-join with loose index scan
++  match_tab = orig->match_tab;
++  loosescan_key_len = orig->loosescan_key_len;
++
++  // copy join_buffer info.
++  op_type = orig->op_type;
++  materialize_table = orig->materialize_table;
++  needs_duplicate_removal = orig->needs_duplicate_removal;  // for distinct
++
++  return false;
++}
++
++/// Minion for clone_if_transient(), to reduce code duplication when we make
++/// clones of Item_func-s which have similar layout (example: equal,
++/// greater-than, ...).
++template <typename T>
++T *make_cmp_op(THD *thd, Item_func *op) {
++  assert(op->argument_count() <= 3);
++  Item *args[3];
++  for (uint i = 0; i < op->argument_count(); ++i) {
++    args[i] = clone_if_transient(thd, op->get_arg(i));
++    if (!args[i]) return nullptr;
++  }
++  if constexpr (std::is_base_of_v<Item_func_comparison, T>) {
++    assert(op->argument_count() == 2);
++    return new (thd->mem_root) T(args[0], args[1]);
++  } else if constexpr (std::is_same_v<Item_func_if, T>) {
++    assert(op->argument_count() == 3);
++    return new (thd->mem_root) T(args[0], args[1], args[2]);
++  } else {
++    assert(op->argument_count() == 1);
++    return new (thd->mem_root) T(args[0]);
++  }
++}
++
++/*
++  PLAN_CACHE_PORT
++
++  Here an attempt to make a simple Item-cloning function capable to handle
++  single-table queries.
++
++  Why does plan cache need to clone Items?
++
++  Because the Optimizer modifies WHERE/HAVING conditions (and builds more: ICP
++  condition, per-table condition) (modifications can be: equality propagation,
++  trivial condition removal, change of expressions to generated columns, etc),
++  and these modified conditions are intentionally lost after execution (as a
++  next execution is supposed to re-do the optimization). As the goal of plan
++  cache is to not re-do an optimization, it needs to save the modified,
++  optimized conditions before they disappear. Hence, the need to clone them.
++
++  Some background about Item's life when there is a prepared statement (to be
++  used like this: PREPARE/EXECUTE/EXECUTE/etc, with EXECUTE re-doing a fresh
++  optimization each time): Items which already exist when optimization starts,
++  which are post-resolution, live in the statement's (permanent) MEM_ROOT, so
++  are long-lived ; items created during optimization live in the execution
++  (transient) MEM_ROOT. The latter MEM_ROOT is freed at the end of one
++  execution, so they are short-lived. When an optimization starts, it starts
++  on the long-lived items. It duplicates any AND/OR node into short-lived
++  items (see copy_andor_structure()). For example, "a=1 AND a=a" becomes "a=1
++  NEW_AND a=a" (the '=' are still the original ones, NEW_AND is a new AND i.e.
++  a clone). The advantage of this is that, when the optimizer then sees that
++  "a=a" is always true, it can just disconnect it from NEW_AND by editing the
++  argument list of NEW_AND. At end of execution, the WHERE clause can simply
++  be restored to be the original AND, which still has its two components. But
++  this is not the only mechanism: starting with "a=1 AND b>a", then "a=1
++  NEW_AND b>a", the optimizer makes "a=1 NEW_AND b>1": here we have a
++  modification done to the argument list of the long-lived item ">". To make
++  sure this is undone at the end of execution, the change "a -> 1" in ">" is
++  recorded (change_item_tree()) when it's done, and undone with
++  rollback_item_tree_changes().
++
++  Summary: changes to short-lived items can be done without precaution,
++  changes to long-lived items use change_item_tree().
++
++  So far we say:
++  - long-lived item: return unchanged.
++  - short-lived item: return a clone.
++
++  Abbreviations for the rest: long-lived = LL, short-lived = SL.
++
++  But what about Items with arguments: if the LL item contains (as
++  argument) a SL item (call this "situation SL-in-LL"), or the
++  SL item contains a LL item ("LL-in-SL") ?
++
++  LL-in-SL is no problem: clone the SL, give the clone the LL item as
++  argument. Example: "a=1 NEW_AND b=a", changed to "NEW=(1,a,b)" then to "a
++  NEW= 1 NEW_AND b NEW= 1" where both "=" are SL and "1" is LL (cf
++  eliminate_item_equal()).
++
++  Now to SL-in-LL: in this case the change of argument has been tracked by a
++  call to change_item_tree(). Example: "a=1 NEW_AND FUNC(a)>2". In FUNC, "a"
++  is replaced with "1". "1" is sometimes just a pointer to the "1" in "a=1"
++  (LL), sometimes a copy (SL) (see Item_int::clone_item()), and in the latter
++  case we have SL-in-LL.
++
++  This case poses a hard problem: if, when making the plan cache, we simply
++  store the LL FUNC in our "copy of the Item tree for later", later when we
++  want to use this copy in the next execution, the replacement "a-to-1" has
++  been undone by rollback_item_tree_changes() meanwhile, and we are back to
++  the un-optimized, less efficient "FUNC(a)>2". OTOH if we rather decide to
++  store FUNC(1) in the plan cache (efficient), how do we store it so that it
++  is not rolled back to FUNC(a)? We cannot, unless we clone FUNC (the clone
++  will not be affected by rollback), but then it requires us to implement
++  cloning for ALL SQL functions (not only those created by the optimizer -
++  FUNC could be anything).
++
++  We cannot simply ban such case from plan cache, as it happens in simple
++  queries like:
++  - "a=1 AND b>a", changed to "a=1 NEW_AND b> NEW1" (cf
++  substitute_for_best_equal_field()) (using '>' here, not '=' which triggers
++  another quite different code path),
++  - "time_col IN ('2002-02-02 01:01:01',...)", changed to
++  "time_col IN (NEW<cache>('2002-02-02 01:01:01'),...)" (the <cache>
++  represents a one-time-calculated temporal value ; cf
++  cache_const_expr_transformer()).
++
++  The chosen solution is as follows.
++
++  First, when caching the plan (cf cache_plan()).
++
++  (A) We create a map of all SL items (scanning THD::item_list), which
++  maps the address to nullptr (for now).
++
++  (B) We scan the changes registered by change_item_tree() (which are not yet
++  rolled back), and we build a list of all such changes if they modify a LL
++  item ; if the new value is a SL item then we clone such SL item, so the list
++  contains pairs of type {LL place to change, LL item or clone of SL item to
++  put in the place}.
++
++  When cloning a SL item, the address of the clone is put as second value in
++  the map (replacing nullptr).
++
++  Then when a call to clone_if_transient() is made, check the map: if found,
++  then the item is SL, return the address of its clone, or if nullptr (= not yet
++  cloned), make a clone and return it (and update the map). If not found, then
++  it is LL, return it.
++
++  Next, when applying the cached plan.
++
++  We get conditions saved in the previous phase (no cloning happens, anymore).
++  For the case of "a=1 AND b>a", it means we get "a=1 CLONED_AND b>a". But we
++  also replay changes which we had recorded in a list in (B), which gives us
++  "a=1 CLONED_AND b>CLONED_1", as desired. The replaying is tracked with
++  change_item_tree(), so it is undone when execution ends (due to the usual
++  mechanism of PS).
++
++  If we give up on applying this cached plan due to errors, we rollback the
++  changes above, with an explicit call to rollback_item_tree_changes(). Then
++  we fall through a fresh new optimization.
++
++  [1] which are:
++  - AND, OR
++  - FIELD (only for substitution of expression with a generated column?)
++  - CACHE (to replace 1+2 with <cache>(1+2), addition done only once)
++  - TRIG_COND (only for left join, so with >=2 tables, so can be ignored for
++  - plan cache)
++  - TRUE,FALSE (for always-true/false conditions)
++  - Constants (made by Item::clone_item() implemented only for Item_int and the
++  like)
++  - CAST (from cast_incompatible_args())
++  - EQUAL (from conversion of multiple-equality to plain equality)
++  - IS NOT NULL (for NULL filtering) (only for >=2 tables, so can be ignored for
++  plan cache).
++  - sql_const_folding.cc adds those:
++  - Constants which do not have clone_item(): Item_{date,time,datetime}_literal;
++  - tests IS NULL, IS NOT NULL, >, <, >=, <=, <>;
++  - IF.
++
++  The list above has been compiled by code inspection (which proved to be
++  insufficient) and by running the main mtr suite with plan cache globally
++  enabled, and by running it again with --ps-protocol which makes much more
++  use of prepared statements, thus exercises plan cache a lot.
++  Any non-handled item led to an assertion failure at the end of
++  clone_if_transient(). That revealed the case of Items made by
++  sql_const_folding.cc.
++*/
++Item *clone_if_transient(THD *thd, Item *i) {
++  // transient = short-lived. vs permanent = long-lived.
++  auto &transient_items =
++      thd->lex->current_query_block()
++          ->cached_plan->plan_cache_exec_context->transient_items;
++
++  auto transient = transient_items.find(i);
++  if (transient == transient_items.end()) {
++    // A permanent Item, will continue to exist in next executions, so just use
++    // it.
++    return i;
++  }
++
++  // 'c' stands for " (C)lone of 'i' ".
++  auto c = transient->second;
++  // If a clone already exists, avoid double cloning, use it. Can happen if we
++  // clone where_cond() then the QEP_TAB's condition then the ICP condition
++  // (they may all be equal!).
++  if (c != nullptr) return c;
++
++  // Make a clone. Code depends on the type.
++  switch (i->type()) {
++    case Item::FUNC_ITEM:
++    case Item::COND_ITEM: {
++      auto i_f = down_cast<Item_func *>(i);
++      auto f_t = i_f->functype();
++      switch (f_t) {
++        case Item_func::EQ_FUNC: {
++          c = make_cmp_op<Item_func_eq>(thd, i_f);
++          // need a call to update_used_tables() for proper creation of Filter
++          // access paths containing this item; fix_fields() will do that below.
++          break;
++        }
++        case Item_func::LT_FUNC: {
++          c = make_cmp_op<Item_func_lt>(thd, i_f);
++          break;
++        }
++        case Item_func::GT_FUNC: {
++          c = make_cmp_op<Item_func_gt>(thd, i_f);
++          break;
++        }
++        case Item_func::LE_FUNC: {
++          c = make_cmp_op<Item_func_le>(thd, i_f);
++          break;
++        }
++        case Item_func::GE_FUNC: {
++          c = make_cmp_op<Item_func_ge>(thd, i_f);
++          break;
++        }
++        case Item_func::NE_FUNC: {
++          c = make_cmp_op<Item_func_ne>(thd, i_f);
++          break;
++        }
++        case Item_func::ISNULL_FUNC: {
++          c = make_cmp_op<Item_func_isnull>(thd, i_f);
++          break;
++        }
++        case Item_func::ISNOTNULL_FUNC: {
++          c = make_cmp_op<Item_func_isnotnull>(thd, i_f);
++          break;
++        }
++        case Item_func::IF_FUNC: {
++          c = make_cmp_op<Item_func_if>(thd, i_f);
++          break;
++        }
++        case Item_func::TRUE_FUNC:
++          c = new Item_func_true();
++          break;
++        case Item_func::FALSE_FUNC:
++          c = new Item_func_false();
++          break;
++        case Item_func::COND_AND_FUNC: {
++          // inspired by copy_andor_structure()
++          auto i_cond = down_cast<Item_cond_and *>(i);
++          auto c_cond = new Item_cond_and(thd, i_cond);
++          if (c_cond == nullptr) return nullptr;
++          for (auto &it : *i_cond->argument_list()) {
++            assert(it.real_item());  // Sanity check (no dangling 'ref')
++            auto arg = clone_if_transient(thd, &it);
++            if (arg == nullptr) return nullptr;
++            c_cond->argument_list()->push_back(arg);
++          }
++          c = c_cond;
++          break;
++        }
++        case Item_func::COND_OR_FUNC: {
++          auto i_cond = down_cast<Item_cond_or *>(i);
++          auto c_cond = new Item_cond_or(thd, i_cond);
++          if (c_cond == nullptr) return nullptr;
++          for (auto &it : *i_cond->argument_list()) {
++            assert(it.real_item());  // Sanity check (no dangling 'ref')
++            auto arg = clone_if_transient(thd, &it);
++            if (arg == nullptr) return nullptr;
++            c_cond->argument_list()->push_back(arg);
++          }
++          c = c_cond;
++          break;
++        }
++        case Item_func::TYPECAST_FUNC: {
++          // cf wrap_in_cast()
++          switch (i_f->data_type()) {
++            case MYSQL_TYPE_DATETIME:
++              c = new Item_typecast_datetime(i_f->get_arg(0), false);
++              break;
++            case MYSQL_TYPE_DATE:
++              c = new Item_typecast_date(i_f->get_arg(0), false);
++              break;
++            case MYSQL_TYPE_TIME:
++              c = new Item_typecast_time(i_f->get_arg(0));
++              break;
++            case MYSQL_TYPE_DOUBLE:
++              c = new Item_typecast_real(i_f->get_arg(0));
++              break;
++            default:
++              break;
++          }
++          break;
++        }
++        case Item_func::DATETIME_LITERAL: {
++          auto i_dl = down_cast<Item_datetime_literal *>(i);
++          MYSQL_TIME ltime;
++          i_dl->get_date(&ltime, 0);
++          c = new (thd->mem_root) Item_datetime_literal(
++              &ltime, i_dl->decimals, thd->variables.time_zone);
++          break;
++        }
++        default:
++          break;
++      }
++      break;
++    }
++    case Item::CACHE_ITEM: {
++      // cf Item::cache_const_expr_transformer
++      auto i_cache = down_cast<Item_cache *>(i);
++      auto c_cache =
++          Item_cache::get_cache(i_cache->get_example(), i->result_type());
++      c_cache->setup(i_cache->get_example());
++      c_cache->store(i_cache->get_example());
++      c = c_cache;
++      break;
++    }
++    case Item::FIELD_ITEM: {
++      // Could originate from gc_subst_transformer().
++      auto i_field = down_cast<Item_field *>(i);
++      assert(i_field->field->is_gcol());
++      c = new Item_field(i_field->field);
++      break;
++    }
++    default:
++      break;
++  }
++  if (!c) {
++    // Some constants have a working clone_item().
++    c = i->clone_item();
++  }
++  if (!c) {
++    // Unlike other items above, these two temporal literals have no type() or
++    // functype() to identify them, so we dynamically cast to see:
++    auto i_time = dynamic_cast<Item_time_literal *>(i);
++    if (i_time) {
++      // PLAN_CACHE_PORT inspired by clone_for_plan_cache() for such item;
++      // though no need to alloc 'ltime' on MEM_ROOT, it's used only
++      // temporarily.
++      MYSQL_TIME ltime;
++      i_time->get_time(&ltime);
++      c = new (thd->mem_root) Item_time_literal(&ltime, i_time->decimals);
++    } else {
++      auto i_datetime = dynamic_cast<Item_date_literal *>(i);
++      if (i_datetime) {
++        MYSQL_TIME ltime;
++        i_datetime->get_date(&ltime, 0);
++        c = new (thd->mem_root) Item_date_literal(&ltime);
++      }
++    }
++  }
++  if (!c) {
++    // Still unknown Item, not able to copy this type. We have an assertion
++    // here, because we are interested in discovering uncovered types when
++    // testing internally.
++    assert(false);
++    return nullptr;
++  }
++  Item *dummy = c;
++  // Some ctors above have set 'fixed=true', some not. Run fix_fields().
++  if (!c->fixed) {
++    // fix_fields() on a comparison operator (like "=") may evaluate its
++    // arguments, which is:
++    // - undesirable here
++    // - causing trouble if one argument is a subquery (this subquery's
++    // evaluation may trigger its optimization, with optimize-time Items-s
++    // getting created inside the persistent MEM_ROOT currently active!).
++    // So we turn this evaluation off.
++    auto flag_on = thd->lex->context_analysis_only & CONTEXT_ANALYSIS_ONLY_VIEW;
++    thd->lex->context_analysis_only |= CONTEXT_ANALYSIS_ONLY_VIEW;
++    bool rc = c->fix_fields(thd, &dummy);
++    if (!flag_on)
++      thd->lex->context_analysis_only &= ~CONTEXT_ANALYSIS_ONLY_VIEW;
++    if (rc) return nullptr;
++    assert(dummy == c);
++  }
++  transient_items[i] = c;
++  return c;
++}
++
++/**
++ PLAN_CACHE_PORT this is needed in the new plan cache implementation, where
++ we sometimes re-use the permanent items instead of cloning everything.
++
++ This function stores 'src' into 'dst' and refreshes 'used_tables'. Also, for
++ a condition, it makes a copy of the AND-OR structure ; because the condition
++ may be modified later in the process (*) so we need the modification to be done
++ on a copy, so the original is preserved for the next execution.
++
++ (*) details: after we have applied the cached plan, make_tmp_tables_info()
++ runs. Which calls JOIN::add_having_as_tmp_table_cond(). This function may
++ move HAVING into the QEP_TAB's condition, like this: qep_tab condition =
++ qep_tab condition AND having condition. If before this, qep_tab condition was
++ an AND then we now have qep_tab condition = (A AND B) AND having condition.
++ then Item_cond::fix_fields() on this new AND will dissolve the nested AND:
++ qep_tab condition = A AND B AND having condition. And this dissolving has
++ the side effect that the old AND Item_cond_and becomes empty (in
++ cond->list.clear() in Item_cond::fix_fields()). If we didn't make a copy
++ here, then this would make the cached condition empty, so a next execution
++ (next applying of the cached plan) would be wrong.
++
++ @param dst store the new item here
++ @param src source item
++ @param is_cond if true, this is used as condition.
++*/
++static inline void get_item_and_refresh(Item *&dst, Item *src, bool is_cond) {
++  dst = src;
++  if (!src) return;
++  if (is_cond) dst = dst->copy_andor_structure(current_thd);
++  // It is important to update Item-s after we rolled forward
++  // Exec_context::new_change_list, so they know they are constant (e.g. due
++  // to rolling forward a constant propagation in an argument). You may search
++  // for "update_used_tables" in session_plan_cache.test for an example.
++  dst->update_used_tables();
++}
++
++/**
++  This function is used for plan cache. When reuse a cached plan for a ref
++  scan, if referenced value is changed, this function is responsible to change
++  the values of store_keys of Index_lookup.
++
++  This function was made by copying create_ref_for_key() and simplifying.
++*/
++bool QEP_TAB::replace_cache_key() {
++  Index_lookup *t_ref = &ref();
++  THD *const thd = join()->thd;
++  Key_use *keyuse = NULL;
++  KEY *const keyinfo = table()->key_info + t_ref->key;
++  uchar *key_buff = t_ref->key_buff;
++
++  auto set_size = ALIGN_SIZE(t_ref->key_length);
++  memset(key_buff, 0, set_size);
++  memset(t_ref->key_buff2, 0, set_size);
++
++  for (uint part_no = 0; part_no < t_ref->key_parts; part_no++) {
++    keyuse = &position()->key[part_no];
++    bool maybe_null = keyinfo->key_part[part_no].null_bit;
++
++    get_item_and_refresh(keyuse->val, keyuse->val, false);
++
++    store_key *s_key = get_store_key(
++        thd, keyuse->val, join()->const_table_map, join()->const_table_map,
++        &keyinfo->key_part[part_no], key_buff, maybe_null);
++    if (unlikely(!s_key || thd->is_fatal_error())) return true;
++
++    /* PLAN_CACHE_PORT the original plan cache does not test the return value,
++       which is like in create_ref_for_key(). However I think it's better to
++       test it. Consider that we have "WHERE idx_col=?", and we're in
++       optimization, an index lookup is chosen, and '?' has a value which is in
++       the range of idx_col. reduce_cond_for_table() runs, using test_if_ref(),
++       and decides that the post-lookup filter (Item_func_eq) is redundant (it
++       is, as the value of '?' is in-bounds), and eliminates it. We cache this
++       plan. Then we re-execute, but with a value of '?' out of bounds of
++       idx_col. copy() below truncates it to a bound, the lookup is done, and
++       may return a wrong row. And there's no post-lookup filter to eliminate
++       this row, anymore. Thus, if truncation happens, we bail out. The effect
++       will be that plan cache will not be used for this execution. */
++    if (s_key->copy() != store_key::STORE_KEY_OK) return true;
++
++    if (s_key->null_key)
++      t_ref->key_copy[part_no] = s_key;  // Reevaluate in JOIN::exec()
++    else
++      t_ref->key_copy[part_no] = NULL;
++
++    key_buff += keyinfo->key_part[part_no].store_length;
++  }
++  return false;
++}
++
++/// This function is a very simplified, sort of copy constructor for JOIN, for
++/// the use of session-plan-cache.
++///
++/// @todo see if we can merge it with JOIN::copy_for_plan_cache
++/// @returns true if error
++
++bool JOIN::shallow_clone(JOIN *orig) {
++  // If, in the future, new members are added to class JOIN, they probably
++  // must be copied here.
++
++  tables_list = query_block->leaf_tables;
++  const_table_map = orig->const_table_map;
++  where_cond = orig->where_cond;
++  having_cond = orig->having_cond;
++  having_for_explain = orig->having_for_explain;
++  tables = orig->tables;
++  explain_flags = orig->explain_flags;
++  calc_found_rows = orig->calc_found_rows;
++  m_select_limit = orig->m_select_limit;
++  send_group_parts = orig->send_group_parts;
++  grouped = orig->grouped;
++  group_optimized_away = orig->group_optimized_away;
++  implicit_grouping = orig->implicit_grouping;
++  need_tmp_before_win = orig->need_tmp_before_win;
++  simple_group = orig->simple_group;
++  simple_order = orig->simple_order;
++  streaming_aggregation = orig->streaming_aggregation;
++  m_ordered_index_usage = orig->m_ordered_index_usage;
++  skip_sort_order = orig->skip_sort_order;
++  select_distinct = orig->select_distinct;
++  group_list = orig->group_list;
++  order = orig->order;
++  rollup_state = orig->rollup_state;
++  best_read = orig->best_read;
++  // PLAN_CACHE_PORT this is used in Query_expression::optimize() so let's try
++  // to not let it stay at 0.
++  best_rowcount = orig->best_rowcount;
++  m_windows_sort = orig->m_windows_sort;
++
++  return false;
++}
++
++/**
++   When a plan is cached, QEP_TABs for tmp tables are allocated into this plan
++   (e.g. tmp table for GROUP BY). They remain empty, because the intention
++   that when the plan is applied, make_tmp_tables_info() will fill them.
++   However, when the plan is applied a second time, this 'filling' needs to be
++   cleared, so that make_tmp_tables_info() can run properly again. Overall, it
++   means we have to re-run the constructor.
++
++   Note that at the end of the first execution of the cached plan,
++   QEP_TAB::cleanup() has been called on this QEP_TAB. All that remains after
++   that in QEP_TAB, is dangling pointers like condition(), integer or boolean
++   members describing plan details... Thus this function's job is to clear
++   these.
++ */
++void QEP_TAB::rerun_constructor_for_tmp_table() {
++  // This function is only for optimizer-internal tmp tables
++  assert(table_ref == nullptr);
++  auto save_join = join();  // save ptr before losing it
++  auto save_idx = idx();
++  // Using placement-new to overwrite existing object with empty object.
++  auto *new_qs = new (m_qs) QEP_shared;
++  assert(new_qs == m_qs);
++  auto new_tab [[maybe_unused]] = new (this) QEP_TAB;
++  assert(new_tab == this);
++  set_qs(new_qs);
++  set_join(save_join);
++  set_idx(save_idx);
++  // The primary motivation for this function is to clear the short-lived
++  // condition created by JOIN::add_having_as_tmp_table_cond(); so:
++  assert(condition() == nullptr);
++}
++
++/////////////////// End of dependencies
++
++namespace plan_cache {
++
++std::atomic<ulong> cached_plan_count{0};
++std::atomic<ulong> cached_plan_invalidations{0};
++
++class Clone_plan_RAII {
++ public:
++  explicit Clone_plan_RAII(THD *thd)
++      : m_thd(thd),
++        save_want_privilege(m_thd->want_privilege),
++        save_allow_sum_func(m_thd->lex->allow_sum_func) {
++    m_thd->want_privilege = SELECT_ACL;
++    m_thd->lex->allow_sum_func |= ((nesting_map)1)
++                                  << m_thd->lex->query_block->nest_level;
++  }
++  ~Clone_plan_RAII() {
++    m_thd->want_privilege = save_want_privilege;
++    m_thd->lex->allow_sum_func = save_allow_sum_func;
++  }
++
++ private:
++  THD *m_thd;
++  ulonglong save_want_privilege;
++  nesting_map save_allow_sum_func;
++};
++
++void set_uncacheable(Query_block *sl) {
++  sl->plan_cache_state = plan_cache_state::UNCACHEABLE;
++  // This state is final. After that, 'sl' will never do plan caching.
++}
++
++/// Throws away an already cached plan.
++void invalidate_cached_plan(Query_block *select) {
++  JOIN *plan = select->cached_plan;
++  if (!plan) return;
++
++  Opt_trace_context *const trace = &plan->thd->opt_trace;
++  Opt_trace_object trace_plan_cache(trace, "invalidate_cached_plan");
++  trace_plan_cache.add("invalidate", true);
++  // If already hit, plan->destroy() has been called already (when a previous
++  // execution ended, which had join==plan). Avoid double call:
++
++  // PLAN_CACHE_PORT let me explain more. Independently of plan caching, after
++  // execution of a plan, JOIN::destroy() is called and this function does not
++  // support being called a 2nd time (the QEP_TAB::cleanup() function may have
++  // destroyed some members in table() especially if this was a materialized
++  // tmp table, so on 2nd time there are unreadable pointers). Let's bring
++  // caching in. In the normal situation of "1 cache a plan, 2 re-use cached
++  // plan, 3 re-use cached plan once more", in step 2 the JOIN is the cached
++  // plan, and thus at end of step 2 there is a call to JOIN::destroy() on it,
++  // in step 3 we re-fill it properly (apply_cached_plan() etc), so at the end
++  // of step 3 it can go into another JOIN::destroy() fine. Now to
++  // invalidation. In the situation of "1 cache a plan, 2 re-use cached plan,
++  // 3 try to re-use it once more but see it cannot so invalidate it", the
++  // invalidation in 3 operates on a plan which has just gone out of
++  // JOIN::destroy(), so we mustn't do it again. While in the situation of "1
++  // cache a plan, 2 try to re-use it once more but see it cannot so
++  // invalidate it", the invalidation in 2 operates on a plan which has not
++  // just gone through JOIN::destroy(), so we must do it. Hence this if(),
++  // which interprets "this plan has been used at least once" to "so
++  // invalidation is occurring after a recent call to JOIN::destroy()".
++  // Personally I think that this interpretation, though generally true as I
++  // tried to explain, is possibly not fool-proof in all scenarios of
++  // failures.
++
++  if (!plan->is_cached_plan_hit()) plan->destroy();
++  destroy_cached_plan(plan);
++  select->cached_plan = nullptr;
++  select->plan_cache_state = plan_cache_state::NONE;
++  cached_plan_invalidations++;
++}
++
++void destroy_cached_plan(JOIN *join) {
++  cached_plan_count--;
++  auto arena = (join->plan_cache_exec_context != nullptr)
++                   ? join->plan_cache_exec_context->arena
++                   : nullptr;
++  destroy(join);  // Note: this is a call to ~JOIN(), not to JOIN::destroy(),
++  // and it calls ~Exec_context() too. Which is why we saved
++  // Exec_context::arena first.
++  if (arena) {
++    cleanup_items(arena->item_list());
++    // This is necessary, or we may leak memory. F.ex. we cloned an Item_json
++    // and Item_json::clone_item() allocated a Json_dom on the heap (not on a
++    // MEM_ROOT ; look at all the calls to 'new' in json_dom.cc) ; this thing
++    // remains reachable only from Item_json. We must free it by calling the
++    // destructor of Item_json below.
++    arena->free_items();
++    // This is where memory allocated in a MEM_ROOT to hold the cached plan
++    // (Exec_context, JOIN, QEP_TAB, clones of Items...), is finally freed. We
++    // have to be cautious: the MEM_ROOT itself is allocated in its own
++    // buffers (see at the end of cache_plan(), the variable mem_root_heap),
++    // so if we destroy the MEM_ROOT it risks becoming unreadable by its
++    // own destructor. So we first move this MEM_ROOT to a stack object, which
++    // takes ownership of the buffers, and whose destructor is then implicitly
++    // called when it goes out of scope. This is the reverse operation
++    // (move-to-stack) of what was done at the end of cache_plan()
++    // (move-from-stack).
++    auto root(std::move(*arena->mem_root));
++    // Make sure the compiler moved it, not copied it.
++    assert(arena->mem_root->allocated_size() == 0 &&
++           root.allocated_size() != 0);
++    ::destroy(arena);
++  }
++}
++
++bool is_ready(Query_block *sl) {
++  return sl->plan_cache_state == plan_cache_state::READY;
++}
++
++void set_ready(Query_block *sl) {
++  sl->plan_cache_state = plan_cache_state::READY;
++}
++
++static Key_map get_quick_key_map(AccessPath *quick) {
++  Key_map keys_map{0};
++  auto idx = used_index(quick);
++  if (idx != MAX_KEY)
++    keys_map.set_bit(idx);
++  else {
++    Mem_root_array<AccessPath *> *children = nullptr;
++    switch (quick->type) {
++      case AccessPath::ROWID_UNION:
++        children = quick->rowid_union().children;
++        break;
++      case AccessPath::INDEX_MERGE:
++        children = quick->index_merge().children;
++        break;
++      case AccessPath::ROWID_INTERSECTION:
++        children = quick->rowid_intersection().children;
++        break;
++      default:
++        assert(0);
++        break;
++    }
++    if (children) {
++      for (auto inner_path : *children)
++        keys_map.merge(get_quick_key_map(inner_path));
++    }
++  }
++
++  return keys_map;
++}
++
++/*
++ * Check whether current plan can be cached.
++ *
++ * @param[in] join pointer of current plan object
++ *
++ * @retval FALSE plan can't be cached. Otherwise, it can be.
++ */
++bool check_query_plan_cacheable(JOIN *join) {
++  Query_block *select = join->query_block;
++  auto leaf_table_count = select->leaf_table_count;
++  // Only one table
++  if (leaf_table_count != 1) return false;
++
++  Query_expression *unit = select->master_query_expression();
++  THD *thd = join->thd;
++  if (!thd->lex->m_sql_cmd) return false;
++  // "WHERE col=@a" may be optimized to WHERE FALSE or WHERE TRUE, which
++  // cannot be cached in a plan as @a may change.
++  if (thd->lex->has_user_or_system_var()) return false;
++  // For WITH ROLLUP, items in query_block::fields will be transformed into
++  // Item_rollup**, which can't be found in query_block::fields, making
++  // make_group_order_list fail and plan not be cached. We short-cut this
++  // case.
++  if (select->olap == ROLLUP_TYPE) return false;
++  // Don't support stored procedure.
++  if (thd->sp_runtime_ctx) return false;
++  // Don't support stored function.
++  if (thd->lex->sroutines_list.elements > 0) return false;
++
++  // Don't support query under lock tables because clone plan needs open a new
++  // table which causes a mess under lock tables.
++  if (thd->locked_tables_mode == LTM_LOCK_TABLES ||
++      thd->locked_tables_mode == LTM_PRELOCKED_UNDER_LOCK_TABLES)
++    return false;
++
++  // Here we need check UNION from root Query_expression. Because
++  // fake_select_lex can be null for UNION ALL. PLAN_CACHE_PORT: also blocking
++  // EXCEPT,INTERSECT (possible in .41).
++  if (unit->is_set_operation()) return false;
++
++  if (!(  // user asked to cache plans
++          thd->variables.plan_cache_enabled &&
++          // must be a prepared statement
++          thd->stmt_arena->is_stmt_prepared_or_executed() &&
++          // must be a SELECT command
++          select->parent_lex->sql_command == SQLCOM_SELECT))
++    return false;
++
++  if (unit->outer_query_block()) {
++    // If this is a subquery, it should be scalar and not correlated. This is
++    // to ensure that :
++    // - it undergoes no transformation,
++    // - its value is not parameterized on the outer query block's current row
++    // (which would complicate plan caching).
++    // Last, max-min is the product of a subquery transformation, we do not
++    // want to tackle the complexity of these yet.
++    if (!(unit->item &&
++          unit->item->substype() == Item_subselect::SINGLEROW_SUBS &&
++          !down_cast<Item_singlerow_subselect *>(unit->item)->is_maxmin() &&
++          !unit->item->is_uncacheable()))
++      return false;
++    // If Item tree changes have been done, given that THD::change_list is
++    // common to all query blocks, this makes it impossible for us to identify
++    // which changes must be replayed later in apply_cached_plan().
++    if (!thd->change_list.is_empty()) return false;
++  }
++
++  if (select->first_inner_query_expression()) {
++    // If this contains a subquery, see above
++    auto inner_unit = select->first_inner_query_expression();
++    if (!(inner_unit->item &&
++          inner_unit->item->substype() == Item_subselect::SINGLEROW_SUBS &&
++          !down_cast<Item_singlerow_subselect *>(inner_unit->item)
++               ->is_maxmin() &&
++          !inner_unit->item->is_uncacheable()))
++      return false;
++    if (!thd->change_list.is_empty()) return false;
++  }
++
++  for (uint i = 0; i < leaf_table_count; ++i) {
++    QEP_TAB *qep_tab = &join->qep_tab[i];
++    TABLE *table = qep_tab->table();
++    // Fulltext is not supported
++    if (qep_tab->type() == JT_FT) return false;
++    if (table->s->is_secondary_engine()) return false;
++  }
++
++  if (is_temporary_table(select->leaf_tables) ||
++      // Don't support information_schema table
++      select->leaf_tables->schema_table ||
++      select->leaf_tables->is_system_view ||
++      is_infoschema_db(select->leaf_tables->db) ||
++      is_perfschema_db(select->leaf_tables->db))
++    return false;
++
++  if (select->hidden_items_from_optimization > 0) {
++    // Some fields were added to Query_block::fields during optimization, and
++    // as we do not repeat this addition when applying a cached plan, we are
++    // not able to re-create a correct execution. So, no plan caching. Grep
++    // for this counter for more details. The known case is: ORDER BY <expr>
++    // where <expr> is replaced by the Optimizer with a generated column. This
++    // is a new limitation in the new implementation.
++    return false;
++  }
++
++  // Considering where cache_plan() is called, this holds. See related
++  // comment in reinit_qep_tab_properties().
++  assert(join->zero_result_cause == nullptr);
++
++  // Note that when using the hypergraph optimizer, JOIN::optimize() does not
++  // call cache_plan(). So the plan cache does not work with such optimizer;
++  // and to solve this, it would need a design change, as it needs a QEP_TAB
++  // whereas the hypergraph optimizer does not create any.
++
++  return true;
++}
++
++/*
++ * During clone plan, we need clone ORDER/GROUP BY list. This is because some
++ * optimization might occur for ORDER/GROUP BY statement. For example
++ * ORDER/GROUP BY '1', col1: optimizer will remove const expression '1' in
++ * remove_const(). Thus plan cache should clone such list so as to reuse such
++ * an optimization. The ORDER BY clause of WINDOW does not undergo the same
++ * optimization so we needn't clone it.
++ *
++ * @skip_fix is used to mark whether ORDER object needs a refix. When cache
++ * a plan, it's not necessary. There is one case for virtual column in ORDER
++ * object. Optimizer will create a Item_field to replace an expression with
++ * related virtual column. Such a Item_field is created in current memory,
++ * which can't be referenced by cached plan because such a Item_field will be
++ * destroyed after query ends. So it should not be fixed during cached plan.
++ */
++static bool make_group_order_list(THD *thd, Query_block *sl, ORDER **dst,
++                                  ORDER *orig, bool skip_fix [[maybe_unused]]) {
++  assert(dst && !*dst);
++  ORDER *ptr = nullptr;
++  for (ORDER *group = orig; group; group = group->next) {
++    ORDER *group_new = pc_dup_order(thd, sl, group);
++    if (!group_new) return true;
++    if (ptr) {
++      ptr->next = group_new;
++      ptr = ptr->next;
++    } else {
++      ptr = group_new;
++    }
++    // Point to the first cloned ORDER item.
++    if (!*dst) *dst = ptr;
++  }
++  return false;
++}
++
++bool Exec_context::fill(THD *thd, JOIN *join, QEP_TAB *cached_qep_tab) {
++  optimizer_switch =
++      (thd->variables.optimizer_switch & interested_optimizer_switch_flags);
++
++  // Do deep copy for tmp_table_param, see cache_plan() for details
++  if (!(tmp_table_param = new (thd->mem_root)
++            Temp_table_param(thd->mem_root, join->tmp_table_param)))
++    return true;
++
++  character_set_client = thd->variables.character_set_client;
++  auto orig_tab = &join->qep_tab[0];
++  TABLE *table = orig_tab->table();
++  if (table->file->pushed_idx_cond &&
++      (!(pushed_idx_cond =
++             clone_if_transient(thd, table->file->pushed_idx_cond))))
++    return true;
++  pushed_idx_cond_keyno = table->file->pushed_idx_cond_keyno;
++  key_read = table->key_read;
++  // Note that we are after partition pruning, so the number below is that of
++  // remaining partitions. Later when we want to reuse this plan, we'll be
++  // before pruning, thus is_table_stats_changed_sharply() will compare apple
++  // to oranges which may lead to invalidation of the plan, alas.
++  table_records = table->file->stats.records;
++  table_version = table->s->get_table_ref_version();
++  covering_keys = table->covering_keys;
++  // Used to check whether secondary engine optimization is needed.
++  current_query_cost = join->best_read;
++  Query_block *sl = join->query_block;
++  if (join->group_list.order) {
++    ORDER *order = nullptr;
++    if (make_group_order_list(thd, sl, &order, join->group_list.order, true))
++      return true;
++    distinct_group_list =
++        new (thd->mem_root) ORDER_with_src(order, join->group_list.src);
++    if (!distinct_group_list) return true;
++  }
++  if (join->order.order) {
++    ORDER *order = nullptr;
++    if (make_group_order_list(thd, sl, &order, join->order.order, true))
++      return true;
++    order_list = new (thd->mem_root) ORDER_with_src(order, join->order.src);
++    if (!order_list) return true;
++  }
++
++  if (join->where_cond &&
++      (!(where_cond = clone_if_transient(thd, join->where_cond))))
++    return true;
++  if (join->having_cond &&
++      (!(having_cond = clone_if_transient(thd, join->having_cond))))
++    return true;
++
++  auto *quick = orig_tab->range_scan();
++
++  if (quick) {
++    // pc_dup_tabs() has cloned the QUICK_SELECT_I.
++    // We do not store this clone into the being-cached
++    // plan, because when we later reuse the plan, we would have to update
++    // values in the intervals of ranges to match the new values of prepared
++    // statements' parameters for the new execution, which is complex.
++    // Instead, when this plan is later reused, its QUICK_SELECT_I will be
++    // regenerated by a call to test_quick_select().
++    quick_type = quick->type;
++    quick_keys_map.merge(get_quick_key_map(quick));
++    if (quick->type == AccessPath::INDEX_RANGE_SCAN)
++      index_range_scan_props = quick->index_range_scan();
++    quick_used_key_parts = get_used_key_parts(quick);
++  }
++
++  tab_condition = cached_qep_tab->condition();
++
++  /* Here we have some members of JOIN which have already been copied from the
++  original JOIN to our JOIN by JOIN::shallow_clone(). However, after this
++  copying happened, their values in the original JOIN will be modified (most
++  often in JOIN::make_tmp_tables_info() and callees). You may think this is
++  ok, as our JOIN is already made at this time. But now imagine we apply the
++  cached plan. Now it is our JOIN (the cached JOIN) which is going to go
++  through make_tmp_tables_info() and its members will be modified. So when we
++  apply the cached plan a second time (i.e. when we are starting the third
++  execution of the prepared statement), the members in our cached JOIN will
++  not be what they used to be: the third execution will not start on the same
++  state as the second did, leading to bugs. This is why we back up these
++  members in the context. */
++  explain_flags = join->explain_flags;
++  calc_found_rows = join->calc_found_rows;
++  m_select_limit = join->m_select_limit;
++  grouped = join->grouped;
++  streaming_aggregation = join->streaming_aggregation;
++  select_distinct = join->select_distinct;
++  // rollup_state should also be copied as it's modified, but is not needed as
++  // plan cache does not support ROLLUP.
++  assert(join->rollup_state == JOIN::RollupState::NONE);
++  best_read = join->best_read;
++
++  return false;
++}
++
++static bool has_same_type_and_item_params(Item *old_val, Item *new_val);
++
++/**
++ * Entry to cache execution plan
++ *
++ * Check whether current plan is applicable to cache plan. If it is,
++ * plan will be cloned and stored.
++ * @returns true if error
++ */
++bool cache_plan(JOIN *orig_join) {
++  THD *thd = orig_join->thd;
++  Query_block *sl = orig_join->query_block;
++  if (is_ready(sl)) return false;  // already cached
++  // If optimizer thinks that current plan can't be cached, then skip.
++  if (sl->plan_cache_state == plan_cache_state::UNCACHEABLE) return false;
++  // Check further whether the query is applicable to be cached.
++  if (!check_query_plan_cacheable(orig_join)) return false;
++
++  Opt_trace_context *const trace = &thd->opt_trace;
++  Opt_trace_object trace_wrapper(trace);
++  Opt_trace_object trace_plan_cache(trace, "cache_plan");
++  sl->plan_cache_state = plan_cache_state::START;
++  assert(thd->stmt_arena);
++
++  // Before switching to a new MEM_ROOT, save pointers to transient items:
++  auto transient_mem_root = thd->mem_root;
++  auto transient_item_list = thd->item_list();
++
++  // We here switch to a MEM_ROOT which is dedicated to plan cache. It makes
++  // sense, as the current MEM_ROOT (the execution MEM_ROOT), will be freed at
++  // the end of execution, and our cached plan (JOIN, Item-s etc) must survive
++  // longer. The original implementation instead used the statement's
++  // permanent MEM_ROOT (thd->stmt_arena->mem_root). But this had a bad
++  // consequence: if we later invalidated this plan, and then made a new
++  // cached plan, invalidated it, etc, we used to grow the permanent MEM_ROOT
++  // indefinitely as we made new clones (yes this can happen in real life,
++  // grep for GROUP_INDEX_SKIP_SCAN in session_plan_cache.test; it can also be
++  // provoked at will, if you look at is_environment_changed(): prepare,
++  // execute, change optimizer_switch flag to "mrr=off", execute, change to
++  // "mrr=on", execute, repeat forever).
++
++  MEM_ROOT mem_root{key_memory_plan_cache_mem_root, 1024};
++
++  // When a plan is invalidated, the MEM_ROOT above is freed, and so are any
++  // Items which were allocated into it. Therefore, these Items must not be
++  // left in the item_list() of some Query_arena which would outlive the plan.
++  // We thus have a dedicated arena too:
++  Query_arena arena(&mem_root, Query_arena::STMT_PREPARED), arena_backup;
++  // With this, all new Items created by the plan cache will be in the
++  // item_list() of 'arena', and thd->mem_root is updated.
++  thd->swap_query_arena(arena, &arena_backup);
++
++  Clone_plan_RAII cpr(thd);
++  JOIN *join_local = new (thd->mem_root) JOIN(thd, sl);
++
++  auto error_guard =
++      create_scope_guard([&trace_plan_cache, orig_join, join_local, sl, thd,
++                          &arena, &arena_backup]() {
++        trace_plan_cache.add("cached", false);
++        orig_join->query_block->cached_plan = nullptr;
++        if (join_local) {
++          join_local->destroy();
++          ::destroy(join_local);
++        }
++        set_uncacheable(sl);
++        // return to the previous arena and destroy unneeded Items
++        thd->swap_query_arena(arena_backup, &arena);
++        cleanup_items(arena.item_list());
++        arena.free_items();
++        // MEM_ROOT is on stack, will be destroyed implicitly.
++      });
++
++  auto some_item_param_are_gone = [thd]() {
++    // Check whether Item_param objects have been optimized away or transformed
++    // into other type. If so, cached plan must be invalidated.
++    I_List_iterator<Item_change_record> it(thd->change_list);
++    Item_change_record *change;
++    while ((change = it++)) {
++      if (!has_same_type_and_item_params(change->old_value,
++                                         change->new_value)) {
++        return true;
++      }
++    }
++    return false;
++  };
++
++  // We run the check a first time now ; if it fails, it saves us from doing
++  // useless allocations; it also prevents clone_if_transient() from calling
++  // clone_item() on the special case of an Item_int_with_ref wrapping a
++  // (non-constant) Item_param, a case where clone_item() fails with assertion
++  // failure.
++  if (some_item_param_are_gone()) return true;
++
++  if (!(join_local->plan_cache_exec_context =
++            new (thd->mem_root) Exec_context(thd->mem_root)))
++    return true;
++
++  orig_join->query_block->cached_plan = join_local;
++  join_local->shallow_clone(orig_join);
++  // No Table_ref is stored in the cached plan.
++  join_local->tables_list = nullptr;
++
++  {
++    auto &transient_items_map =  // shorter synonym
++        join_local->plan_cache_exec_context->transient_items;
++
++    for (auto i = transient_item_list; i != nullptr; i = i->next_free) {
++      if (transient_mem_root->Contains(i)) {
++        assert(transient_items_map.count(i) ==
++               0);                         // There is uniqueness in list.
++        transient_items_map[i] = nullptr;  // No clone exists yet.
++      } else {
++        // As we are in execution, when it started the execution Query_arena
++        // has been activated, which (cf set_query_arena()) has changed
++        // THD::item_list(). So all items we meet in transient_item_list
++        // should be in the transient MEM_ROOT.
++        assert(false);
++      }
++    }
++
++    auto &new_change_list =
++        join_local->plan_cache_exec_context->new_change_list;
++
++    I_List_iterator<Item_change_record> it(thd->change_list);
++    Item_change_record *change;
++    while ((change = it++)) {
++      assert(!change->m_cancel);  // A grep in code shows it's always false
++      // Track only changes to permanent items. Transient items will
++      // disappear.
++      if (!transient_mem_root->Contains(change->place))
++        new_change_list.push_back({change->place, change->new_value});
++    }
++    // Vector is in order last-change-is-first. Reverse it, because we want
++    // new_change_list to start with older changes first, as we will replay
++    // them in such order when we apply the cached plan.
++    std::reverse(new_change_list.begin(), new_change_list.end());
++    // Clone transient items and record the clone's address.
++    for (auto &c : new_change_list) {
++      if (transient_mem_root->Contains(c.second)) {
++        auto n = clone_if_transient(thd, c.second);
++        if (!n) return true;
++        c.second = n;
++      }
++    }
++  }
++
++  if (pc_dup_tabs(join_local, orig_join)) return true;
++  // During clone, fix_fields might do a transformation, which might cause
++  // the plan to not be cacheable
++  if (sl->plan_cache_state == plan_cache_state::UNCACHEABLE) return true;
++  // Do deep copy for tmp_table_param. Following execution on join_local may
++  // allocate memory when create temp table, if allocate memory on
++  // thd->stmt_arena may result in increased memory usage even OOM for long
++  // session, need to reinitialize mem root allocator for copy_fields and
++  // grouped_expressions to thd->mem_root, instead of use permanent memory
++  // of prepared statement(thd->stmt_arena). Note "new (&...)" operator is
++  // placement-new which doesn't allocate any memory, no need to delete it
++  // manually.
++  new (&join_local->tmp_table_param)
++      Temp_table_param(thd->mem_root, orig_join->tmp_table_param);
++
++  if (join_local->plan_cache_exec_context->fill(thd, orig_join,
++                                                join_local->qep_tab))
++    return true;
++
++  // Repeat the check done when the function started, because since then, we
++  // cloned and fixed more Items, which may have changed types again (usually
++  // happens in the fixing of equalities).
++  if (some_item_param_are_gone()) return true;
++
++  // Here we reset m_qs->m_table to be nullptr in order to free such a cached
++  // plan correctly because TABLE::file might be closed when such a cached
++  // plan tries to free itself, such as this cached plan is never hit.
++  join_local->qep_tab[0].set_table(nullptr);
++
++  set_ready(sl);
++
++  if (join_local->alloc_func_list()) return true;
++
++  // Now we have to protect the plan's MEM_ROOT (an object on the stack) from
++  // being deleted when leaving the function. For that, we save (move) it to
++  // heap memory and keep a pointer in the Exec_context. And do the same for
++  // Query_arena.
++  auto root_storage = mem_root.Alloc(sizeof(MEM_ROOT));
++  if (root_storage == nullptr) return true;
++  auto arena_storage = mem_root.Alloc(sizeof(Query_arena));
++  if (arena_storage == nullptr) return true;
++
++  thd->swap_query_arena(arena_backup, &arena);
++  error_guard.release();
++  // From here, no call must fail until the function ends.
++  auto mem_root_heap = new (root_storage) MEM_ROOT(std::move(mem_root));
++  // Make sure the compiler moved it, not copied it.
++  assert(mem_root.allocated_size() == 0 &&
++         mem_root_heap->allocated_size() != 0);
++  // Query_arena has no move constructor so we do a swap.
++  auto arena_heap = new (arena_storage) Query_arena();
++  std::swap(arena, *arena_heap);
++  assert(arena.mem_root == nullptr && arena_heap->mem_root == &mem_root);
++  arena_heap->mem_root = mem_root_heap;
++  // Items which have just been created for this plan, are not going to be
++  // used in this execution, so we clean up them up, as is commonly done when
++  // an execution ends. They will be re-bound (to tables) with bind_fields().
++  cleanup_items(arena_heap->item_list());
++  join_local->plan_cache_exec_context->arena = arena_heap;
++  cached_plan_count++;
++  trace_plan_cache.add("cached", true);
++  return false;
++}
++
++/// @returns true if Plan Cache wants the optimizer to assume that a certain
++/// hint has been used. @See comment in Exec_context::fill().
++bool emulates_hint(const THD *thd, opt_hints_enum hint) {
++  auto qb = thd->lex->current_query_block();
++  JOIN *plan = qb ? qb->cached_plan : nullptr;
++  if (!plan) return false;
++  auto quick_type = plan->plan_cache_exec_context->quick_type;
++  switch (hint) {
++    case INDEX_MERGE_HINT_ENUM:
++      if (quick_type == AccessPath::ROWID_UNION ||
++          quick_type == AccessPath::ROWID_INTERSECTION ||
++          quick_type == AccessPath::INDEX_MERGE)
++        return true;
++      break;
++    case SKIP_SCAN_HINT_ENUM:
++      if (quick_type == AccessPath::INDEX_SKIP_SCAN) return true;
++      break;
++    default:
++      break;
++  }
++  return false;
++}
++
++static int evaluate_const_cond(THD *thd, Item *const_cond) {
++  bool const_cond_result = true;
++  if (const_cond) {
++    const_cond_result = const_cond->val_int() != 0;
++    if (thd->is_error()) return 1;
++  }
++  if (!const_cond_result) return -1;
++
++  return 0;
++}
++
++/**
++   Initialize properties for QEP_TAB according to scan method.
++
++   @param qt pointer of QEP_TAB
++
++   @retval 0 success
++           1 error
++          -1 nullable table is returned.
++*/
++static int reinit_qep_tab_properties(QEP_TAB *qt) {
++  JOIN *join = qt->join();
++  THD *thd = join->thd;
++  Item *qep_cond = nullptr;
++  get_item_and_refresh(qep_cond, join->plan_cache_exec_context->tab_condition,
++                       true);
++  qt->set_condition(qep_cond);
++  qt->reset_condition_as_pushed_to_sort();
++  Item *where_cond = nullptr;
++  get_item_and_refresh(where_cond, join->query_block->where_cond(), true);
++  // Approximate number of found rows to read them, ndp need this information
++  // Only one matching row for JT_SYSTEM or JT_CONST, otherwise use file->stats
++  ha_rows read_rows = 1;
++  if (qt->type() != JT_SYSTEM && qt->type() != JT_CONST) {
++    read_rows = qt->table()->file->stats.records;
++  }
++  qt->set_records(read_rows);
++
++  assert(!join->zero_result_cause);  // per reset_cached_plan()
++
++  switch (qt->type()) {
++    case JT_SYSTEM: {
++      TABLE *table = qt->table();
++      // Verify that this is still a system table.
++      if (!((table->s->system || table->file->stats.records <= 1 ||
++             table->all_partitions_pruned_away) &&
++            (table->file->ha_table_flags() & HA_STATS_RECORDS_IS_EXACT))) {
++        return 1;
++      }
++      int status = read_system(qt->table());
++      if (status == 0) {
++        // Imagine that the query is SELECT FROM const_table WHERE cond; Then,
++        // Then, in the first optimization, 'cond' was evaluated, let's assume
++        // it was TRUE (if it was FALSE, then we got a zero_result_cause and
++        // the plan was not cached). 'cond' was not recorded in QEP_TABs.
++        // Maybe now the table's single row's value has changed and we thus
++        // must evaluate 'cond' again, in case it is FALSE now.  As the plan
++        // cache is only about one table, we can test the whole WHERE
++        // condition.
++        status = evaluate_const_cond(thd, where_cond);
++      }
++      if (status == -1) join->zero_result_cause = "Impossible WHERE";
++      return status;
++    }
++    case JT_CONST: {
++      // This table still has the right indexes which make it JT_CONST, unless
++      // there was a DDL to change indexes, but in that case plan cache
++      // detected the change in metadata version number and invalidated the
++      // plan.
++      if (qt->replace_cache_key()) return 1;
++      int status = read_const_maybe_key_read(qt);
++      if (status == 0) status = evaluate_const_cond(thd, where_cond);
++      if (status == -1) join->zero_result_cause = "Impossible WHERE";
++      return status;
++    }
++    case JT_EQ_REF:
++    case JT_REF_OR_NULL:
++    case JT_REF:
++      if (qt->replace_cache_key()) return 1;
++      break;
++    case JT_INDEX_MERGE:
++    case JT_RANGE: {
++      AccessPath *qck;
++      qt->set_skip_records_in_range(true);
++      Key_map needed_reg_dummy;
++      // During test_quick_select, needs cost information.
++      qt->table()->init_cost_model(join->cost_model());
++      auto interesting_order =
++          join->order.order ? join->order.order->direction : ORDER_NOT_RELEVANT;
++      auto &cached_props =
++          join->plan_cache_exec_context->index_range_scan_props;
++      if (join->plan_cache_exec_context->quick_type ==
++              AccessPath::INDEX_RANGE_SCAN &&
++          !(cached_props.mrr_flags & HA_MRR_SORTED)) {
++        // It means that the original range access was created without
++        // consideration of ORDER BY (see 'order_direction' usage in
++        // check_quick_select()); it can happen if the caller was
++        // get_quick_record_count(). So, we should do the same.
++        interesting_order = ORDER_NOT_RELEVANT;
++      }
++
++      MEM_ROOT temp_mem_root(key_memory_test_quick_select_exec,
++                             thd->variables.range_alloc_block_size);
++      int rc = test_quick_select(
++          thd, thd->mem_root, &temp_mem_root,
++          join->plan_cache_exec_context->quick_keys_map,  // keys_to_use
++          0,                                              // prev_tables
++          0,                                              // read_tables
++          join->calc_found_rows ? HA_POS_ERROR
++                                : join->query_expression()->select_limit_cnt,
++          true,  // force quick range
++          interesting_order, qt->table(),
++          true,  // skip_records_in_range
++          join->query_block->where_cond(), &needed_reg_dummy,
++          true,  // ignore_table_scan,
++          join->query_block, &qck);
++      DBUG_EXECUTE_IF("plan_cache_debug_test_quick_select_fail", rc = 0;);
++      if (!rc) {
++        return 1;
++      } else if (rc == -1) {
++        join->zero_result_cause = "Impossible range";
++        return -1;  // impossible range
++      }
++      if (thd->is_error())  // @todo consolidate error reporting of
++        // test_quick_select
++        return 1;
++      // Verify that the new QUICK_SELECT_I is of the same type and keys as the
++      // cached plan had. Imagine the chosen index has changed from A to B:
++      // maybe with A some ORDER BY was superfluous and removed by the
++      // optimizer, while with B it is not superfluous and we would miss the
++      // removed ORDER BY. The same is true for the type, if it has changed
++      // from RANGE to INDEX MERGE.
++      if (qck && qck->type == join->plan_cache_exec_context->quick_type) {
++        if (get_quick_key_map(qck) !=
++            join->plan_cache_exec_context->quick_keys_map)
++          return 1;
++        if (qck->type == AccessPath::INDEX_RANGE_SCAN) {
++          if (cached_props.reverse &&
++              make_reverse(get_used_key_parts(qck), qck))
++            return 1;
++          if (cached_props.mrr_flags & HA_MRR_SORTED) {
++            // Setting this flag is not done by test_quick_select() but by
++            // test_if_skip_sort_order() which we have not called. So:
++            set_need_sorted_output(qck);
++          }
++          // If DS-MRR (disk-sweep multi-range-read) is used : as we skipped the
++          // call to records_in_range() in test_quick_select() above (to save
++          // time), the estimated number of records is different, and so is the
++          // buffer size. If the new one is smaller, it can be inefficient, so
++          // we increase it to become as big as the old one. If, instead, it is
++          // bigger, this is suspicious, we do not want to allocate a big buffer
++          // based on missing cost calculations.
++          auto &new_props = qck->index_range_scan();
++          if (new_props.mrr_buf_size < cached_props.mrr_buf_size)
++            new_props.mrr_buf_size = cached_props.mrr_buf_size;
++          // Check that other non-pointer properties are equal
++          if (new_props.num_ranges != cached_props.num_ranges ||
++              new_props.mrr_flags != cached_props.mrr_flags ||
++              new_props.mrr_buf_size != cached_props.mrr_buf_size ||
++              new_props.index != cached_props.index ||
++              new_props.num_used_key_parts != cached_props.num_used_key_parts ||
++              new_props.can_be_used_for_ror !=
++                  cached_props.can_be_used_for_ror ||
++              new_props.need_rows_in_rowid_order !=
++                  cached_props.need_rows_in_rowid_order ||
++              new_props.can_be_used_for_imerge !=
++                  cached_props.can_be_used_for_imerge ||
++              new_props.reuse_handler != cached_props.reuse_handler ||
++              new_props.geometry != cached_props.geometry ||
++              new_props.reverse != cached_props.reverse ||
++              new_props.using_extended_key_parts !=
++                  cached_props.using_extended_key_parts)
++            return 1;
++        }
++        if (join->plan_cache_exec_context->quick_used_key_parts !=
++            get_used_key_parts(qck))
++          return 1;
++        qt->set_range_scan(qck);
++        qt->set_type(calc_join_type(qck));
++      } else
++        return 1;
++    } break;
++    case JT_INDEX_SCAN:
++      // Item_param will make sure key_part type to be compatible with value
++      // result type. Here we skip to do such a check.
++    case JT_ALL:
++      break;
++    case JT_FT:
++    default:
++      assert(0);
++  }
++  return 0;
++}
++
++static bool apply_cached_plan(JOIN *join);
++
++/** Check cached plan and see whether it's ready to be used. If it can be
++ * used, then apply cached plan.
++ *
++ * This function will check constraints to see whether current cached plan is
++ * adapted to be used. For example, if the table related is altered during
++ * applying, plan cache won't be reused and will be invalidated.
++ *
++ * @retval True means cached plan is not ready or some thing wrong happens.
++ * Otherwise false.
++ */
++static bool apply_cached_plan_if_suitable(THD *thd, Query_block *query_block,
++                                          Opt_trace_object &trace) {
++  JOIN *cached_plan = query_block->cached_plan;
++  assert(cached_plan);
++  Exec_context *context = cached_plan->plan_cache_exec_context;
++  Table_ref *tl = query_block->leaf_tables;
++
++  auto error_guard = create_scope_guard(
++      [query_block]() { invalidate_cached_plan(query_block); });
++
++  if (!thd->change_list.is_empty()) {
++    // We expect the change list to be empty, because we are in execution,
++    // resolution has not been re-done, and we are at the very start of
++    // optimization.But if there are multiple query blocks (like subqueries)
++    // another query block may have started its optimization and filled the
++    // changed list. If not empty, we would not know how to undo (in case of
++    // error) only the changes which apply_cached_plan() is about to do.
++    return true;
++  }
++
++  // Checked when we cached plan, checked again when we reuse cached plan:
++  if (tl->table->s->is_secondary_engine()) {
++    trace.add("used", false);
++    trace.add_utf8("cause", "Table is using secondary engine");
++    return true;
++  }
++  if (tl->fetch_number_of_rows()) return true;
++
++  /*
++    PLAN_CACHE_PORT in .22, ANALYZE causes a re-preparation of the prepared
++    statement and thus an invalidation of the cached plan (this was visible in
++    the mtr test); but in .41 this changed due to
++    3a32cf15f02c065dbe429625731659c095068663 BUG#32224917: ANALYZE TABLE TAKES
++    TABLE LOCK DURING INDEX STATS UPDATE, CAUSES QUERY PILEUP, and they don't
++    invalidate TABLE_SHARE any more, they just invalidate TABLE, and
++    table_ref_version() does not change. So a cached plan is not anymore
++    invalidated by ANALYZE TABLE.
++  */
++  if (tl->table->s->get_table_ref_version() != context->table_version) {
++    // PLAN_CACHE_PORT note that this is not covered in the test (even in the
++    // original patch in .22): if version changed, statement repreparation
++    // occurred which invalidated the cached plan immediately, so we do not come
++    // here.
++    trace.add("used", false);
++    trace.add_utf8("cause", "DDL was done on cached table");
++    return true;
++  }
++  if (context->is_environment_changed(thd)) {
++    trace.add("used", false);
++    trace.add_utf8("cause", "Optimizer_switch or character set was changed");
++    return true;
++  }
++  if (context->is_table_stats_changed_sharply(
++          tl->table->file->stats.records,
++          thd->variables.plan_cache_allow_change_ratio)) {
++    trace.add("used", false);
++    trace.add("cached table records", context->table_records);
++    trace.add("current table records", tl->table->file->stats.records);
++    trace.add_utf8("cause", "Number of table records was changed sharply");
++    return true;
++  }
++
++  if (apply_cached_plan(cached_plan)) {
++    trace.add("used", false);
++    trace.add_utf8("cause", "Error happened during apply cached plan");
++    return true;
++  }
++
++  thd->lock_query_plan();
++  query_block->join = cached_plan;
++  thd->unlock_query_plan();
++
++  cached_plan->set_cached_plan_hit();
++  error_guard.release();
++  return false;
++}
++
++static bool refix_table(JOIN *join, TABLE *table) {
++  table->covering_keys = join->plan_cache_exec_context->covering_keys;
++  // When applying the plan, we do not clone any Item: clones, if they are
++  // needed, were already made during plan caching, and they were made
++  // long-lived.
++  Item *cond;
++  get_item_and_refresh(cond, join->plan_cache_exec_context->pushed_idx_cond,
++                       true);
++  if (cond != nullptr) {
++    auto keyno = join->plan_cache_exec_context->pushed_idx_cond_keyno;
++    auto not_pushed [[maybe_unused]] = table->file->idx_cond_push(keyno, cond);
++    // Verify that the engine accepted our request
++    assert(not_pushed == nullptr &&
++           keyno == table->file->pushed_idx_cond_keyno &&
++           cond == table->file->pushed_idx_cond);
++  } else {
++    table->file->cancel_pushed_idx_cond();
++  }
++
++  if (join->plan_cache_exec_context->key_read) table->set_keyread(true);
++
++  return false;
++}
++
++/**
++  Entrance to take use of cached plan.
++
++  @param sl Pointer of current query block.
++
++  This function will check whether cached plan can be used any more. If does,
++  cached plan will be restored and apply it to current query block.
++
++  @retval True means some error happens. Optimizer will re-optimize current
++  query. Otherwise, False means cached plan applies.
++*/
++bool exec_cached_plan(Query_block *sl) {
++  if (!sl) return true;
++  THD *thd = sl->parent_lex->thd;
++  // user asked to use cached plans or plan is not cached
++  if (!thd->variables.plan_cache_enabled || !is_ready(sl)) return true;
++  Opt_trace_context *const trace = &thd->opt_trace;
++  Opt_trace_object trace_wrapper(trace);
++  Opt_trace_object trace_plan_cache(trace, "apply_cached_plan");
++  // LIMIT is required for optimization
++  if (sl->master_query_expression()->set_limit(thd, sl)) return true;
++
++  if (apply_cached_plan_if_suitable(thd, sl, trace_plan_cache)) return true;
++
++  // From now on, the cached plan is registered in sl->join, we must be
++  // careful in error paths.
++
++  // Execute some final steps of optimization.
++  assert(sl->plan_cache_state == plan_cache_state::READY);
++  JOIN *join = sl->join;
++  Table_ref *leaf_tables = sl->leaf_tables;
++  uint leaf_table_count = sl->leaf_table_count;
++  int status = 0;
++  // Now we only support query with one table
++  assert(leaf_table_count == 1);
++
++  auto hints_table_saved = leaf_tables->opt_hints_table;
++
++  auto error_guard = create_scope_guard([&trace_plan_cache, sl, thd, join,
++                                         leaf_tables, hints_table_saved]() {
++    trace_plan_cache.add("used", false);
++    trace_plan_cache.add_utf8("cause",
++                              "Error happened during apply cached plan");
++    // cancel what refix_table() has done on the table, to return the table to
++    // a state similar to what is expected when JOIN::optimize() starts
++    auto table = leaf_tables->table;
++    table->covering_keys = leaf_tables->get_covering_keys_saved();
++    table->file->cancel_pushed_idx_cond();
++    table->set_keyread(false);
++    // Cancel the hint which was added for the range optimizer
++    leaf_tables->opt_hints_table = hints_table_saved;
++    thd->rollback_item_tree_changes();  // if failure after apply_cached_plan().
++    // It was ready earlier in this function (see some assertion above), and
++    // invalidate_cached_plan() has not been called yet:
++    assert(is_ready(sl));
++    join->destroy();
++    // this is to replace other invalidations scattered in
++    // callees. It makes sense to say: if it failed to apply, no matter why,
++    // invalidate it.
++    invalidate_cached_plan(sl);
++  });
++
++  const bool has_windows = join->m_windows.elements != 0;
++  if (has_windows && Window::setup_windows2(thd, &sl->join->m_windows))
++    return true;
++
++  if (join->alloc_indirection_slices()) return true;
++  // The base ref items from query block are assigned as JOIN's ref items
++  join->ref_items[REF_SLICE_ACTIVE] = sl->base_ref_items;
++
++  for (uint i = 0; i < leaf_table_count; ++i) {
++    QEP_TAB *qep_tab = &join->qep_tab[i];
++    TABLE *table = leaf_tables->table;
++
++    assert(table);
++    Key_use *keyuse = qep_tab->position()->key;
++    if (keyuse) keyuse->table_ref = leaf_tables;
++    if (refix_table(join, table)) return true;
++    // If multiple tables, map2qep_tab should be used to set correct
++    // table_ref for qep_tab.
++    qep_tab->set_table(table);
++    if (join->plan_cache_exec_context->quick_type != -1) {
++      // reinit_qep_tab_properties() will soon call the range optimizer. To
++      // ensure that such function will pick the exact same type of range
++      // access path as we had in the cached plan, we have modified
++      // hint_table_state() and also create a table hint (used by
++      // idx_merge_hint_state()). It is unfortunately not respecting the
++      // layout of hint classes (it is not "resolved", it has no
++      // PT_key_level_hint, etc), due to the complexity of such layout.
++      auto opt_hints_table =
++          new (thd->mem_root) Opt_hints_table(nullptr, nullptr, thd->mem_root);
++      if (opt_hints_table == nullptr) return true;
++      opt_hints_table->index_merge.get_key_map()->merge(
++          join->plan_cache_exec_context->quick_keys_map);
++      leaf_tables->opt_hints_table = opt_hints_table;
++    }
++    qep_tab->table_ref = leaf_tables;
++    auto old_leaf = leaf_tables;
++    leaf_tables = leaf_tables->next_leaf;
++    status = reinit_qep_tab_properties(qep_tab);
++    // The hint is not needed anymore, and is on transient MEM_ROOT, so do not
++    // keep a pointer to it.
++    old_leaf->opt_hints_table = hints_table_saved;
++    if (status > 0) return true;
++  }
++
++  // Now handle the other QEP_TABs - that of optimizer-internal tmp tables
++  for (uint i = 0; i < join->tables; ++i) {
++    QEP_TAB *qep_tab = &join->qep_tab[i];
++    if (qep_tab->table_ref == nullptr)
++      qep_tab->rerun_constructor_for_tmp_table();
++  }
++
++  if (join->query_block->partitioned_table_count &&
++      join->prune_table_partitions())
++    return true;
++
++  join->set_optimized();
++  thd->status_var.cached_plan_hits++;
++  trace_plan_cache.add("used", true);
++  error_guard.release();
++  return false;
++}
++
++/**
++  Reset the state of cached_plan object so that it be reused normally.
++*/
++static void reset_cached_plan(JOIN *cached_plan) {
++  assert(cached_plan);
++
++  cached_plan->zero_result_cause = nullptr;
++  // Reset quick() to nullptr because in QEP_shared_owner::qs_cleanup, it only
++  // delete quick() and it must be set to nullptr to avoid repeated memory
++  // release.
++  QEP_TAB *qep_tab = cached_plan->qep_tab;
++  if (qep_tab) {
++    for (uint i = 0; i < cached_plan->tables; i++) {
++      qep_tab[i].set_range_scan(nullptr);
++    }
++  }
++}
++
++/**
++  Applied recorded plan properties to restored plan.
++
++  After we cached a plan, some optimized plan information has been cleaned up
++  (because it was in some data structures which have been freed or reset). In
++  order to restore cached plan, this information needs to be recovered from
++  plan cache context. This function helps do these things.
++*/
++static bool apply_cached_plan(JOIN *join) {
++  Exec_context *context = join->plan_cache_exec_context;
++  Query_block *sl = join->query_block;
++  assert(sl->leaf_table_count == 1);
++  bind_fields(context->arena->item_list());
++  reset_cached_plan(join);
++  assert(context);
++  if (context->tmp_table_param) {
++    // Since cached plan's join->tmp_table_param was freed by MEM_ROOT::Clear
++    // for last execution, we need to reinitialize tmp_table_param for each
++    // apply cached plan, see cache_plan() for details.
++    new (&join->tmp_table_param) Temp_table_param();
++    join->tmp_table_param.copy_for_plan_cache(context->tmp_table_param);
++  }
++
++  DBUG_EXECUTE_IF("apply_cached_plan_fail", { return true; });
++  join->ref_items = nullptr;
++  // Here we need reset lock information.
++  join->lock = join->thd->lock;
++  join->tmp_tables = 0;
++  join->thd->m_current_query_cost = context->current_query_cost;
++  // Need reset such a fields otherwise join->fields is reset to slice. The
++  // following alloc_indirect_slice will reset slices. This will result in
++  // a crash.
++  join->fields = &sl->fields;
++  join->tables_list = sl->leaf_tables;
++
++  THD *thd = join->thd;
++  Clone_plan_RAII cpr(thd);
++  auto error_guard = create_scope_guard([thd]() {
++    // We must undo the changes we did above, as a normal optimization is now
++    // going to start (we do not want it to start on half-modified cached
++    // objects).
++    thd->rollback_item_tree_changes();
++  });
++
++  // Replay the Item tree changes done during optimization (only those
++  // affecting permanent items).
++  for (auto &c : context->new_change_list) {
++    if (*c.first != c.second) {  // skip a no-op
++      thd->change_item_tree(c.first, c.second);
++    }
++    // If it is a generated column created during optimization by
++    // get_gc_for_expr(), it got added to read_set then. Later got
++    // removed from read_set at start of next execution, by
++    // Table_ref::restore_properties(). We need to add it back again.
++    auto i_f = dynamic_cast<Item_field *>(c.second);
++    if (i_f && i_f->field->is_gcol()) {
++      i_f->field->table->mark_column_used(i_f->field, MARK_COLUMNS_READ);
++    }
++  }
++
++  join->group_list.clean();
++  join->order.clean();
++
++  if (context->distinct_group_list && context->distinct_group_list->order) {
++    // When doing PREPARE EXPLAIN, on second execution the displayed plan
++    // sometimes lacked "Using temporary", even though the tmp table was
++    // properly created (so it was just a display issue). This was because the
++    // 'src' of ORDER_with_src was not copied from 'context' to the JOIN's GROUP
++    // and ORDER BY. This bug was visible when running main.ps
++    ORDER *order = nullptr;
++    if (make_group_order_list(thd, sl, &order,
++                              context->distinct_group_list->order, false))
++      return true;
++    join->group_list = *context->distinct_group_list;
++    join->group_list.order = order;
++  }
++  if (context->order_list && context->order_list->order) {
++    ORDER *order = nullptr;
++    if (make_group_order_list(thd, sl, &order, context->order_list->order,
++                              false))
++      return true;
++    join->order = *context->order_list;
++    join->order.order = order;
++  }
++
++  for (auto list : {join->group_list.order, join->order.order}) {
++    for (auto group = list; group; group = group->next) {
++      get_item_and_refresh(*group->item, *group->item, false);
++    }
++  }
++
++  // JOIN::make_tmp_tables_info() fills these two lists with possibly
++  // short-lived Items, for use with tmp tables, so empty them for our fresh
++  // start, they will be recreated.
++  if (join->sum_funcs) *join->sum_funcs = nullptr;
++  join->group_fields_cache.clear();
++
++  // Non-pointer members of JOIN which JOIN:make_tmp_tables_info() changes,
++  // need to be restored from their value at the time of caching.
++  join->explain_flags = context->explain_flags;
++  join->calc_found_rows = context->calc_found_rows;
++  join->m_select_limit = context->m_select_limit;
++  join->grouped = context->grouped;
++  join->streaming_aggregation = context->streaming_aggregation;
++  join->select_distinct = context->select_distinct;
++  join->best_read = context->best_read;
++
++  // PLAN_CACHE:
++  // - Item_field-s in these conditions are properly pointing into the TABLE
++  // currently used by this execution, because they went through bind_fields()
++  // called by Sql_cmd_dml::restore_cmd_properties() when this execution
++  // started.
++
++  get_item_and_refresh(join->where_cond, context->where_cond, true);
++  get_item_and_refresh(join->having_cond, context->having_cond, true);
++
++  set_ready(sl);
++  count_field_types(sl, &join->tmp_table_param, *join->fields, false, false);
++  error_guard.release();
++  return false;
++}
++
++bool Exec_context::is_environment_changed(THD *thd) {
++  return ((thd->variables.optimizer_switch &
++           interested_optimizer_switch_flags) ^
++          optimizer_switch) ||
++         (character_set_client != thd->variables.character_set_client);
++}
++
++Exec_context::~Exec_context() {
++  if (tmp_table_param) tmp_table_param->cleanup();
++  destroy(tmp_table_param);
++  destroy(distinct_group_list);
++  destroy(order_list);
++}
++
++void collect_item_params(Item *item, std::set<Item *> &params) {
++  assert(current_thd);
++  if (!current_thd->variables.plan_cache_enabled) return;
++
++  bool save_walk_const_item = current_thd->walk_const_item;
++  current_thd->walk_const_item = true;
++  WalkItem(item, enum_walk::POSTFIX, [&params](Item *sub_item) {
++    if (sub_item->type() == Item::PARAM_ITEM) {
++      params.insert(sub_item);
++    }
++    return false;
++  });
++  current_thd->walk_const_item = save_walk_const_item;
++}
++
++/**
++  After executing reduce_cond_for_table or remove_eq_conds function,
++  some condition might be reduced. If any Item_param is optimized away,
++  plan cache is not used. This function Imagine there was "WHERE ?=1",
++  and '?' is 1: WHERE is removed. This plan, without any WHERE, would be
++  unusable for a next execution with '?' being 2.
++  No need to compare types (as in plan_cache::has_same_type_and_item_params),
++  because condition optimization didn't change them.
++*/
++void cmp_item_params_after_reduce_cond(THD *thd,
++                                       const std::set<Item *> &old_params,
++                                       Item *condition) {
++  if (!thd->variables.plan_cache_enabled || old_params.empty()) return;
++
++  if (!condition)
++    plan_cache::set_uncacheable(thd->lex->current_query_block());
++  else {
++    std::set<Item *> params_new;
++    plan_cache::collect_item_params(condition, params_new);
++    if (old_params != params_new)
++      plan_cache::set_uncacheable(thd->lex->current_query_block());
++  }
++}
++
++/// This function checks whether Item type has changed during optimization.
++/// e.g col_int <= ? might be transformed into col_int = ? . Pessimistically,
++/// such transformation may be dependent on the value of some Item_param
++/// inside it (like if '?' is INT_MIN, in the example above).
++static bool is_item_type_transformed(Item *old_val, Item *new_val) {
++  // Here we need compare actual Item cached by Item_cache.
++  if (old_val->type() == Item::CACHE_ITEM)
++    old_val = down_cast<Item_cache *>(old_val)->get_example();
++  if (new_val->type() == Item::CACHE_ITEM)
++    new_val = down_cast<Item_cache *>(new_val)->get_example();
++
++  if (old_val->type() != new_val->type()) return true;
++
++  if (old_val->type() == Item::FUNC_ITEM &&
++      down_cast<Item_func *>(old_val)->functype() !=
++          down_cast<Item_func *>(new_val)->functype())
++    return true;
++
++  return false;
++}
++
++/// Check whether Item_param objects in two Item objects are the same. In
++/// order to make sure Item_param objects are not optimized away or
++/// transformed, we need such a function. It also verifies that the item's
++/// type didn't change.
++static bool has_same_type_and_item_params(Item *old_val, Item *new_val) {
++  std::set<Item *> old_item_params;
++  collect_item_params(old_val, old_item_params);
++  // This item is not what we are interested in. We only care Item with
++  // Item_param object.
++  if (old_item_params.empty()) return true;
++  // Here we need to compare if Item type has been transformed.
++  if (is_item_type_transformed(old_val, new_val)) return false;
++  // Check whether actual Item_params are the same.
++  std::set<Item *> new_item_params;
++  collect_item_params(new_val, new_item_params);
++  return (old_item_params == new_item_params);
++}
++
++}  // namespace plan_cache
+diff --git a/sql/sql_plan_cache.h b/sql/sql_plan_cache.h
+new file mode 100644
+index 000000000..2b75b9bb7
+--- /dev/null
++++ b/sql/sql_plan_cache.h
+@@ -0,0 +1,139 @@
++#ifndef PLAN_CACHE_INCLUDE_H
++#define PLAN_CACHE_INCLUDE_H
++
++/* Copyright (c) 2026, Huawei and/or its affiliates. All rights reserved.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is also distributed with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have included with MySQL.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++#include <set>
++#include "m_ctype.h"
++#include "my_base.h"
++#include "my_inttypes.h"
++#include "sql/join_optimizer/access_path.h"
++#include "sql/mysqld.h"
++#include "sql/opt_explain_format.h"
++#include "sql/opt_hints.h"
++#include "sql/sql_list.h"
++#include "sql_const.h"
++class JOIN;
++class Query_expression;
++class Temp_table_param;
++class THD;
++struct LEX;
++class Query_block;
++class Item;
++class Item_cache;
++class ORDER_with_src;
++class QEP_TAB;
++
++namespace plan_cache {
++
++extern std::atomic<ulong> cached_plan_count;
++extern std::atomic<ulong> cached_plan_invalidations;
++
++struct Exec_context {
++  /// If one of these flags is changed by the user, plan may change, so the
++  /// cached plan should not be used.
++  static const ulonglong interested_optimizer_switch_flags =
++      OPTIMIZER_SWITCH_INDEX_MERGE | OPTIMIZER_SWITCH_INDEX_MERGE_UNION |
++      OPTIMIZER_SWITCH_INDEX_MERGE_SORT_UNION |
++      OPTIMIZER_SWITCH_INDEX_MERGE_INTERSECT |
++      OPTIMIZER_SWITCH_ENGINE_CONDITION_PUSHDOWN |
++      OPTIMIZER_SWITCH_INDEX_CONDITION_PUSHDOWN | OPTIMIZER_SWITCH_MRR |
++      OPTIMIZER_SWITCH_MRR_COST_BASED | OPTIMIZER_SWITCH_USE_INVISIBLE_INDEXES |
++      OPTIMIZER_SKIP_SCAN | OPTIMIZER_SWITCH_PREFER_ORDERING_INDEX |
++      OPTIMIZER_SWITCH_HYPERGRAPH_OPTIMIZER;
++
++  Key_map quick_keys_map{0};
++  /// If the AccessPath is an index range scan, we store a copy of all its
++  /// properties (members) here. The original struct type is anonymous, that's
++  /// why the declaration is a bit complex.
++  std::remove_reference<decltype(AccessPath().index_range_scan())>::type
++      index_range_scan_props;
++  uint quick_used_key_parts{0};
++  Temp_table_param *tmp_table_param{nullptr};
++  ulonglong optimizer_switch{0};
++  const CHARSET_INFO *character_set_client;
++  bool fill(THD *thd, JOIN *join, QEP_TAB *cached_qep_tab);
++  uint pushed_idx_cond_keyno{MAX_KEY};
++  Item *pushed_idx_cond{nullptr};
++  bool key_read{false};
++  double current_query_cost{0};
++  ORDER_with_src *distinct_group_list{nullptr};
++  ORDER_with_src *order_list{nullptr};
++  Item *where_cond{nullptr};
++  Item *having_cond{nullptr};
++  ha_rows table_records{0};  //#records in table
++  ulonglong table_version;
++  Key_map covering_keys{0};
++  /// It's used to help recover m_condition for QEP_TAB.
++  Item *tab_condition{nullptr};
++  int quick_type{-1};  // -1 to mean "no range access"
++
++  Explain_format_flags explain_flags;
++  bool calc_found_rows;
++  ha_rows m_select_limit;
++  bool grouped;
++  bool streaming_aggregation;
++  bool select_distinct;
++  double best_read;
++  /// Owns memory for this cached plan
++  Query_arena *arena{nullptr};
++
++  using map_value_type = std::map<Item *, Item *>::value_type;
++  using allocator_for_map = Mem_root_allocator<map_value_type>;
++  std::map<Item *, Item *, std::less<Item *>, allocator_for_map>
++      transient_items;
++  using allocator_for_vector = Mem_root_allocator<std::pair<Item **, Item *>>;
++  std::vector<std::pair<Item **, Item *>, allocator_for_vector> new_change_list;
++
++  bool is_environment_changed(THD *thd);
++  bool is_table_stats_changed_sharply(ha_rows new_rows,
++                                      double allow_change_ratio) {
++    // If allow_change_ratio is not 0, when the number of rows in the table
++    // is changed more than this fraction, cached plan will be invalidated.
++    if (allow_change_ratio &&
++        (std::abs(longlong(new_rows - table_records)) /
++         (float)(table_records + 1)) > allow_change_ratio) {
++      return true;
++    }
++    return false;
++  }
++
++  Exec_context(MEM_ROOT *root)
++      : transient_items(allocator_for_map(root)),
++        new_change_list(allocator_for_vector(root)) {}
++  ~Exec_context();
++};
++bool cache_plan(JOIN *orig_join);
++bool exec_cached_plan(Query_block *sl);
++bool is_ready(Query_block *sl);
++void set_uncacheable(Query_block *sl);
++void collect_item_params(Item *item, std::set<Item *> &params);
++void set_ready(Query_block *sl);
++void invalidate_cached_plan(Query_block *select);
++bool emulates_hint(const THD *thd, opt_hints_enum hint);
++void restore_param_snapshot_clones(LEX *lex);
++void cmp_item_params_after_reduce_cond(THD *thd,
++                                       const std::set<Item *> &old_params,
++                                       Item *condition);
++void destroy_cached_plan(JOIN *join);
++}  // namespace plan_cache
++#endif  // PLAN_CACHE_INCLUDE_H
+diff --git a/sql/sql_prepare.cc b/sql/sql_prepare.cc
+index 5e452465f..f67518d8f 100644
+--- a/sql/sql_prepare.cc
++++ b/sql/sql_prepare.cc
+@@ -168,6 +168,7 @@ When one supplies long data for a placeholder:
+ #include "sql/sql_lex.h"
+ #include "sql/sql_list.h"
+ #include "sql/sql_parse.h"  // sql_command_flags
++#include "sql/sql_plan_cache.h"  // invalidate_cached_plan
+ #include "sql/sql_profile.h"
+ #include "sql/sql_query_rewrite.h"
+ #include "sql/sql_rewrite.h"  // mysql_rewrite_query
+@@ -3227,6 +3228,7 @@ bool Prepared_statement::reprepare(THD *thd) {
+   Prepared_statement copy(thd);
+ 
+   swap_prepared_statement(&copy);
++  plan_cache::invalidate_cached_plan(copy.m_lex->query_block);
+   auto copy_guard =
+       create_scope_guard([&]() { swap_prepared_statement(&copy); });
+ 
+diff --git a/sql/sql_select.cc b/sql/sql_select.cc
+index 0a427fd92..c9bd28cd5 100644
+--- a/sql/sql_select.cc
++++ b/sql/sql_select.cc
+@@ -112,6 +112,7 @@
+ #include "sql/sql_list.h"
+ #include "sql/sql_optimizer.h"  // JOIN
+ #include "sql/sql_parse.h"      // bind_fields
++#include "sql/sql_plan_cache.h"  // Plan cache
+ #include "sql/sql_planner.h"    // calculate_condition_filter
+ #include "sql/sql_resolver.h"
+ #include "sql/sql_test.h"       // misc. debug printing utilities
+@@ -129,10 +130,10 @@
+ using std::max;
+ using std::min;
+ 
+-static store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
+-                                table_map const_tables,
+-                                const KEY_PART_INFO *key_part, uchar *key_buff,
+-                                uint maybe_null);
++store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
++                         table_map const_tables,
++                         const KEY_PART_INFO *key_part, uchar *key_buff,
++                         uint maybe_null);
+ 
+ using Global_tables_iterator =
+     IntrusiveListIterator<Table_ref, &Table_ref::next_global>;
+@@ -1940,6 +1941,11 @@ void JOIN::destroy() {
+   group_fields.destroy_elements();
+   semijoin_deduplication_fields.destroy_elements();
+ 
++  // group fields has been destroy above, but group_fields_cache needs to be
++  // cleared to set elements 0 so that they won't be reused when applying
++  // cached plan. Details can be referenced by make_group_fields.
++  group_fields_cache.clear();
++
+   tmp_table_param.cleanup();
+ 
+   /* Cleanup items referencing temporary table columns */
+@@ -1988,16 +1994,18 @@ bool Query_block::optimize(THD *thd, bool finalize_access_paths) {
+ 
+   assert(master_query_expression()->cleaned == Query_expression::UC_DIRTY);
+   assert(join == nullptr);
+-  JOIN *const join_local = new (thd->mem_root) JOIN(thd, this);
+-  if (!join_local) return true; /* purecov: inspected */
++  if (plan_cache::exec_cached_plan(this)) {
++    JOIN *const join_local = new (thd->mem_root) JOIN(thd, this);
++    if (!join_local) return true; /* purecov: inspected */
+ 
+-  /*
+-    Updating Query_block::join requires acquiring THD::LOCK_query_plan
+-    to avoid races when EXPLAIN FOR CONNECTION is used.
+-  */
+-  thd->lock_query_plan();
+-  join = join_local;
+-  thd->unlock_query_plan();
++    /*
++      Updating Query_block::join requires acquiring THD::LOCK_query_plan
++      to avoid races when EXPLAIN FOR CONNECTION is used.
++    */
++    thd->lock_query_plan();
++    join = join_local;
++    thd->unlock_query_plan();
++  }
+ 
+   if (join->optimize(finalize_access_paths)) return true;
+ 
+@@ -2254,14 +2262,21 @@ void JOIN::set_semijoin_info() {
+   }
+ }
+ 
+-void calc_length_and_keyparts(Key_use *keyuse, JOIN_TAB *tab, const uint key,
+-                              table_map used_tables, Key_use **chosen_keyuses,
+-                              uint *length_out, uint *keyparts_out,
+-                              table_map *dep_map, bool *maybe_null) {
++void calc_length_and_keyparts(Key_use *keyuse, QEP_shared_owner *tab,
++                              const uint key, table_map used_tables,
++                              Key_use **chosen_keyuses, uint *length_out,
++                              uint *keyparts_out, table_map *dep_map,
++                              bool *maybe_null) {
+   assert(!dep_map || maybe_null);
+   uint keyparts = 0, length = 0;
+   uint found_part_ref_or_null = 0;
+   KEY *const keyinfo = tab->table()->key_info + key;
++  // Here we need a backup for TABLE_LIST because QEP_shared_owner has no way
++  // to get the same TABLE_LIST. One possible way is checking
++  // QEP_shared_owner::table()->pos_in_table_list. But one exception is
++  // multiple UPDATE, such a pos_in_table_list might point to different
++  // TABLE_LIST from keyuse->table_ref.
++  Table_ref *table_ref = keyuse->table_ref;
+ 
+   do {
+     /*
+@@ -2287,7 +2302,8 @@ void calc_length_and_keyparts(Key_use *keyuse, JOIN_TAB *tab, const uint key,
+       }
+     }
+     keyuse++;
+-  } while (keyuse->table_ref == tab->table_ref && keyuse->key == key);
++  } while (keyuse->table_ref == table_ref &&
++           keyuse->table_ref->table == tab->table() && keyuse->key == key);
+   if (keyparts <= 0) {
+     assert(false);
+     my_error(ER_INTERNAL_ERROR, MYF(0),
+@@ -2572,10 +2588,10 @@ class store_key_json_item final : public store_key {
+ 
+ }  // namespace
+ 
+-static store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
+-                                table_map const_tables,
+-                                const KEY_PART_INFO *key_part, uchar *key_buff,
+-                                uint maybe_null) {
++store_key *get_store_key(THD *thd, Item *val, table_map used_tables,
++                         table_map const_tables,
++                         const KEY_PART_INFO *key_part, uchar *key_buff,
++                         uint maybe_null) {
+   if (key_part->field->is_array()) {
+     return new (thd->mem_root)
+         store_key_json_item(thd, key_part->field, key_buff + maybe_null,
+@@ -4712,7 +4728,11 @@ bool JOIN::make_tmp_tables_info() {
+       [1] above: too early to do query ORDER BY if we have windowing; must
+       wait till after window processing.
+     */
+-    ASSERT_BEST_REF_IN_JOIN_ORDER(this);
++    if (best_ref) {
++      // The code below supports the case where best_ref is not set (happens
++      // when a cached plan is reused).
++      ASSERT_BEST_REF_IN_JOIN_ORDER(this);
++    }
+     DBUG_PRINT("info", ("Sorting for send_result_set_metadata"));
+     /*
+       If we have already done the group, add HAVING to sorted table except
+@@ -4951,6 +4971,9 @@ void JOIN::refresh_base_slice() {
+ }
+ 
+ void JOIN::unplug_join_tabs() {
++  // Needed by plan cache.
++  if (tables != 0 && !(best_ref && !join_tab)) return;
++
+   ASSERT_BEST_REF_IN_JOIN_ORDER(this);
+ 
+   map2table = nullptr;
+@@ -4981,7 +5004,8 @@ void JOIN::unplug_join_tabs() {
+ bool JOIN::add_sorting_to_table(uint idx, ORDER_with_src *sort_order,
+                                 bool sort_before_group) {
+   DBUG_TRACE;
+-  ASSERT_BEST_REF_IN_JOIN_ORDER(this);
++  // ASSERT_BEST_REF_IN_JOIN_ORDER(this) is not necessary, as this function
++  // doesn't use best_ref anymore.
+   assert(!query_block->is_recursive());
+   const enum join_type jt = qep_tab[idx].type();
+   if (jt == JT_CONST || jt == JT_EQ_REF)
+diff --git a/sql/sql_select.h b/sql/sql_select.h
+index b160c6815..5686376d6 100644
+--- a/sql/sql_select.h
++++ b/sql/sql_select.h
+@@ -298,6 +298,8 @@ class Key_use {
+     This information is stored only in the first Key_use of the index.
+   */
+   double read_cost;
++
++  Key_use *pc_clone(Key_use *new_key_use);
+ };
+ 
+ /// @returns join type according to quick select type used
+@@ -440,7 +442,7 @@ struct POSITION {
+     NULL  -  'index' or 'range' or 'index_merge' or 'ALL' access is used.
+     Other - [eq_]ref[_or_null] access is used. Pointer to {t.keypart1 = expr}
+   */
+-  Key_use *key;
++  Key_use *key{nullptr};
+ 
+   /** If ref-based access is used: bitmap of tables this table depends on  */
+   table_map ref_depend_map;
+@@ -574,6 +576,8 @@ struct POSITION {
+     prefix_rowcount *= filter_effect;
+   }
+ 
++  bool copy_for_plan_cache(THD *thd, QEP_TAB *orig_tab);
++
+   void set_suffix_lateral_deps(table_map deps) { m_suffix_lateral_deps = deps; }
+ 
+   table_map get_suffix_lateral_deps() const { return m_suffix_lateral_deps; }
+@@ -938,11 +942,11 @@ bool test_if_cheaper_ordering(const JOIN_TAB *tab, ORDER_with_src *order,
+   @param [out] dep_map        when given, calculated dependency map
+   @param [out] maybe_null     when given, calculated maybe_null property
+ */
+-
+-void calc_length_and_keyparts(Key_use *keyuse, JOIN_TAB *tab, const uint key,
+-                              table_map used_tables, Key_use **chosen_keyuses,
+-                              uint *length_out, uint *keyparts_out,
+-                              table_map *dep_map, bool *maybe_null);
++void calc_length_and_keyparts(Key_use *keyuse, QEP_shared_owner *tab,
++                              const uint key, table_map used_tables,
++                              Key_use **chosen_keyuses, uint *length_out,
++                              uint *keyparts_out, table_map *dep_map,
++                              bool *maybe_null);
+ 
+ /**
+   Initialize the given TABLE_REF; setting basic fields and allocating memory
+diff --git a/sql/sql_union.cc b/sql/sql_union.cc
+index 166b9c5b9..efa4c611e 100644
+--- a/sql/sql_union.cc
++++ b/sql/sql_union.cc
+@@ -90,6 +90,8 @@
+ #include "sql/sql_lex.h"
+ #include "sql/sql_list.h"
+ #include "sql/sql_optimizer.h"  // JOIN
++#include "sql/sql_parse.h"       // cleanup_items
++#include "sql/sql_plan_cache.h"  // is_ready, set_ready, cached_plan_count
+ #include "sql/sql_select.h"
+ #include "sql/sql_tmp_table.h"  // tmp tables
+ #include "sql/table_function.h"  // Table_function
+@@ -2090,7 +2092,22 @@ void Query_block::cleanup(bool full) {
+     if (full) {
+       assert(join->query_block == this);
+       join->destroy();
+-      ::destroy(join);
++      if (join != cached_plan) {
++        ::destroy(join);
++      } else {
++        // Current JOIN is the cached plan, may be reused later, keep it:
++        plan_cache::set_ready(this);
++        auto context = join->plan_cache_exec_context;
++        if (context && context->arena)
++          cleanup_items(context->arena->item_list());
++        // The temporary table will be released after the SQL statement
++        // execution is completed. It must be set to null here; otherwise,
++        // there is a risk of dangling pointer access and double release.
++        for (uint tmp = join->primary_tables;
++             tmp < join->primary_tables + join->tmp_tables; tmp++) {
++          join->qep_tab[tmp].set_table(nullptr);
++        }
++      }
+       join = nullptr;
+     } else
+       join->cleanup();
+@@ -2146,5 +2163,11 @@ void Query_block::destroy() {
+     rollup_sums.clear();
+     rollup_sums.shrink_to_fit();
+   }
++
++  if (cached_plan) {
++    plan_cache::destroy_cached_plan(cached_plan);
++    cached_plan = nullptr;
++  }
++
+   invalidate();
+ }
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 9d18d89b5..7f0e990fc 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -2097,6 +2097,21 @@ static Sys_var_charptr Sys_datadir(
+     READ_ONLY NON_PERSIST GLOBAL_VAR(mysql_real_data_home_ptr),
+     CMD_LINE(REQUIRED_ARG, 'h'), IN_FS_CHARSET, DEFAULT(mysql_real_data_home));
+ 
++static Sys_var_bool Sys_plan_cache("plan_cache",
++                                   "Allows the server to store query plans "
++                                   "into a cache and to reuse them for next "
++                                   "queries.",
++                                   SESSION_VAR(plan_cache_enabled),
++                                   CMD_LINE(OPT_ARG), DEFAULT(true));
++
++static Sys_var_double Sys_plan_cache_allow_change_ratio(
++    "plan_cache_allow_change_ratio",
++    "If the number of rows in the table is changed more than this fraction, "
++    "cached plan will be invalidated. A value of 0 means the cached plan is "
++    "always valid.",
++    SESSION_VAR(plan_cache_allow_change_ratio), CMD_LINE(REQUIRED_ARG),
++    VALID_RANGE(0, DBL_MAX), DEFAULT(0.2));
++
+ #ifndef NDEBUG
+ static Sys_var_dbug Sys_dbug("debug", "Debug log", sys_var::SESSION,
+                              CMD_LINE(OPT_ARG, '#'), DEFAULT(""),
+diff --git a/sql/system_variables.h b/sql/system_variables.h
+index 225c755c6..ed3a5ef14 100644
+--- a/sql/system_variables.h
++++ b/sql/system_variables.h
+@@ -704,6 +704,13 @@ struct System_variables {
+     @sa Sys_explain_format
+    */
+   Explain_format_type explain_format;
++
++  /// 'True' <=> the user wants us to cache a plan, and to use a cached plan.
++  bool plan_cache_enabled;
++
++  /* If the number of rows in the table changed by more than this fraction,
++   cached plan cannot be used. */
++   double plan_cache_allow_change_ratio;
+ };
+ 
+ /**
+@@ -778,6 +785,9 @@ struct System_status_var {
+   /* Number of statements sent from the client. */
+   ulonglong questions;
+ 
++  /// Status of plan cache
++  ulonglong cached_plan_hits;
++
+   /// How many queries have been executed on a secondary storage engine.
+   ulonglong secondary_engine_execution_count;
+ 
+diff --git a/sql/table.h b/sql/table.h
+index 3730205ea..958b56b70 100644
+--- a/sql/table.h
++++ b/sql/table.h
+@@ -4031,6 +4031,8 @@ class Table_ref {
+   MY_BITMAP read_set_saved;
+   MY_BITMAP write_set_saved;
+   MY_BITMAP read_set_internal_saved;
++ public:
++  Key_map get_covering_keys_saved() const { return covering_keys_saved; }
+ };
+ 
+ /*
+diff --git a/sql/temp_table_param.h b/sql/temp_table_param.h
+index 8c4ab8fe2..4d75344a3 100644
+--- a/sql/temp_table_param.h
++++ b/sql/temp_table_param.h
+@@ -258,6 +258,8 @@ class Temp_table_param {
+         m_window(other.m_window) {}
+ 
+   void cleanup() { copy_fields.clear(); }
++
++  void copy_for_plan_cache(Temp_table_param *orig);
+ };
+ 
+ #endif  // TEMP_TABLE_PARAM_INCLUDED
+-- 
+2.34.1
+

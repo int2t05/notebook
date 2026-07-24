@@ -1,0 +1,1141 @@
+From b7778c4dcea1c4322fd77c974418e93e5e0f216f Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Fri, 8 Aug 2025 17:11:40 +0800
+Subject: [PATCH] fast tuple comparing
+
+---
+ storage/innobase/btr/btr0cur.cc       |  21 +-
+ storage/innobase/dict/dict0dict.cc    | 116 +++++++---
+ storage/innobase/include/data0type.ic |  39 ++++
+ storage/innobase/include/dict0mem.h   |  36 +--
+ storage/innobase/include/page0cur.h   |   9 +-
+ storage/innobase/include/page0cur.ic  |   6 +-
+ storage/innobase/include/rem0cmp.h    |   4 +
+ storage/innobase/include/rem0cmp.ic   | 136 ++++++++++++
+ storage/innobase/include/rem0rec.h    |  15 ++
+ storage/innobase/include/rem0rec.ic   |  42 +++-
+ storage/innobase/page/page0cur.cc     | 307 +++++++++++++++-----------
+ storage/innobase/row/row0sel.cc       |  30 ++-
+ 12 files changed, 564 insertions(+), 197 deletions(-)
+
+diff --git a/storage/innobase/btr/btr0cur.cc b/storage/innobase/btr/btr0cur.cc
+index 6e5053a4122..05e2254d774 100644
+--- a/storage/innobase/btr/btr0cur.cc
++++ b/storage/innobase/btr/btr0cur.cc
+@@ -830,6 +830,13 @@ btr_cur_search_to_nth_level(
+ 	bool		mbr_adj = false;
+ 	bool		found = false;
+ 
++	/* Get the partial comparing record from seatched dtuple. */
++	const byte* dtuple_rec = NULL;
++	ulint dtuple_rec_size = 0;
++#if !defined(PAGE_CUR_LE_OR_EXTENDS) && defined(__aarch64__)
++	byte dtuple_rec_buf[PARTIAL_FAST_CMP_RECORD_SIZE];
++#endif
++
+ 	DBUG_ENTER("btr_cur_search_to_nth_level");
+ 
+ 	btr_search_t*	info;
+@@ -862,6 +869,12 @@ btr_cur_search_to_nth_level(
+ 
+ 	ibool	s_latch_by_caller;
+ 
++#if !defined(PAGE_CUR_LE_OR_EXTENDS) && defined(__aarch64__)
++	dtuple_rec = dtuple_fetch_partial_cmp_rec(
++		index, tuple, &dtuple_rec_size,dtuple_rec_buf,
++		PARTIAL_FAST_CMP_RECORD_SIZE);
++#endif
++
+ 	s_latch_by_caller = latch_mode & BTR_ALREADY_S_LATCHED;
+ 
+ 	ut_ad(!s_latch_by_caller
+@@ -1546,7 +1559,8 @@ retry_page_get:
+ 		page_cur_search_with_match(
+ 			block, index, tuple, page_mode, &up_match,
+ 			&low_match, page_cursor,
+-			need_path ? cursor->rtr_info : NULL);
++			need_path ? cursor->rtr_info : NULL,
++			dtuple_rec, dtuple_rec_size);
+ 	}
+ 
+ 	if (estimate) {
+@@ -3363,11 +3377,8 @@ fail_err:
+ 		const rec_t*	page_cursor_rec = page_cur_get_rec(page_cursor);
+ 
+ 		if (dict_table_is_intrinsic(index->table)) {
+-
+-			index->rec_cache.rec_size = rec_size;
+-
+ 			*rec = page_cur_tuple_direct_insert(
+-				page_cursor, entry, index, n_ext, mtr);
++				page_cursor, entry, index, n_ext, mtr, rec_size);
+ 		} else {
+ 			/* Check locks and write to the undo log,
+ 			if specified */
+diff --git a/storage/innobase/dict/dict0dict.cc b/storage/innobase/dict/dict0dict.cc
+index 204b95ffdf0..5517ac57fef 100644
+--- a/storage/innobase/dict/dict0dict.cc
++++ b/storage/innobase/dict/dict0dict.cc
+@@ -2662,6 +2662,82 @@ dict_index_remove_from_v_col_list(dict_index_t* index) {
+ 	}
+ }
+ 
++/** Check if key part of the index has fixed len and thus rec offsets can be
++cached. If so, it initializes rec_cache.offsets and rec_cache.nullable_cols, so
++that we can avoid calling the costly rec_get_offsets() in many cases. That is:
++- offsets will contain offsets of the first n columns within a rec, assuming
++that none of them contains NULL, where n is chosen to be sufficient for the
++most common use case, which is a binary search within a B-tree page,
++- nullable_cols will be the number of columns among those first n columns, which
++are NULLable at all, so that before using the rec_cache.offset we know how
++many initial bits of the rec's NULL mask need to be zero, to ensure that the
++rec doesn't have NULLs in the n first columns and thus rec_cache.offsets is
++indeed corresponding to its layout and can be used for this rec.
++@param[in]  index   The index instance for which rec_cache should be computed
++*/
++static
++void
++dict_index_try_cache_rec_offsets(dict_index_t *index) {
++	ut_ad(index->rec_cache.offsets == NULL);
++	ut_ad(index->rec_cache.nullable_cols == 0);
++
++	/* in arm platform, we won't just cache intrinsic table's record offsets.
++	any fixed length index record's offset will be cached. */
++#if !defined(__aarch64__)
++	if (!dict_table_is_intrinsic(index->table)) {
++		return;
++	}
++#endif
++
++	const ulint n_unique_in_tree = dict_index_get_n_unique_in_tree(index);
++	ut_a(0 < n_unique_in_tree);
++#ifdef UNIV_DEBUG
++	/* Check for backward compatibility - in the past we used cache only for
++	intrinsic tables, and assumed that it is sufficient to check only if the
++	first n_uniq fields are fixed length. We'd like to ensure that the new code
++	uses cache for intrinsic tables at least in these cases it used to before.
++	But the loop below now checks n_unique_in_tree columns, not just n_unique.
++	Following assert makes sure that when n_unique < n_unique_in_tree, we still
++	use cache, because it only happens when n_unique_in_tree has one more column
++	which is the primary key reference and has a fixed length, so should not
++	affect the decision of the loop.
++	Note: in general primary keys can have more than one column, don't have to be
++	fixed length, etc. It just never happens for intrinsic tables in our testing.
++	This is not an assert crucial for correctness. It's just to show that there's
++	no obvious regression w.r.t intrinsic tables. */
++	if (dict_table_is_intrinsic(index->table) &&
++		index->n_uniq != n_unique_in_tree) {
++		ut_a(index->n_uniq == n_unique_in_tree - 1);
++		ut_a(!dict_index_is_clust(index));
++		ut_a(dict_index_get_nth_field(index, n_unique_in_tree - 1)->fixed_len);
++	}
++#endif
++	for (size_t i = 0; i < n_unique_in_tree; i++) {
++		if (!dict_index_get_nth_field(index, i)->fixed_len) {
++			return;
++		}
++	}
++
++	/* inlined rec_get_offsets_func() and rec_init_offsets()'s fast-path without
++	referencing rec follows: */
++	const ulint offsets_len = n_unique_in_tree + (1 + REC_OFFS_HEADER_SIZE);
++	ulint *const offsets = static_cast<ulint *>(
++		mem_heap_alloc(index->heap, sizeof(ulint) * offsets_len));
++
++	index->rec_cache.offsets = offsets;
++	rec_offs_set_n_alloc(offsets, offsets_len);
++	rec_offs_set_n_fields(offsets, n_unique_in_tree);
++	rec_init_fixed_offsets(index, offsets);
++
++	for (size_t i = 0; i < n_unique_in_tree; i++) {
++		const dict_field_t *field = dict_index_get_nth_field(index, i);
++		if (!(field->col->prtype & DATA_NOT_NULL)) {
++			index->rec_cache.nullable_cols++;
++		}
++	}
++	ut_a(index->rec_cache.nullable_cols <= index->n_nullable);
++}
++
+ /** Adds an index to the dictionary cache, with possible indexing newly
+ added column.
+ @param[in,out]	table	table on which the index is
+@@ -2798,40 +2874,24 @@ dict_index_add_to_cache_w_vcol(
+ 	rw_lock_create(index_tree_rw_lock_key, &new_index->lock,
+ 		       SYNC_INDEX_TREE);
+ 
++	/* The conditions listed here correspond to the simplest call-path through
++	rec_get_offsets(). If they are met now, we can cache rec offsets and use
++	the cache as long they are met. We assert before using the rec_cache that
++	they are still met, and clear the rec_cache.offsets when they change. */
++	if (dict_table_is_comp(table) && !dict_index_has_virtual(index) &&
++		!dict_index_is_spatial(index)) {
++		dict_index_try_cache_rec_offsets(new_index);
++	} else {
++		/* The rules should not prevent caching for intrinsic tables */
++		ut_ad(!dict_table_is_intrinsic(table));
++	}
++
+ 	/* Intrinsic table are not added to dictionary cache instead are
+ 	cached to session specific thread cache. */
+ 	if (!dict_table_is_intrinsic(table)) {
+ 		dict_sys->size += mem_heap_get_size(new_index->heap);
+ 	}
+ 
+-	/* Check if key part of the index is unique. */
+-	if (dict_table_is_intrinsic(table)) {
+-
+-		new_index->rec_cache.fixed_len_key = true;
+-		for (i = 0; i < new_index->n_uniq; i++) {
+-
+-			const dict_field_t*	field;
+-			field = dict_index_get_nth_field(new_index, i);
+-
+-			if (!field->fixed_len) {
+-				new_index->rec_cache.fixed_len_key = false;
+-				break;
+-			}
+-		}
+-
+-		new_index->rec_cache.key_has_null_cols = false;
+-		for (i = 0; i < new_index->n_uniq; i++) {
+-
+-			const dict_field_t*	field;
+-			field = dict_index_get_nth_field(new_index, i);
+-
+-			if (!(field->col->prtype & DATA_NOT_NULL)) {
+-				new_index->rec_cache.key_has_null_cols = true;
+-				break;
+-			}
+-		}
+-	}
+-
+ 	dict_mem_index_free(index);
+ 
+ 	return(DB_SUCCESS);
+diff --git a/storage/innobase/include/data0type.ic b/storage/innobase/include/data0type.ic
+index bede9bd9ed3..e25692982f4 100644
+--- a/storage/innobase/include/data0type.ic
++++ b/storage/innobase/include/data0type.ic
+@@ -707,3 +707,42 @@ prtype_get_compression_extra(
+ 	return (prtype & DATA_COMPRESSED) != 0 ?
+ 		ZIP_COLUMN_HEADER_LENGTH : 0;
+ }
++
++
++/** Whether or not the type is deterministric in memory conparing.
++ @param[in]		dtype	the dtype of one dtuple.
++ @return		true	if the dtype is deterministric in memory comparing. */
++UNIV_INLINE bool dtype_is_memcmp_deterministric(const dtype_t *&dtype)
++{
++	switch (dtype->mtype) {
++		case DATA_FIXBINARY:
++		case DATA_BINARY:
++		case DATA_INT:
++		case DATA_SYS_CHILD:
++		case DATA_SYS:
++			return true;
++
++		case DATA_POINT:
++		case DATA_VAR_POINT:
++		case DATA_GEOMETRY: {
++			if (dtype->prtype & DATA_GIS_MBR) {
++				return false;
++			}
++
++			return true;
++		}
++
++		case DATA_BLOB: {
++			if (dtype->prtype & DATA_BINARY_TYPE) {
++				return true;
++			}
++
++			return false;
++		}
++
++		default:
++			return false;
++	}
++
++	return false;
++}
+\ No newline at end of file
+diff --git a/storage/innobase/include/dict0mem.h b/storage/innobase/include/dict0mem.h
+index ac1c9f17d71..8b4b7d64c99 100644
+--- a/storage/innobase/include/dict0mem.h
++++ b/storage/innobase/include/dict0mem.h
+@@ -778,41 +778,15 @@ struct zip_pad_info_t {
+ /** If key is fixed length key then cache the record offsets on first
+ computation. This will help save computation cycle that generate same
+ redundant data. */
+-class rec_cache_t
++struct rec_cache_t
+ {
+-public:
+-	/** Constructor */
+-	rec_cache_t()
+-		:
+-		rec_size(),
+-		offsets(),
+-		sz_of_offsets(),
+-		fixed_len_key(),
+-		offsets_cached(),
+-		key_has_null_cols()
+-	{
+-		/* Do Nothing. */
+-	}
+-
+-public:
+-	/** Record size. (for fixed length key record size is constant) */
+-	ulint		rec_size;
++	rec_cache_t() : offsets(NULL), nullable_cols(0) {}
+ 
+ 	/** Holds reference to cached offsets for record. */
+-	ulint*		offsets;
+-
+-	/** Size of offset array */
+-	uint32_t	sz_of_offsets;
+-
+-	/** If true, then key is fixed length key. */
+-	bool		fixed_len_key;
+-
+-	/** If true, then offset has been cached for re-use. */
+-	bool		offsets_cached;
++	const ulint*	offsets;
+ 
+-	/** If true, then key part can have columns that can take
+-	NULL values. */
+-	bool		key_has_null_cols;
++	/** Number of NULLable columns among those for which offsets are cached */
++	size_t			nullable_cols;
+ };
+ 
+ /** Cache position of last inserted or selected record by caching record
+diff --git a/storage/innobase/include/page0cur.h b/storage/innobase/include/page0cur.h
+index bd009b4ba55..dc94f91f009 100644
+--- a/storage/innobase/include/page0cur.h
++++ b/storage/innobase/include/page0cur.h
+@@ -216,6 +216,7 @@ page_cur_insert_rec_low(
+ @param[in]	tuple		pointer to a data tuple
+ @param[in]	n_ext		number of externally stored columns
+ @param[in]	mtr		mini-transaction handle, or NULL
++@param[in]	rec_size	The size of new record
+ 
+ @return pointer to record if succeed, NULL otherwise */
+ rec_t*
+@@ -224,7 +225,8 @@ page_cur_direct_insert_rec_low(
+ 	dict_index_t*	index,
+ 	const dtuple_t*	tuple,
+ 	ulint		n_ext,
+-	mtr_t*		mtr);
++	mtr_t*		mtr,
++	ulint		rec_size);
+ 
+ /***********************************************************//**
+ Inserts a record next to page cursor on a compressed and uncompressed
+@@ -322,7 +324,10 @@ page_cur_search_with_match(
+ 					/*!< in/out: already matched
+ 					fields in lower limit record */
+ 	page_cur_t*		cursor,	/*!< out: page cursor */
+-	rtr_info_t*		rtr_info);/*!< in/out: rtree search stack */
++	rtr_info_t*		rtr_info, /*!< in/out: rtree search stack */
++	const byte *tuple_rec = NULL, /*!<in: the partial record for tuple fast comparing */
++	ulint tuple_rec_size = 0); /*!< in: the size of tuple_rec*/
++
+ /** Search the right position for a page cursor.
+ @param[in]	block			buffer block
+ @param[in]	index			index tree
+diff --git a/storage/innobase/include/page0cur.ic b/storage/innobase/include/page0cur.ic
+index 3e3405444d5..927b808c161 100644
+--- a/storage/innobase/include/page0cur.ic
++++ b/storage/innobase/include/page0cur.ic
+@@ -300,6 +300,7 @@ the page from tuple without creating intermediate copy of the record.
+ @param[in]	index	record descriptor
+ @param[in]	n_ext	number of externally stored columns
+ @param[in]	mtr	mini-transaction handle, or NULL
++@param[in]	rec_size	The size of new record
+ 
+ @return pointer to record if succeed, NULL otherwise */
+ UNIV_INLINE
+@@ -309,14 +310,15 @@ page_cur_tuple_direct_insert(
+ 	const dtuple_t*	tuple,
+ 	dict_index_t*	index,
+ 	ulint		n_ext,
+-	mtr_t*		mtr)
++	mtr_t*		mtr,
++	ulint		rec_size)
+ {
+ 	rec_t*		rec;
+ 
+ 	ut_ad(dict_table_is_intrinsic(index->table));
+ 
+ 	rec = page_cur_direct_insert_rec_low(
+-		cursor->rec, index, tuple, n_ext, mtr);
++		cursor->rec, index, tuple, n_ext, mtr, rec_size);
+ 
+ 	return(rec);
+ }
+diff --git a/storage/innobase/include/rem0cmp.h b/storage/innobase/include/rem0cmp.h
+index af4f15f153c..7b8cbc006da 100644
+--- a/storage/innobase/include/rem0cmp.h
++++ b/storage/innobase/include/rem0cmp.h
+@@ -41,6 +41,10 @@ Created 7/1/1994 Heikki Tuuri
+ #include "rem0rec.h"
+ #include <my_sys.h>
+ 
++/** The buffer size of partial fast record comparing. if the paritial comparing
++size is greater than this, we will disale it */
++const size_t PARTIAL_FAST_CMP_RECORD_SIZE = 255;
++
+ /*************************************************************//**
+ Returns TRUE if two columns are equal for comparison purposes.
+ @return TRUE if the columns are considered equal in comparisons */
+diff --git a/storage/innobase/include/rem0cmp.ic b/storage/innobase/include/rem0cmp.ic
+index 0daca7d8a85..18b66c8a24d 100644
+--- a/storage/innobase/include/rem0cmp.ic
++++ b/storage/innobase/include/rem0cmp.ic
+@@ -148,3 +148,139 @@ cmp_dfield_dfield_like_prefix(
+ 	ib::fatal() << "Unable to find charset-collation " << cs_num;
+ 	return(0);
+ }
++
++
++/** Fetch the 'record' only contains fields participated in comparing from
++ the complete dtuple record.
++ @param[in]		index		the index owned the record
++ @param[in]		dtuple		the complete dtuple record
++ @param[out]	size		the size of 'fast cmp rec'
++ @param[in]		buf			the memory buffer for the 'fast cmp rec' if needed
++ @param[in]		buf_size	the buffer size.
++ @return  the partial record of dtuple for comparing. */
++UNIV_INLINE byte* dtuple_fetch_partial_cmp_rec(const dict_index_t *index,
++	const dtuple_t *dtuple,
++	ulint *size, byte* buf,
++	ulint buf_size)
++{
++	ut_ad(size != NULL);
++	ut_ad(buf != NULL);
++	byte *last_pos = NULL;
++	bool inplace_rec = true;
++	ulint i = 0;
++
++	ulint info_bits = dtuple_get_info_bits(dtuple);
++
++	if (!index->cached || !dict_table_is_comp(index->table) ||
++		dtuple->n_fields == 0 || (info_bits & REC_INFO_MIN_REC_FLAG)) {
++		return NULL;
++	}
++
++	*size = 0;
++
++	for (i = 0; i < dtuple_get_n_fields_cmp(dtuple); i++) {
++		const dfield_t *dfield = dtuple_get_nth_field(dtuple, i);
++		const dtype_t *field_type = dfield_get_type(dfield);
++		const dict_field_t *field = dict_index_get_nth_field(index, i);
++
++		if (dfield->len != field->fixed_len ||
++			!(field->col->prtype & DATA_NOT_NULL) ||
++			!dtype_is_memcmp_deterministric(field_type)) {
++			return NULL;
++		}
++
++		if (inplace_rec && i < dtuple_get_n_fields_cmp(dtuple) - 1) {
++			last_pos = static_cast<byte *>(dfield->data);
++			byte* next_field =
++				static_cast<byte *>(dtuple_get_nth_field(dtuple, i + 1)->data);
++
++			/* those fields in record is not continus, should copy those
++			fields into buf. */
++			if (last_pos + dfield->len != next_field) {
++				inplace_rec = false;
++			}
++		}
++
++		*size += dfield->len;
++	}
++
++	if (inplace_rec) {
++		return static_cast<byte *>(dtuple_get_nth_field(dtuple, 0)->data);
++	}
++
++	if (*size > buf_size) {
++		return NULL;
++	}
++
++	byte *ptr = buf;
++	for (i = 0; i < dtuple_get_n_fields_cmp(dtuple); i++) {
++		const dfield_t *dfield = dtuple_get_nth_field(dtuple, i);
++		ut_memcpy(ptr, dfield->data, dfield->len);
++		ptr += dfield->len;
++	}
++
++	return buf;
++}
++
++/** Directly compare record's memory without collocation.
++ @param[in]		rec1			the first record for memory comparing
++ @param[in]		rec2			the second record for memory comparing
++ @param[in]		len				the minimum length of the comparing records
++ @param[out]	matched_bytes	matched length the two records.
++ @return	the memory comparing result. */
++UNIV_INLINE int rec_direct_memcmp(const byte *rec1, const byte *rec2,
++	ulint len, ulint *matched_bytes)
++{
++	ut_ad(matched_bytes != NULL);
++	for (ulint i = 0; i < len; i++) {
++		int cmp =  (int)(*rec1) - (int)(*rec2);
++		if (cmp != 0) {
++			*matched_bytes = i;
++			return cmp;
++		}
++
++		rec1++;
++		rec2++;
++	}
++
++	*matched_bytes = len;
++	return 0;
++}
++
++/** convert matched fields to matched bytes in dtuple record comparing.
++ @param[in]		dtuple			the tuple record.
++ @param[in]		matched_fields	the comparing matched fields in tuple comparing.
++ @return matched bytes. */
++UNIV_INLINE int dtuple_matched_fields_to_bytes(const dtuple_t *dtuple,
++	ulint matched_fields)
++{
++	ulint matched_bytes = 0;
++	ut_ad(matched_fields <= dtuple_get_n_fields_cmp(dtuple));
++
++	for (ulint i = 0; i < matched_fields; i++) {
++		matched_bytes += dtuple_get_nth_field(dtuple, i)->len;
++	}
++
++	return matched_bytes;
++}
++
++/** convert matched bytes to matched fields in dtuple record comparing.
++ @param[in]		dtuple			the tuple record.
++ @param[in]		matched_bytes	the comparing matched bytes in tuple comparing.
++ @return matched fields. */
++UNIV_INLINE int dtuple_matched_bytes_to_fields(const dtuple_t *dtuple,
++	ulint matched_bytes)
++{
++	ulint matched_fields = 0;
++
++	for (; matched_fields < dtuple_get_n_fields_cmp(dtuple); matched_fields++) {
++		const dfield_t *dfield = dtuple_get_nth_field(dtuple, matched_fields);
++		if (matched_bytes < dfield->len) {
++			return matched_fields;
++		}
++
++		matched_bytes -= dfield->len;
++	}
++
++	return matched_fields;
++}
+\ No newline at end of file
+diff --git a/storage/innobase/include/rem0rec.h b/storage/innobase/include/rem0rec.h
+index 179ebdcf5c5..a7151c0a1b0 100644
+--- a/storage/innobase/include/rem0rec.h
++++ b/storage/innobase/include/rem0rec.h
+@@ -793,6 +793,21 @@ rec_init_offsets_temp(
+ 	ulint*			offsets);/*!< in/out: array of offsets;
+ 					in: n=rec_offs_n_fields(offsets) */
+ 
++/** A simplified variant rec_init_offsets(rec, index, offsets) for the case in
++which the rec contains only fixed-length columns and non-NULL values in them,
++thus we can compute the offsets without looking at the rec. Such offsets can be
++cached and reused for many recs which don't contain NULLs.
++@see rec_init_offsets for more details
++@param[in]		index	The index for which we want to cache the fixed offsets
++@param[in,out]	offsets	The already allocated array to store the offsets.
++						It should already have been initialized with
++						rec_offs_set_n_alloc() and rec_offs_set_n_fields()
++						before the call.
++						This function will fill all the other elements. */
++UNIV_INLINE
++void
++rec_init_fixed_offsets(const dict_index_t *index, ulint *offsets);
++
+ /*********************************************************//**
+ Builds a temporary file record out of a data tuple.
+ @see rec_init_offsets_temp() */
+diff --git a/storage/innobase/include/rem0rec.ic b/storage/innobase/include/rem0rec.ic
+index f12bbca5c06..a297a285d00 100644
+--- a/storage/innobase/include/rem0rec.ic
++++ b/storage/innobase/include/rem0rec.ic
+@@ -1008,7 +1008,18 @@ rec_offs_validate(
+ 	ulint	comp	= *rec_offs_base(offsets) & REC_OFFS_COMPACT;
+ 
+ 	if (rec) {
+-		ut_ad((ulint) rec == offsets[2]);
++#ifdef UNIV_DEBUG
++		/* The offsets array might be:
++		- specific to the `rec`, in which case its address is stored in offsets[2],
++		- cached and shared by many records, in which case we've passed rec=nullptr
++		when preparing the offsets array.
++		We use caching only for the ROW_FORMAT=COMPACT format. */
++		if (offsets[2] != (ulint)NULL) {
++			ut_ad((ulint) rec == offsets[2]);
++		} else if (index != NULL) {
++			ut_ad(offsets[2] == (ulint)NULL && offsets == index->rec_cache.offsets);
++		}
++#endif
+ 		if (!comp) {
+ 			ut_a(rec_get_n_fields_old(rec) >= i);
+ 		}
+@@ -1059,10 +1070,11 @@ rec_offs_make_valid(
+ 	ulint*			offsets)/*!< in: array returned by
+ 					rec_get_offsets() */
+ {
+-	ut_ad(rec);
++	ut_ad(rec || offsets == index->rec_cache.offsets);
+ 	ut_ad(index);
+ 	ut_ad(offsets);
+-	ut_ad(rec_get_n_fields(rec, index) >= rec_offs_n_fields(offsets));
++	ut_ad(rec == NULL ||
++		  rec_get_n_fields(rec, index) >= rec_offs_n_fields(offsets));
+ 	offsets[2] = (ulint) rec;
+ 	offsets[3] = (ulint) index;
+ }
+@@ -1770,4 +1782,28 @@ rec_fold(
+ 
+ 	return(fold);
+ }
++
++/** A simplified variant rec_init_offsets(rec, index, offsets) for the case in
++which the rec contains only fixed-length columns and non-NULL values in them,
++thus we can compute the offsets without looking at the rec. Such offsets can be
++cached and reused for many recs which don't contain NULLs.
++@see rec_init_offsets for more details
++@param[in]		index	The index for which we want to cache the fixed offsets
++@param[in,out]	offsets	The already allocated array to store the offsets.
++			It should already have been initialized with
++			rec_offs_set_n_alloc() and rec_offs_set_n_fields() before
++			the call.
++			This function will fill all the other elements. */
++UNIV_INLINE
++void
++rec_init_fixed_offsets(const dict_index_t *index, ulint *offsets) {
++	rec_offs_make_valid(NULL, index, offsets);
++	rec_offs_base(offsets)[0] = REC_N_NEW_EXTRA_BYTES | REC_OFFS_COMPACT;
++	const ulint n_fields = rec_offs_n_fields(offsets);
++	ulint *field_end = rec_offs_base(offsets) + 1;
++	for (size_t i = 0; i < n_fields; i++) {
++		field_end[i] = (i ? field_end[i - 1] : 0) +
++			dict_index_get_nth_field(index, i)->fixed_len;
++	}
++}
+ #endif /* !UNIV_HOTBACKUP */
+diff --git a/storage/innobase/page/page0cur.cc b/storage/innobase/page/page0cur.cc
+index bab57645106..b228f7d4f00 100644
+--- a/storage/innobase/page/page0cur.cc
++++ b/storage/innobase/page/page0cur.cc
+@@ -309,96 +309,113 @@ page_cur_rec_field_extends(
+ }
+ #endif /* PAGE_CUR_LE_OR_EXTENDS */
+ 
+-/** If key is fixed length then populate offset directly from
+-cached version.
+-@param[in]	rec	B-Tree record for which offset needs to be
+-			populated.
+-@param[in,out]	index	index handler
+-@param[in]	tuple	data tuple
+-@param[in,out]	offsets	default offsets array
+-@param[in,out]	heap	heap
+-@return reference to populate offsets. */
+-static
+-ulint*
+-populate_offsets(
+-	const rec_t*		rec,
+-	const dtuple_t*		tuple,
+-	dict_index_t*		index,
+-	ulint*			offsets,
+-	mem_heap_t**		heap)
+-{
+-	ut_ad(dict_table_is_intrinsic(index->table));
+-
+-	bool rec_has_null_values	= false;
+-
+-	if (index->rec_cache.key_has_null_cols) {
+-		/* Check if record has null value. */
+-		const byte*	nulls = rec - (1 + REC_N_NEW_EXTRA_BYTES);
+-		ulint		n_bytes_to_scan
+-			= UT_BITS_IN_BYTES(index->n_nullable);
+-		byte		null_mask = 0xff;
+-		ulint		bits_examined = 0;
+-
+-		for (ulint i = 0; i < n_bytes_to_scan - 1; i++) {
+-			if (*nulls & null_mask) {
+-				rec_has_null_values = true;
+-				break;
+-			}
+-			--nulls;
+-			bits_examined += 8;
++/** Check if rec has at least one NULL value among the columns for which
++rec_cache.offsets was cached, which means rec_cache.offsets should not be used
++for this rec as it has a different layout of fields than the cached version.
++@param[in]	rec		B-Tree record
++@param[in]	index	The index from which the rec was taken
++@return true iff the rec has at least one relevant column with NULL */
++UNIV_INLINE
++bool
++page_cur_has_null(const rec_t *rec, const dict_index_t *index) {
++	ut_ad(index->rec_cache.offsets);
++	const size_t nullable_cols = index->rec_cache.nullable_cols;
++	ut_ad(nullable_cols <= index->n_nullable);
++	if (!nullable_cols) {
++		return false;
++	}
++
++	/* Check if this record has a NULL value. */
++	const byte *nulls = rec - (1 + REC_N_NEW_EXTRA_BYTES);
++	size_t n_bytes_to_scan = UT_BITS_IN_BYTES(nullable_cols);
++	byte null_mask = 0xff;
++	size_t bits_examined = 0;
++
++	for (size_t i = 0; i < n_bytes_to_scan - 1; i++) {
++		if (*nulls & null_mask) {
++			return true;
+ 		}
++		--nulls;
++		bits_examined += 8;
++	}
++	null_mask >>= (8 - (nullable_cols - bits_examined));
++	return (*nulls & null_mask);
++}
+ 
+-		if (!rec_has_null_values) {
+-			null_mask >>= (8 - (index->n_nullable - bits_examined));
+-			rec_has_null_values = *nulls & null_mask;
++/** calculate the record offsets, if record's offsets is cached, it will be
++ returned directly.
++ @param[in]     rec     B-Tree record for which offset needs to be
++-                       populated.
++ @param[in,out] index   index handler
++ @param[in]     tuple   data tuple
++ @param[in,out] offsets_ default offsets array
++ @param[in,out] heap    heap
++ @return reference to populate offsets. */
++UNIV_INLINE
++const ulint *
++page_cur_populate_offses(const rec_t *rec, const dtuple_t *tuple,
++						 const dict_index_t *index, ulint *offsets_,
++						 mem_heap_t *heap) {
++	const ulint *offsets = NULL;
++	const ulint* cached_offsets = index->rec_cache.offsets;
++#ifdef UNIV_DEBUG
++	if (cached_offsets) {
++		ut_ad(dict_table_is_comp(index->table));
++		ut_ad(!dict_index_has_virtual(index));
++		ut_ad(!dict_index_is_spatial(index));
++		const size_t n = dtuple_get_n_fields_cmp(tuple);
++		const size_t searchable = dict_index_get_n_unique_in_tree(index);
++		/* assert there was no change in number of columns since caching */
++		ut_ad(searchable == index->rec_cache.offsets[1]);
++		/* assert that the number of nullable columns hasn't changed since
++		caching */
++		{
++			size_t nullable = 0;
++			for (size_t i = 0; i < searchable; i++) {
++				const dict_field_t *field =
++					dict_index_get_nth_field(index, i);
++				if (!(field->col->prtype & DATA_NOT_NULL)) {
++					++nullable;
++				}
+ 		}
+-
+-		if (rec_has_null_values) {
+-
+-			offsets = rec_get_offsets(
+-				rec, index, offsets,
+-				dtuple_get_n_fields_cmp(tuple), heap);
+-
+-			return(offsets);
++		ut_ad(index->rec_cache.nullable_cols == nullable);
+ 		}
++		/* We never do a binary search on columns which are not part of internal
++		nodes, nor on node_ptr field. If we ever start doing this, make sure to
++		not use cached_offset offsets then, as it has only searchable columns.
++		*/
++		ut_ad(n <= searchable);
+ 	}
++#endif
+ 
+-	/* Check if offsets are cached else cache them first.
+-	There are queries that will first verify if key is present using index
+-	search and then initiate insert. If offsets are cached during index
+-	search it would be based on key part only but during insert that looks
+-	out for exact location to insert key + db_row_id both columns would
+-	be used and so re-compute offsets in such case. */
+-	if (!index->rec_cache.offsets_cached
+-	    || (rec_offs_n_fields(index->rec_cache.offsets)
+-		< dtuple_get_n_fields_cmp(tuple))) {
+-
+-		offsets = rec_get_offsets(
+-			rec, index, offsets,
+-			dtuple_get_n_fields_cmp(tuple), heap);
+-
+-		/* Reallocate if our offset array is not big
+-		enough to hold the needed size. */
+-		ulint sz1 = index->rec_cache.sz_of_offsets;
+-		ulint sz2 = offsets[0];
+-		if (sz1 < sz2) {
+-			index->rec_cache.offsets = static_cast<ulint*>(
+-				mem_heap_alloc(
+-					index->heap, sizeof(ulint) * sz2));
+-			index->rec_cache.sz_of_offsets =
+-				static_cast<uint32_t>(sz2);
++	if (cached_offsets && !page_cur_has_null(rec, index)) {
++#ifdef UNIV_DEBUG
++		const size_t n = dtuple_get_n_fields_cmp(tuple);
++		offsets = rec_get_offsets(rec, index, offsets_, n, &heap);
++		ut_a(n <= offsets[0]);
++		ut_a(n <= offsets[1]);
++		ut_a(n <= cached_offsets[0]);
++		ut_a(n <= cached_offsets[1]);
++		for (size_t i = 0; i < n; ++i) {
++			ulint len;
++			ulint len2;
++
++			const rec_t* off =
++				rec_get_nth_field(rec, offsets, i, &len);
++			const rec_t* off2 =
++				rec_get_nth_field(rec, cached_offsets, i, &len2);
++			ut_a(off == off2);
++			ut_a(len == len2);
+ 		}
+-
+-		memcpy(index->rec_cache.offsets,
+-		       offsets, (sizeof(ulint) * sz2));
+-		index->rec_cache.offsets_cached = true;
++#endif
++		offsets = cached_offsets;
++	} else {
++		offsets = rec_get_offsets(rec, index, offsets_,
++			dtuple_get_n_fields_cmp(tuple), &heap);
+ 	}
+ 
+-	ut_ad(index->rec_cache.offsets[2] = (ulint) rec);
+-
+-	return(index->rec_cache.offsets);
++	return offsets;
+ }
+-
+ /****************************************************************//**
+ Searches the right position for a page cursor. */
+ void
+@@ -417,7 +434,10 @@ page_cur_search_with_match(
+ 					/*!< in/out: already matched
+ 					fields in lower limit record */
+ 	page_cur_t*		cursor,	/*!< out: page cursor */
+-	rtr_info_t*		rtr_info)/*!< in/out: rtree search stack */
++	rtr_info_t*		rtr_info,	/*!< in/out: rtree search stack */
++	const byte *tuple_rec,
++					/*!<in: the partial record for tuple fast comparing */
++	ulint tuple_rec_size)	/*!< in: the size of tuple_rec*/
+ {
+ 	ulint		up;
+ 	ulint		low;
+@@ -436,7 +456,7 @@ page_cur_search_with_match(
+ #endif /* UNIV_ZIP_DEBUG */
+ 	mem_heap_t*	heap		= NULL;
+ 	ulint		offsets_[REC_OFFS_NORMAL_SIZE];
+-	ulint*		offsets		= offsets_;
++	const ulint*		offsets;
+ 	rec_offs_init(offsets_);
+ 
+ 	ut_ad(dtuple_validate(tuple));
+@@ -507,9 +527,15 @@ page_cur_search_with_match(
+ 	the input parameter, and X denotes an arbitrary physical record on
+ 	the page. We want to position the cursor on the first X which
+ 	satisfies the condition. */
+-
+-	up_matched_fields  = *iup_matched_fields;
+-	low_matched_fields = *ilow_matched_fields;
++	if (tuple_rec != NULL) {
++		up_matched_fields =
++			dtuple_matched_fields_to_bytes(tuple, *iup_matched_fields);
++		low_matched_fields =
++			dtuple_matched_fields_to_bytes(tuple, *ilow_matched_fields);
++	} else {
++		up_matched_fields = *iup_matched_fields;
++		low_matched_fields = *ilow_matched_fields;
++	}
+ 
+ 	/* Perform binary search. First the search is done through the page
+ 	directory, after that as a linear search in the list of records
+@@ -529,22 +555,33 @@ page_cur_search_with_match(
+ 		cur_matched_fields = std::min(low_matched_fields,
+ 					      up_matched_fields);
+ 
+-		offsets = offsets_;
+-		if (index->rec_cache.fixed_len_key) {
+-			offsets = populate_offsets(
+-				mid_rec, tuple,
+-				const_cast<dict_index_t*>(index),
+-				offsets, &heap);
++		if (tuple_rec != NULL) {
++			ulint matched_bytes = 0;
++			cmp = rec_direct_memcmp(
++					tuple_rec + cur_matched_fields,
++					mid_rec + cur_matched_fields,
++					tuple_rec_size - cur_matched_fields,
++					&matched_bytes);
++			cur_matched_fields += matched_bytes;
++
++#ifdef UNIV_DEBUG
++			ulint rec_info =
++				rec_get_info_bits(mid_rec, dict_table_is_comp(index->table));
++			ut_ad(!(rec_info & REC_INFO_MIN_REC_FLAG));
++			offsets = rec_get_offsets(mid_rec, index, offsets_,
++						dtuple_get_n_fields_cmp(tuple), &heap);
++			int cmp2 = cmp_dtuple_rec(tuple, mid_rec, offsets);
++			ut_ad((cmp > 0 && cmp2 > 0) || (cmp == 0 && cmp2 ==0) ||
++				  (cmp < 0 && cmp2 < 0));
++#endif
+ 		} else {
+-			offsets = rec_get_offsets(
+-				mid_rec, index, offsets,
+-				dtuple_get_n_fields_cmp(tuple), &heap);
++			offsets =
++				page_cur_populate_offses(mid_rec, tuple, index, offsets_, heap);
+ 
++			cmp = cmp_dtuple_rec_with_match(
++				tuple, mid_rec, offsets, &cur_matched_fields);
+ 		}
+ 
+-		cmp = cmp_dtuple_rec_with_match(
+-			tuple, mid_rec, offsets, &cur_matched_fields);
+-
+ 		if (cmp > 0) {
+ low_slot_match:
+ 			low = mid;
+@@ -591,22 +628,36 @@ up_slot_match:
+ 		cur_matched_fields = std::min(low_matched_fields,
+ 					      up_matched_fields);
+ 
+-		offsets = offsets_;
+-		if (index->rec_cache.fixed_len_key) {
+-			offsets = populate_offsets(
+-				mid_rec, tuple,
+-				const_cast<dict_index_t*>(index),
+-				offsets, &heap);
++		if (tuple_rec != NULL) {
++			ulint rec_info =
++				rec_get_info_bits(mid_rec, dict_table_is_comp(index->table));
++			if (likely(!(rec_info & REC_INFO_MIN_REC_FLAG))) {
++				ulint matched_bytes = 0;
++				cmp = rec_direct_memcmp(
++						tuple_rec + cur_matched_fields,
++						mid_rec + cur_matched_fields,
++						tuple_rec_size - cur_matched_fields,
++						&matched_bytes);
++				cur_matched_fields += matched_bytes;
++			} else {
++				cmp = 1;
++			}
++
++#ifdef UNIV_DEBUG
++			offsets = rec_get_offsets(mid_rec, index, offsets_,
++						dtuple_get_n_fields_cmp(tuple), &heap);
++			int cmp2 = cmp_dtuple_rec(tuple, mid_rec, offsets);
++			ut_ad((cmp > 0 && cmp2 > 0) || (cmp == 0 && cmp2 ==0) ||
++				  (cmp < 0 && cmp2 < 0));
++#endif
+ 		} else {
+-			offsets = rec_get_offsets(
+-				mid_rec, index, offsets,
+-				dtuple_get_n_fields_cmp(tuple), &heap);
++			offsets =
++				page_cur_populate_offses(mid_rec, tuple, index, offsets_, heap);
+ 
++			cmp = cmp_dtuple_rec_with_match(
++				tuple, mid_rec, offsets, &cur_matched_fields);
+ 		}
+ 
+-		cmp = cmp_dtuple_rec_with_match(
+-			tuple, mid_rec, offsets, &cur_matched_fields);
+-
+ 		if (cmp > 0) {
+ low_rec_match:
+ 			low_rec = mid_rec;
+@@ -643,7 +694,7 @@ up_rec_match:
+ 				ut_ad(btr_page_get_prev(page, &mtr) == FIL_NULL);
+ 				mtr_commit(&mtr);
+ #endif
+-
++				ut_ad(tuple_rec == NULL);
+ 				cur_matched_fields = dtuple_get_n_fields_cmp(tuple);
+ 			}
+ 
+@@ -660,8 +711,16 @@ up_rec_match:
+ 		page_cur_position(low_rec, block, cursor);
+ 	}
+ 
+-	*iup_matched_fields  = up_matched_fields;
+-	*ilow_matched_fields = low_matched_fields;
++	if (tuple_rec != NULL) {
++		*iup_matched_fields =
++			dtuple_matched_bytes_to_fields(tuple, up_matched_fields);
++		*ilow_matched_fields =
++			dtuple_matched_bytes_to_fields(tuple, low_matched_fields);
++	} else {
++		*iup_matched_fields = up_matched_fields;
++		*ilow_matched_fields = low_matched_fields;
++	}
++
+ 	if (UNIV_LIKELY_NULL(heap)) {
+ 		mem_heap_free(heap);
+ 	}
+@@ -1549,6 +1608,7 @@ use_heap:
+ @param[in]	tuple		pointer to a data tuple
+ @param[in]	n_ext		number of externally stored columns
+ @param[in]	mtr		mini-transaction handle, or NULL
++@param[in]	rec_size	The size of new record
+ 
+ @return pointer to record if succeed, NULL otherwise */
+ rec_t*
+@@ -1557,10 +1617,10 @@ page_cur_direct_insert_rec_low(
+ 	dict_index_t*	index,
+ 	const dtuple_t*	tuple,
+ 	ulint		n_ext,
+-	mtr_t*		mtr)
++	mtr_t*		mtr,
++	ulint		rec_size)
+ {
+ 	byte*		insert_buf;
+-	ulint		rec_size;
+ 	page_t*		page;		/*!< the relevant page */
+ 	rec_t*		last_insert;	/*!< cursor position at previous
+ 					insert */
+@@ -1582,10 +1642,7 @@ page_cur_direct_insert_rec_low(
+ 
+ 	ut_ad(!page_rec_is_supremum(current_rec));
+ 
+-	/* 1. Get the size of the physical record in the page */
+-	rec_size = index->rec_cache.rec_size;
+-
+-	/* 2. Try to find suitable space from page memory management */
++	/* Try to find suitable space from page memory management */
+ 	free_rec = page_header_get_ptr(page, PAGE_FREE);
+ 	if (free_rec) {
+ 		/* Try to allocate from the head of the free list. */
+@@ -1642,10 +1699,10 @@ page_cur_direct_insert_rec_low(
+ 		}
+ 	}
+ 
+-	/* 3. Create the record */
++	/* Create the record */
+ 	insert_rec = rec_convert_dtuple_to_rec(insert_buf, index, tuple, n_ext);
+ 
+-	/* 4. Insert the record in the linked list of records */
++	/* Insert the record in the linked list of records */
+ 	ut_ad(current_rec != insert_rec);
+ 
+ 	{
+@@ -1666,7 +1723,7 @@ page_cur_direct_insert_rec_low(
+ 	page_header_set_field(page, NULL, PAGE_N_RECS,
+ 			      1 + page_get_n_recs(page));
+ 
+-	/* 5. Set the n_owned field in the inserted record to zero,
++	/* Set the n_owned field in the inserted record to zero,
+ 	and set the heap_no field */
+ 	if (page_is_comp(page)) {
+ 		rec_set_n_owned_new(insert_rec, NULL, 0);
+@@ -1676,7 +1733,7 @@ page_cur_direct_insert_rec_low(
+ 		rec_set_heap_no_old(insert_rec, heap_no);
+ 	}
+ 
+-	/* 6. Update the last insertion info in page header */
++	/* Update the last insertion info in page header */
+ 
+ 	last_insert = page_header_get_ptr(page, PAGE_LAST_INSERT);
+ 	ut_ad(!last_insert || !page_is_comp(page)
+@@ -1715,7 +1772,7 @@ page_cur_direct_insert_rec_low(
+ 
+ 	page_header_set_ptr(page, NULL, PAGE_LAST_INSERT, insert_rec);
+ 
+-	/* 7. It remains to update the owner record. */
++	/* It remains to update the owner record. */
+ 	{
+ 		rec_t*	owner_rec	= page_rec_find_owner_rec(insert_rec);
+ 		ulint	n_owned;
+@@ -1727,7 +1784,7 @@ page_cur_direct_insert_rec_low(
+ 			rec_set_n_owned_old(owner_rec, n_owned + 1);
+ 		}
+ 
+-		/* 8. Now we have incremented the n_owned field of the owner
++		/* Now we have incremented the n_owned field of the owner
+ 		record. If the number exceeds PAGE_DIR_SLOT_MAX_N_OWNED,
+ 		we have to split the corresponding directory slot in two. */
+ 
+@@ -1738,7 +1795,7 @@ page_cur_direct_insert_rec_low(
+ 		}
+ 	}
+ 
+-	/* 8. Open the mtr for name sake to set the modification flag
++	/* Open the mtr for name sake to set the modification flag
+ 	to true failing which no flush would be done. */
+ 	byte*	log_ptr = mlog_open(mtr, 0);
+ 	ut_ad(log_ptr == NULL);
+diff --git a/storage/innobase/row/row0sel.cc b/storage/innobase/row/row0sel.cc
+index 2a70b038cb5..f077aa3c9c7 100644
+--- a/storage/innobase/row/row0sel.cc
++++ b/storage/innobase/row/row0sel.cc
+@@ -4861,6 +4861,12 @@ row_search_mvcc(
+ 	bool		use_clustered_index		= false;
+ 	ulint		end_loop			= 0;
+ 	Row_sel_get_clust_rec_for_mysql	row_sel_get_clust_rec_for_mysql;
++	/* Get the partial comparing record from seatched dtuple. */
++	const byte* dtuple_rec = NULL;
++	ulint dtuple_rec_size = 0;
++#if !defined(PAGE_CUR_LE_OR_EXTENDS) && defined(__aarch64__)
++	byte dtuple_rec_buf[PARTIAL_FAST_CMP_RECORD_SIZE];
++#endif
+ 
+ 	rec_offs_init(offsets_);
+ 
+@@ -5052,6 +5058,11 @@ row_search_mvcc(
+ 		goto func_exit;
+ 	}
+ 
++#if !defined(PAGE_CUR_LE_OR_EXTENDS) && defined(__aarch64__)
++	dtuple_rec =
++		dtuple_fetch_partial_cmp_rec(index, search_tuple, &dtuple_rec_size,
++			dtuple_rec_buf, PARTIAL_FAST_CMP_RECORD_SIZE);
++#endif
+ 	mtr_start(&mtr);
+ 
+ 	/*-------------------------------------------------------------*/
+@@ -5643,8 +5654,25 @@ wrong_offs:
+ 		in prebuilt: if not, then we return with DB_RECORD_NOT_FOUND */
+ 
+ 		/* fputs("Comparing rec and search tuple\n", stderr); */
++		int cmp = -1;
++		if (dtuple_rec != NULL) {
++			ulint info = rec_get_info_bits(rec, dict_table_is_comp(index->table));
++			if (info & REC_INFO_MIN_REC_FLAG) {
++				cmp = 1;
++			} else {
++				cmp = ut_memcmp(dtuple_rec, rec, dtuple_rec_size);
++			}
++
++#ifdef UNIV_DEBUG
++			int cmp2 = cmp_dtuple_rec(search_tuple, rec, offsets);
++			ut_ad((cmp > 0 && cmp2 > 0) || (cmp == 0 && cmp2 ==0) ||
++				  (cmp < 0 && cmp2 < 0));
++#endif
++		} else {
++			cmp = cmp_dtuple_rec(search_tuple, rec, offsets);
++		}
+ 
+-		if (0 != cmp_dtuple_rec(search_tuple, rec, offsets)) {
++		if (0 != cmp) {
+ 
+ 			if (set_also_gap_locks
+ 			    && !(srv_locks_unsafe_for_binlog
+-- 
+2.27.0
+

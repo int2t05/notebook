@@ -1,0 +1,369 @@
+From c2fb44b009a9b12e3aeae22fdbb3895cee473131 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 30 Sep 2025 16:06:48 +0800
+Subject: [PATCH 4/9] optimize binlog ordered commit
+
+---
+ sql/rpl_commit_stage_manager.cc | 109 ++++++++++++++++++++++++++++++--
+ sql/rpl_commit_stage_manager.h  |  59 ++++++++++++++++-
+ sql/transaction_info.cc         |   4 ++
+ sql/transaction_info.h          |  14 ++++
+ 4 files changed, 179 insertions(+), 7 deletions(-)
+
+diff --git a/sql/rpl_commit_stage_manager.cc b/sql/rpl_commit_stage_manager.cc
+index b70f5ce53..c07896b21 100644
+--- a/sql/rpl_commit_stage_manager.cc
++++ b/sql/rpl_commit_stage_manager.cc
+@@ -58,9 +58,17 @@ bool Commit_stage_manager::Mutex_queue::append(THD *first) {
+     the queue as well.
+   */
+ 
++#if defined(__aarch64__) && defined(__linux__)
++  assign_pending_lock(empty, first);
++#endif
++
+   while (first->next_to_commit) {
+     count++;
+     first = first->next_to_commit;
++#if defined(__aarch64__) && defined(__linux__)
++    assert(first->get_transaction()->m_pending_commit_lock != nullptr);
++    assert(first->get_transaction()->m_pending_commit_cond != nullptr);
++#endif
+   }
+   m_size += count;
+ 
+@@ -110,8 +118,13 @@ void Commit_stage_manager::init(PSI_mutex_key key_LOCK_flush_queue,
+   if (m_is_initialized) return;
+   m_is_initialized = true;
+ 
++#if !defined(__aarch64__) || !defined(__linux__) || !defined(NDEBUG)
+   mysql_mutex_init(key_LOCK_done, &m_lock_done, MY_MUTEX_INIT_FAST);
++#endif
++
++#if !defined(__aarch64__) || !defined(__linux__)
+   mysql_cond_init(key_COND_done, &m_stage_cond_binlog);
++#endif
+   mysql_cond_init(key_COND_done, &m_stage_cond_commit_order);
+   mysql_cond_init(key_COND_flush_queue, &m_stage_cond_leader);
+   mysql_cond_init(key_COND_wait_for_group_turn,
+@@ -156,12 +169,24 @@ void Commit_stage_manager::deinit() {
+   mysql_mutex_destroy(&m_queue_lock[COMMIT_STAGE]);
+   mysql_mutex_destroy(&m_queue_lock[AFTER_COMMIT_STAGE]);
+ 
++#if !defined(__aarch64__) || !defined(__linux__)
+   mysql_cond_destroy(&m_stage_cond_binlog);
++#endif
+   mysql_cond_destroy(&m_stage_cond_commit_order);
+   mysql_cond_destroy(&m_stage_cond_leader);
++#if !defined(__aarch64__) || !defined(__linux__) || !defined(NDEBUG)
+   mysql_mutex_destroy(&m_lock_done);
++#endif
+   mysql_cond_destroy(&this->m_cond_wait_for_ticket_turn);
+   mysql_mutex_destroy(&this->m_lock_wait_for_ticket_turn);
++
++#if defined(__aarch64__) && defined(__linux__)
++  m_queue[BINLOG_FLUSH_STAGE].deinit();
++  m_queue[SYNC_STAGE].deinit();
++  m_queue[COMMIT_STAGE].deinit();
++  m_queue[AFTER_COMMIT_STAGE].deinit();
++  m_queue[COMMIT_ORDER_FLUSH_STAGE].deinit();
++#endif
+ }
+ 
+ bool Commit_stage_manager::is_ticket_on_its_turn_and_back_ticket_incremented(
+@@ -349,7 +374,22 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+   */
+   if (!leader) {
+     CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP("before_follower_wait");
++    mysql_mutex_t *pending_lock = nullptr;
++    mysql_cond_t *pending_cond = nullptr;
++#if defined(__aarch64__) && defined(__linux__)
++    pending_lock = thd->get_transaction()->m_pending_commit_lock;
++    pending_cond = thd->get_transaction()->m_pending_commit_cond;
++#ifndef NDEBUG
++    /* Protect leader_await_preempt_status. */
+     mysql_mutex_lock(&m_lock_done);
++#endif
++#else
++    pending_lock = &m_lock_done;
++    pending_cond = &m_stage_cond_binlog;
++#endif
++    assert(pending_lock != nullptr);
++    assert(pending_cond != nullptr);
++    mysql_mutex_lock(pending_lock);
+ #ifndef NDEBUG
+     /*
+       Leader can be awaiting all-clear to preempt follower's execution.
+@@ -358,16 +398,22 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+     */
+     thd->get_transaction()->m_flags.ready_preempt = true;
+     if (leader_await_preempt_status) mysql_cond_signal(&m_cond_preempt);
++#if defined(__aarch64__) && defined(__linux__)
++    mysql_mutex_unlock(&m_lock_done);
++#endif
+ #endif
+     while (thd->tx_commit_pending) {
+       if (stage == COMMIT_ORDER_FLUSH_STAGE) {
+-        mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
++        mysql_cond_wait(&m_stage_cond_commit_order, pending_lock);
+       } else {
+-        mysql_cond_wait(&m_stage_cond_binlog, &m_lock_done);
++        mysql_cond_wait(pending_cond, pending_lock);
+       }
+     }
+ 
+-    mysql_mutex_unlock(&m_lock_done);
++    mysql_mutex_unlock(pending_lock);
++#if defined(__aarch64__) && defined(__linux__)
++    thd->get_transaction()->reset_pending_commit_lock();
++#endif
+     return false;
+   }
+ 
+@@ -394,6 +440,16 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+       mysql_cond_signal(&m_stage_cond_leader);
+       unlock_queue(stage);
+ 
++#if defined(__aarch64__) && defined(__linux__)
++      mysql_mutex_t *pending_lock = thd->get_transaction()->m_pending_commit_lock;
++      mysql_mutex_lock(pending_lock);
++      /* wait for signal from binlog leader */
++      CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP(
++          "before_commit_order_leader_waits_for_binlog_leader");
++      while (thd->tx_commit_pending)
++        mysql_cond_wait(&m_stage_cond_commit_order, pending_lock);
++      mysql_mutex_unlock(pending_lock);
++#else
+       mysql_mutex_lock(&m_lock_done);
+       /* wait for signal from binlog leader */
+       CONDITIONAL_SYNC_POINT_FOR_TIMESTAMP(
+@@ -401,7 +457,7 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+       while (thd->tx_commit_pending)
+         mysql_cond_wait(&m_stage_cond_commit_order, &m_lock_done);
+       mysql_mutex_unlock(&m_lock_done);
+-
++#endif
+       leader = false;
+       return leader;
+     }
+@@ -488,6 +544,50 @@ void Commit_stage_manager::process_final_stage_for_ordered_commit_group(
+   }
+ }
+ 
++#if defined(__aarch64__) && defined(__linux__)
++void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
++  std::set<mysql_cond_t *> conds;
++  std::set<mysql_cond_t *>::iterator it;
++  mysql_mutex_t *current_lock = nullptr;
++
++  /* Note: The leader in this queue is not assgined lock. */
++  assert(queue->get_transaction()->m_pending_commit_lock == current_lock);
++
++  for (THD *thd = queue; thd; thd = thd->next_to_commit) {
++    if (current_lock != thd->get_transaction()->m_pending_commit_lock) {
++      if (current_lock != nullptr) {
++        mysql_mutex_unlock(current_lock);
++      }
++      current_lock = thd->get_transaction()->m_pending_commit_lock;
++
++      if (stage != COMMIT_ORDER_FLUSH_STAGE) {
++        assert(thd->get_transaction()->m_pending_commit_cond != nullptr);
++        conds.insert(thd->get_transaction()->m_pending_commit_cond);
++      }
++
++      /* only leader has no lock and condition wait. */
++      assert(current_lock != nullptr);
++      mysql_mutex_lock(current_lock);
++    }
++    thd->tx_commit_pending = false;
++    thd->rpl_thd_ctx.binlog_group_commit_ctx().reset();
++  }
++
++  if (current_lock != nullptr) {
++    mysql_mutex_unlock(current_lock);
++  }
++
++  if (stage == COMMIT_ORDER_FLUSH_STAGE) {
++    mysql_cond_broadcast(&m_stage_cond_commit_order);
++  }
++
++  /* Every queue in order commit will share the same lock. */
++  assert(conds.size() <= STAGE_COUNTER);
++  for (it = conds.begin(); it != conds.end(); it++) {
++    mysql_cond_broadcast(*it);
++  }
++}
++#else
+ void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
+   mysql_mutex_lock(&m_lock_done);
+ 
+@@ -504,6 +604,7 @@ void Commit_stage_manager::signal_done(THD *queue, StageID stage) {
+ 
+   mysql_mutex_unlock(&m_lock_done);
+ }
++#endif
+ 
+ void Commit_stage_manager::signal_end_of_ticket(bool force) {
+   auto &ticket_manager = binlog::Bgc_ticket_manager::instance();
+diff --git a/sql/rpl_commit_stage_manager.h b/sql/rpl_commit_stage_manager.h
+index c5830c2de..ec8aae0ff 100644
+--- a/sql/rpl_commit_stage_manager.h
++++ b/sql/rpl_commit_stage_manager.h
+@@ -35,6 +35,10 @@
+ 
+ class THD;
+ 
++#if defined(__aarch64__) && defined(__linux__)
++const static size_t N_LOCKS_PER_COMMIT_QUEUE = 32;
++#endif
++
+ /**
+   Class for maintaining the commit stages for binary log group commit.
+  */
+@@ -44,9 +48,21 @@ class Commit_stage_manager {
+     friend class Commit_stage_manager;
+ 
+    public:
+-    Mutex_queue() : m_first(nullptr), m_last(&m_first), m_size(0) {}
+-
+-    void init(mysql_mutex_t *lock) { m_lock = lock; }
++    Mutex_queue() : m_first(nullptr), m_last(&m_first), m_size(0)
++#if defined(__aarch64__) && defined(__linux__)
++                  , m_to_assign_lock(-1)
++#endif
++                  {}
++
++    void init(mysql_mutex_t *lock) {
++      m_lock = lock;
++#if defined(__aarch64__) && defined(__linux__)
++      for (size_t i = 0; i < N_LOCKS_PER_COMMIT_QUEUE; i++) {
++        mysql_mutex_init(PSI_NOT_INSTRUMENTED, &m_pending_locks[i], MY_MUTEX_INIT_FAST);
++        mysql_cond_init(PSI_NOT_INSTRUMENTED, &m_pending_conds[i]);
++      }
++#endif
++    }
+ 
+     bool is_empty() const { return m_first == nullptr; }
+ 
+@@ -109,6 +125,31 @@ class Commit_stage_manager {
+ 
+     void unlock() { mysql_mutex_unlock(m_lock); }
+ 
++#if defined(__aarch64__) && defined(__linux__)
++    void assign_pending_lock(bool is_header, THD *first) {
++      Transaction_ctx *tx = first->get_transaction();
++      assert(tx->m_pending_commit_lock == nullptr);
++      assert(tx->m_pending_commit_cond == nullptr);
++      if (is_header) {
++        /* leader will reserve lock for followers. */
++        m_to_assign_lock++;
++        assert(m_to_assign_lock >= 0);
++        assert(m_to_assign_lock <= static_cast<int>(N_LOCKS_PER_COMMIT_QUEUE));
++        m_to_assign_lock = (m_to_assign_lock) % N_LOCKS_PER_COMMIT_QUEUE;
++      } else {
++        tx->m_pending_commit_lock = &m_pending_locks[m_to_assign_lock];
++        tx->m_pending_commit_cond = &m_pending_conds[m_to_assign_lock];
++      }
++    }
++
++    void deinit() {
++      for (size_t i = 0; i < N_LOCKS_PER_COMMIT_QUEUE; i++) {
++        mysql_mutex_destroy(&m_pending_locks[i]);
++        mysql_cond_destroy(&m_pending_conds[i]);
++      }
++    }
++#endif
++
+     void assert_owner() { mysql_mutex_assert_owner(m_lock); }
+ 
+    private:
+@@ -139,6 +180,14 @@ class Commit_stage_manager {
+     /** Lock for protecting the queue. */
+     mysql_mutex_t *m_lock;
+ 
++#if defined(__aarch64__) && defined(__linux__)
++    int m_to_assign_lock;
++
++    mysql_mutex_t m_pending_locks[N_LOCKS_PER_COMMIT_QUEUE];
++
++    mysql_cond_t m_pending_conds[N_LOCKS_PER_COMMIT_QUEUE];
++#endif
++
+     /*
+       This attribute did not have the desired effect, at least not according
+       to -fsanitize=undefined with gcc 5.2.1
+@@ -447,11 +496,13 @@ class Commit_stage_manager {
+   */
+   mysql_cond_t m_stage_cond_leader;
+ 
++#if !defined(__aarch64__) || !defined(__linux__)
+   /**
+      Condition variable to indicate that the binlog threads can wake up
+      and continue.
+   */
+   mysql_cond_t m_stage_cond_binlog;
++#endif
+ 
+   /**
+      Condition variable to indicate that the flush to storage engine
+@@ -459,8 +510,10 @@ class Commit_stage_manager {
+   */
+   mysql_cond_t m_stage_cond_commit_order;
+ 
++#if !defined(__aarch64__) || !defined(__linux__) || !defined(NDEBUG)
+   /** Mutex used for the condition variable above */
+   mysql_mutex_t m_lock_done;
++#endif
+ 
+   /** Mutex used for the stage level locks */
+   mysql_mutex_t m_queue_lock[STAGE_COUNTER - 1];
+diff --git a/sql/transaction_info.cc b/sql/transaction_info.cc
+index 0cef187e8..ed8289854 100644
+--- a/sql/transaction_info.cc
++++ b/sql/transaction_info.cc
+@@ -47,6 +47,10 @@ Transaction_ctx::Transaction_ctx()
+                  global_system_variables.trans_alloc_block_size),
+       last_committed(0),
+       sequence_number(0),
++#if defined(__aarch64__) && defined(__linux__)
++      m_pending_commit_lock(nullptr),
++      m_pending_commit_cond(nullptr),
++#endif
+       m_rpl_transaction_ctx(),
+       m_transaction_write_set_ctx(),
+       trans_begin_hook_invoked(false) {
+diff --git a/sql/transaction_info.h b/sql/transaction_info.h
+index eb082fb44..54c5ce2e4 100644
+--- a/sql/transaction_info.h
++++ b/sql/transaction_info.h
+@@ -217,6 +217,13 @@ class Transaction_ctx {
+   */
+   int64 sequence_number;
+ 
++#if defined(__aarch64__) && defined(__linux__)
++  /* following lock and condition will assigned in binlog's order commit to void  "thundering herd" */
++  mysql_mutex_t *m_pending_commit_lock;
++
++  mysql_cond_t *m_pending_commit_cond;
++#endif
++
+   void store_commit_parent(int64 last_arg) { last_committed = last_arg; }
+ 
+   Transaction_ctx();
+@@ -356,6 +363,13 @@ class Transaction_ctx {
+     return;
+   }
+ 
++#if defined(__aarch64__) && defined(__linux__)
++  void reset_pending_commit_lock() {
++    m_pending_commit_lock = nullptr;
++    m_pending_commit_cond = nullptr;
++  }
++#endif
++
+   Rpl_transaction_ctx *get_rpl_transaction_ctx() {
+     return &m_rpl_transaction_ctx;
+   }
+-- 
+2.31.1.windows.1
+

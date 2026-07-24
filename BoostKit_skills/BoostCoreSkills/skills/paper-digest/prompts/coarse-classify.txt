@@ -1,0 +1,42 @@
+你是论文相关性筛选助手。给定研究方向关键词和一批论文标题，按相关性打三档（green/yellow/red）。
+
+研究方向关键词：
+{keywords}
+
+排除词（命中即 red）：
+{exclude}
+
+待筛选论文：
+{papers_json}
+
+输出严格 JSON：
+{
+  "results": [
+    {"id": "C-ISMM-2025-001", "relevance": "green", "reason": "直击 jemalloc 内核优化", "category": null},
+    {"id": "X-arxiv-001", "relevance": "yellow", "reason": "CXL tiered memory 调度策略，与本方向部分相关；论文应聚焦在 ML serving 的 KV cache 上", "category": null},
+    {"id": "C-XXX-002", "relevance": "red", "reason": "标题含 'allocation' 但实际是网络带宽分配", "category": "keyword_false_positive"}
+  ]
+}
+
+# 字段说明
+
+- relevance:
+  - green: 核心相关，必读
+  - yellow: 中等相关，选读
+  - red: 弱相关，速览
+- reason:
+  - green / yellow: **必须**给一句话内容判断（不能只写"hit"），含「论文大致在做什么 + 为何归到该档」
+  - red: 给出排除理由
+- category（仅 red 需要填，其它 null）：
+  - off_topic: 完全离题（标题/摘要与方向无交集）
+  - keyword_false_positive: 关键词误命中（pre-pass 通过但 LLM 判定无关，常见于 'allocation' / 'memory' 在网络/算力上下文）
+  - excluded_by_filter: 触发了 exclude 关键词
+  - tooling_or_workshop: 工具 / workshop / panel / proceedings front-matter，非研究论文
+  - ai_systems_offtopic: AI 系统主线（LLM serving、训练系统）但与本方向交集小
+
+# 约束
+
+- 标题命中任意排除词 → 直接 red，category = excluded_by_filter
+- 拿不准从下一档（保守原则）
+- yellow 的 reason 必须能让人 30 秒看懂论文大致内容（一句话标题翻译 + 与方向的关系）
+- 输出必须可被 JSON.parse；不要 markdown 代码块包装

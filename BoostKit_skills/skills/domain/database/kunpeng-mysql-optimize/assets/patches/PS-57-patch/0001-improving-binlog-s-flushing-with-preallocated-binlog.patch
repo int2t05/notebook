@@ -1,0 +1,356 @@
+From 6ca619859e52e855fdf46d18f9dd10ccdc9f52cc Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Sat, 23 Aug 2025 11:11:04 +0800
+Subject: [PATCH] improving binlog's flushing with preallocated binlog file
+
+---
+ sql/binlog.cc            | 76 +++++++++++++++++++++++++++++++++++++++-
+ sql/binlog.h             | 30 ++++++++++++++++
+ sql/log_event.cc         | 53 ++++++++++++++++++++++++++++
+ sql/mysqld.cc            |  1 +
+ sql/mysqld.h             |  1 +
+ sql/rpl_binlog_sender.cc | 20 ++++++++++-
+ sql/sys_vars.cc          |  6 ++++
+ 7 files changed, 185 insertions(+), 2 deletions(-)
+
+diff --git a/sql/binlog.cc b/sql/binlog.cc
+index 014ffec37f4..0c576a404b7 100644
+--- a/sql/binlog.cc
++++ b/sql/binlog.cc
+@@ -3061,6 +3061,17 @@ File open_binlog_file(IO_CACHE *log, const char *log_file_name, const char **err
+     *errmsg = "Could not open log file";
+     goto err;
+   }
++
++  if (mysql_bin_log.is_active(log_file_name)) {
++    mysql_bin_log.lock_binlog_end_pos();
++    /* Double check the log, during binlog rotating, MySQL always update binlog
++    end position followed openning new binlog. */
++    if (mysql_bin_log.log_preallocated(log_file_name)) {
++      log->end_of_file= mysql_bin_log.get_binlog_end_pos();
++    }
++    mysql_bin_log.unlock_binlog_end_pos();
++  }
++
+   if (check_binlog_magic(log,errmsg))
+     goto err;
+   DBUG_RETURN(file);
+@@ -3462,6 +3473,11 @@ bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log)
+       LOG_INFO li;
+       binary_log->get_current_log(&li, false /*LOCK_log is already acquired*/);
+       end_pos= li.pos;
++      if (binary_log->log_preallocated(linfo.log_file_name)) {
++        /* Just keep consistent behaviour with no log preallocated, even though
++        current end_of_file is safer, */
++        log.end_of_file= end_pos;
++      }
+     }
+     else
+     {
+@@ -3654,7 +3670,8 @@ MYSQL_BIN_LOG::MYSQL_BIN_LOG(uint *sync_period,
+    checksum_alg_reset(binary_log::BINLOG_CHECKSUM_ALG_UNDEF),
+    relay_log_checksum_alg(binary_log::BINLOG_CHECKSUM_ALG_UNDEF),
+    previous_gtid_set_relaylog(0), snapshot_lock_acquired(false),
+-   is_rotating_caused_by_incident(false)
++   is_rotating_caused_by_incident(false),
++   m_preallocated_log_size(0)
+ {
+   log_state.atomic_set(LOG_CLOSED);
+   /*
+@@ -5265,6 +5282,10 @@ bool MYSQL_BIN_LOG::open_binlog(const char *log_name,
+ 
+   if (!my_b_filelength(&log_file))
+   {
++    if (!is_relay_log) {
++      preallocate_log_file();
++    }
++
+     /*
+       The binary log file was empty (probably newly created)
+       This is the normal case and happens when the user doesn't specify
+@@ -8854,6 +8875,8 @@ void MYSQL_BIN_LOG::close(uint exiting, bool need_lock_log,
+         original position on system that doesn't support pwrite().
+       */
+       mysql_file_seek(log_file.file, org_position, MY_SEEK_SET, MYF(0));
++
++      reclain_preallocated_log_file();
+     }
+ 
+     /* this will cleanup IO_CACHE, sync and close the file */
+@@ -10883,6 +10906,57 @@ void MYSQL_BIN_LOG::report_missing_gtids(const Gtid_set* previous_gtid_set,
+   DBUG_VOID_RETURN;
+ }
+ 
++void MYSQL_BIN_LOG::preallocate_log_file() {
++  if (opt_binlog_preallocate == FALSE || log_file.type != WRITE_CACHE) {
++    return;
++  }
++
++  assert(log_file.file != -1);
++#if defined(__aarch64__) && defined(__linux__)
++#if defined(FALLOC_FL_WRITE_ZEROS)
++  /* Some hardware support UMMAP bit or DEAC bit, which can accelerate
++  writting zeros. */
++  const static int BINLOG_FALLOCATE_MODE = FALLOC_FL_WRITE_ZEROS;
++#else
++  const static int BINLOG_FALLOCATE_MODE = FALLOC_FL_ZERO_RANGE;
++#endif
++  my_off_t offset= my_b_get_pos_in_file(&log_file);
++  my_off_t to_size= max_size;
++
++  assert(to_size <= max_size);
++  assert(to_size > offset);
++  int ret= fallocate(log_file.file, BINLOG_FALLOCATE_MODE, offset, to_size);
++  if(ret == 0) {
++    m_preallocated_log_size= to_size;
++    return;
++  }
++
++  sql_print_warning("failed to fallocate for binlog file: %s, error no: %d",
++                    log_file_name, ret);
++  if (m_preallocated_log_size <= offset) {
++    m_preallocated_log_size= 0;
++  }
++#endif
++}
++
++void MYSQL_BIN_LOG::reclain_preallocated_log_file() {
++  if (log_file.type != WRITE_CACHE) {
++    return;
++  }
++
++  my_off_t pos_written= my_b_get_pos_in_file(&log_file);
++  /* In some error cases, io cache maybe hasn't been flushed. */
++  assert(my_b_tell(&log_file) >= pos_written);
++  assert(log_file.file != -1);
++  if (m_preallocated_log_size > pos_written &&
++      ftruncate(log_file.file, pos_written) != 0) {
++    sql_print_error("failed to recalain for binlog file: %s, error no: %d",
++                    log_file_name, errno);
++  }
++
++  m_preallocated_log_size= 0;
++}
++
+ bool THD::is_binlog_cache_empty(bool is_transactional)
+ {
+   DBUG_ENTER("THD::is_binlog_cache_empty(bool)");
+diff --git a/sql/binlog.h b/sql/binlog.h
+index 4dbf1476d34..34f44aba9ca 100644
+--- a/sql/binlog.h
++++ b/sql/binlog.h
+@@ -996,8 +996,38 @@ public:
+   {
+     return &crypto;
+   }
++
++  bool log_preallocated(const char* log_name) {
++    if (is_active(log_name) && log_file.type == WRITE_CACHE) {
++      return m_preallocated_log_size > 0;
++    }
++
++    return false;
++  }
+ private:
++  /*
++    The size of current preallocated binlog file size. When the binlog was
++    created, we will reallocated all physical block. If current binlog is
++    closed, we will reclain the preallocated physical block.
++
++    Testcases: Writting a full of binlog in Kunpen 920B PCIE 4.0 NVME SSD,
++    binlog size: 512MB
++
++    1. directly write(UNIT: 512(IO_SIZE)) costs: 1280ms
++
++    2. fallocated 512MB && write(512 bytes) costs: 650ms
++
++    3. fallocated a file with size of 512MB and zeros filling only costs 0.6ms
++    So with preallocated binlog, we can save 50% costs during binlog's flush
++    stage.
++  */
++  size_t m_preallocated_log_size;
++
+   void publish_coordinates_for_global_status(void) const;
++
++  void preallocate_log_file();
++
++  void reclain_preallocated_log_file();
+ };
+ 
+ typedef struct st_load_file_info
+diff --git a/sql/log_event.cc b/sql/log_event.cc
+index 970910c518f..d188015b58f 100644
+--- a/sql/log_event.cc
++++ b/sql/log_event.cc
+@@ -121,6 +121,9 @@ TYPELIB binlog_checksum_typelib=
+ */
+ #define FMT_G_BUFSIZE(PREC) (3 + (PREC) + 5 + 1)
+ 
++static bool is_buf_zeros(const char *buf, ssize_t buf_len);
++static bool is_preallocated_log_eof(IO_CACHE *logfile);
++
+ #if !defined(MYSQL_CLIENT) && defined(HAVE_REPLICATION)
+ static int rows_event_stmt_cleanup(Relay_log_info const *rli, THD* thd);
+ 
+@@ -288,6 +291,37 @@ static void set_thd_db(THD *thd, const char *db, size_t db_len)
+ 
+ #endif
+ 
++static bool is_buf_zeros(const char *buf, ssize_t buf_len) {
++  while (buf_len > 0) {
++    if(buf[buf_len - 1] != 0) {
++      return false;
++    }
++    buf_len--;
++  }
++
++  return true;
++}
++
++/**
++  Whether or not we reached a eof of preallocated binlog, usually, we only
++  invoke this function only once in crash recovery case, and this function
++  didn't change IO_CACHE's file position.
++  @param logfile  The IO_CACHE for binlog read.
++  @return true  if we have reached a end of preallocated file.
++*/
++static bool is_preallocated_log_eof(IO_CACHE *logfile) {
++  uchar log_io_block[IO_SIZE];
++
++  my_off_t org_position= my_tell(logfile->file, MYF(0));
++  my_off_t offset= my_b_tell(logfile);
++
++  my_off_t length= my_pread(logfile->file, log_io_block, IO_SIZE,
++                            offset, logfile->myflags | MY_NABP);
++
++  my_seek(logfile->file, org_position, MY_SEEK_SET, MYF(0));
++
++  return is_buf_zeros((char *)log_io_block, length);
++}
+ 
+ /*
+   pretty_print_str()
+@@ -1242,6 +1276,16 @@ int Log_event::read_log_event(IO_CACHE* file, String* packet,
+     DBUG_PRINT("info",("Skipped reading the event header. Using the provided one."));
+ 
+   data_len= uint4korr(buf + EVENT_LEN_OFFSET);
++
++  if (unlikely(data_len == 0 && buf == local_buf)) {
++    const ssize_t rest_buf_size = LOG_EVENT_MINIMAL_HEADER_LEN - EVENT_LEN_OFFSET;
++    if (is_buf_zeros(buf + EVENT_LEN_OFFSET, rest_buf_size) &&
++        is_preallocated_log_eof(file)) {
++      result= LOG_READ_EOF;
++      goto end;
++    }
++  }
++
+   if (data_len < LOG_EVENT_MINIMAL_HEADER_LEN ||
+       data_len > max(current_thd->variables.max_allowed_packet,
+                      opt_binlog_rows_event_max_size + MAX_LOG_EVENT_HEADER))
+@@ -1444,6 +1488,15 @@ Log_event* Log_event::read_log_event(IO_CACHE* file,
+     DBUG_RETURN(0);
+   }
+   ulong data_len = uint4korr(head + EVENT_LEN_OFFSET);
++
++  if (unlikely(data_len == 0)) {
++    if (is_buf_zeros(head + EVENT_LEN_OFFSET, header_size - EVENT_LEN_OFFSET) &&
++        is_preallocated_log_eof(file)) {
++      UNLOCK_MUTEX;
++      DBUG_RETURN(0);
++    }
++  }
++
+   char *buf= 0;
+   const char *error= 0;
+   Log_event *res=  0;
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index 160f92b53c6..17b60aa3e47 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -482,6 +482,7 @@ ulong what_to_log;
+ ulong slow_launch_time;
+ Atomic_int32 slave_open_temp_tables;
+ ulong open_files_limit, max_binlog_size, max_relay_log_size;
++my_bool opt_binlog_preallocate = true;
+ ulong slave_trans_retries;
+ uint  slave_net_timeout;
+ ulong slave_exec_mode_options;
+diff --git a/sql/mysqld.h b/sql/mysqld.h
+index ab2e944b208..86e3c1ae210 100644
+--- a/sql/mysqld.h
++++ b/sql/mysqld.h
+@@ -279,6 +279,7 @@ extern int32 opt_binlog_max_flush_queue_time;
+ extern long opt_binlog_group_commit_sync_delay;
+ extern ulong opt_binlog_group_commit_sync_no_delay_count;
+ extern ulong max_binlog_size, max_relay_log_size;
++extern my_bool opt_binlog_preallocate;
+ extern ulong slave_max_allowed_packet;
+ extern ulong opt_binlog_rows_event_max_size;
+ extern ulong binlog_checksum_options;
+diff --git a/sql/rpl_binlog_sender.cc b/sql/rpl_binlog_sender.cc
+index 3f66a6b852f..b33873a07b8 100644
+--- a/sql/rpl_binlog_sender.cc
++++ b/sql/rpl_binlog_sender.cc
+@@ -479,6 +479,12 @@ my_off_t Binlog_sender::send_binlog(IO_CACHE *log_cache, my_off_t start_pos)
+     if (end_pos <= 1)
+       return end_pos;
+ 
++#if defined(__aarch64__) && defined(__linux__)
++    if (opt_binlog_preallocate) {
++      log_cache->end_of_file = end_pos;
++    }
++#endif
++
+     if (send_events(log_cache, end_pos))
+       return 1;
+ 
+@@ -983,6 +989,13 @@ int Binlog_sender::check_start_file()
+   }
+ 
+   size= my_b_filelength(&cache);
++
++  /* if we enable binlog preallocated, we should use the accurate end position
++  of the binlog file in case of reading active binlog. */
++  if (opt_binlog_preallocate && cache.end_of_file < size) {
++    size = cache.end_of_file;
++  }
++
+   end_io_cache(&cache);
+   mysql_file_close(file, MYF(MY_WME));
+ 
+@@ -1267,9 +1280,14 @@ int Binlog_sender::has_previous_gtid_log_event(IO_CACHE *log_cache,
+ {
+   uchar buf[LOG_EVENT_HEADER_LEN];
+   *found= false;
++  my_off_t end_of_file= my_b_filelength(log_cache);
++
++  if (opt_binlog_preallocate) {
++    end_of_file= MY_MIN(end_of_file, log_cache->end_of_file);
++  }
+ 
+   /* It is possible there is only format_description_log_event in the file. */
+-  if (my_b_tell(log_cache) < my_b_filelength(log_cache))
++  if (my_b_tell(log_cache) < end_of_file)
+   {
+     if (my_b_read(log_cache, buf, LOG_EVENT_HEADER_LEN) != 0)
+     {
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 074473bef66..2310ffa9190 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -2457,6 +2457,12 @@ static Sys_var_ulong Sys_max_binlog_size(
+        BLOCK_SIZE(IO_SIZE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0),
+        ON_UPDATE(fix_max_binlog_size));
+ 
++static Sys_var_mybool Sys_enable_binlog_preallocate(
++        "enable_binlog_preallocate", "Whether or not enable allocate binlog "
++        "file using posix_fallocated",
++        READ_ONLY GLOBAL_VAR(opt_binlog_preallocate), CMD_LINE(OPT_ARG),
++        DEFAULT(TRUE));
++
+ static Sys_var_ulong Sys_max_connections(
+        "max_connections", "The number of simultaneous clients allowed",
+        GLOBAL_VAR(max_connections), CMD_LINE(REQUIRED_ARG),
+-- 
+2.27.0
+

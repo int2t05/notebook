@@ -1,0 +1,17 @@
+# Teddy 触发规则集 — 12条 6字节字面量
+# 条件: grey.fdrAllowTeddy + chooseTeddyEngine 成功
+# 12条字面量在 Teddy bucket 容量内 (ARM 8-bucket × load, x86 16-bucket × load)
+# teddy_engine_description.cpp isAllowed: numBuckets < lits.size needs packed=true
+# 不同长度的后缀确保 Tedy mask 能区分
+1:/abc123/
+2:/def456/
+3:/ghi789/
+4:/jkl012/
+5:/mno345/
+6:/pqr678/
+7:/stu901/
+8:/vwx234/
+9:/yza567/
+10:/bcd890/
+11:/efg123/
+12:/hij456/

@@ -1,0 +1,11 @@
+r01,foothebar,foo(.*?)(bar),2
+r02,foothebar,foo(.*?)(bar),1
+r03,foothebar,foo(.*?)(bar),0
+r04,foothebar,foo(.*?)(bar),3
+r05,noMatchHere,foo(.*?)(bar),1
+r06,abc123def,([0-9]+),1
+r07,hello.world,([^.]+),1
+r08,null,foo(.*?)(bar),1
+r09,foothebar,null,1
+r10,null,null,1
+r11,foothebar,foo(.*?)(bar),-1

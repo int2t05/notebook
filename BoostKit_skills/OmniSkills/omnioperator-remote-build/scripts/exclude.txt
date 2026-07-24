@@ -1,0 +1,50 @@
+# Rsync排除文件示例
+# 每行一个模式，支持通配符
+
+# 版本控制目录
+.git/
+.svn/
+.hg/
+
+# 编译输出
+*.o
+*.so
+*.a
+*.exe
+*.dll
+build/
+dist/
+target/
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+
+# IDE文件
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 依赖目录
+node_modules/
+vendor/
+__pycache__/
+*.pyc
+*.pyo
+
+# 配置文件 (可能包含敏感信息)
+.env
+.env.local
+config.local.*

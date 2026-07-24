@@ -1,0 +1,1148 @@
+From 9de0134496f69bc802c60665eea80227609ec02c Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Sat, 28 Mar 2026 09:48:50 +0800
+Subject: [PATCH] adjust threadpool concurrency using scheduler statistics
+
+Sample process CPU usage and context-switch rates in the thread pool timer
+thread and use them to adapt a global active worker quota.
+
+Add Tp_statistics in threadpool_unix.cc to track normalized CPU usage,
+voluntary context-switch frequency (ru_nvcsw), involuntary context-switch
+frequency (ru_nivcsw), and the derived active_threads_quota used by the
+scheduler. Expose the current scheduler inputs through
+Threadpool_statistics_detail, and also export the current global active and
+waiting thread counts through SHOW STATUS.
+
+Use these statistics to control concurrency growth by shrinking
+active_threads_quota when CPU usage or context-switch pressure is high and
+growing it again when pressure drops. Apply the quota in the queue dequeue,
+worker wakeup, and wait paths, and maintain a global active-thread counter
+so quota checks reflect the current runnable worker population.
+
+Add THD_WAIT_ORDER_COMMIT_FLUSH and instrument ordered commit flush/sync
+waits with thd_wait_begin()/thd_wait_end(). When
+thread_pool_enable_extra_threads is enabled, the thread pool can wake or
+create a worker on order-commit flush waits if the group still has queued
+work and available quota.
+
+Add the following global sysvars and basic sys_vars coverage:
+- thread_pool_commit_burst_threads
+- thread_pool_cpu_usage_threshold
+- thread_pool_nvcsw_freq_threshold
+- thread_pool_nivcsw_freq_threshold
+---
+ .../my_system_api/my_system_api.h             |   2 +
+ include/mysql/service_thd_wait.h              |   3 +-
+ ...ead_pool_commit_burst_threads_basic.result |  41 ++
+ ...read_pool_cpu_usage_threshold_basic.result |  47 +++
+ ...ad_pool_nivcsw_freq_threshold_basic.result |  47 +++
+ ...ead_pool_nvcsw_freq_threshold_basic.result |  47 +++
+ ...pool_commit_burst_threads_basic-master.opt |   1 +
+ ...hread_pool_commit_burst_threads_basic.test |  40 ++
+ ...thread_pool_cpu_usage_threshold_basic.test |  41 ++
+ ...read_pool_nivcsw_freq_threshold_basic.test |  41 ++
+ ...hread_pool_nvcsw_freq_threshold_basic.test |  41 ++
+ sql/rpl_commit_stage_manager.cc               |  17 +
+ sql/sys_vars.cc                               |  37 ++
+ sql/threadpool.h                              |   5 +
+ sql/threadpool_common.cc                      |   4 +
+ sql/threadpool_unix.cc                        | 372 +++++++++++++++++-
+ 16 files changed, 777 insertions(+), 9 deletions(-)
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_commit_burst_threads_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic-master.opt
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+
+diff --git a/components/library_mysys/my_system_api/my_system_api.h b/components/library_mysys/my_system_api/my_system_api.h
+index c1353128637..bf0a6fca8f3 100644
+--- a/components/library_mysys/my_system_api/my_system_api.h
++++ b/components/library_mysys/my_system_api/my_system_api.h
+@@ -23,6 +23,8 @@
+ 
+ #pragma once
+ 
++#include "mysql/components/library_mysys/my_system.h"
++
+ /**
+   Read the memory limit set by the container. Try cgroup v2, and then cgroup v1
+   @return memory limit set by cgroup v2 or cgroup v1; or 0
+diff --git a/include/mysql/service_thd_wait.h b/include/mysql/service_thd_wait.h
+index 689716a1787..6e33d93ca6e 100644
+--- a/include/mysql/service_thd_wait.h
++++ b/include/mysql/service_thd_wait.h
+@@ -86,7 +86,8 @@ typedef enum _thd_wait_type_e {
+   THD_WAIT_GROUP_COMMIT = 9,
+   THD_WAIT_SYNC = 10,
+   THD_WAIT_NET = 11,
+-  THD_WAIT_LAST = 12
++  THD_WAIT_GROUP_COMMIT_PENDING = 12,
++  THD_WAIT_LAST = 13
+ } thd_wait_type;
+ 
+ extern "C" struct thd_wait_service_st {
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_commit_burst_threads_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_commit_burst_threads_basic.result
+new file mode 100644
+index 00000000000..0d43b57b5e4
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_commit_burst_threads_basic.result
+@@ -0,0 +1,41 @@
++SET @start_global_value = @@global.thread_pool_commit_burst_threads;
++select @@global.thread_pool_commit_burst_threads in (0,1);
++@@global.thread_pool_commit_burst_threads in (0,1)
++1
++select @@session.thread_pool_commit_burst_threads;
++ERROR HY000: Variable 'thread_pool_commit_burst_threads' is a GLOBAL variable
++show global variables like 'thread_pool_commit_burst_threads';
++Variable_name	Value
++thread_pool_commit_burst_threads	ON
++show session variables like 'thread_pool_commit_burst_threads';
++Variable_name	Value
++thread_pool_commit_burst_threads	ON
++select * from performance_schema.global_variables where variable_name='thread_pool_commit_burst_threads';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_commit_burst_threads	ON
++select * from performance_schema.session_variables where variable_name='thread_pool_commit_burst_threads';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_commit_burst_threads	ON
++set global thread_pool_commit_burst_threads=0;
++select @@global.thread_pool_commit_burst_threads;
++@@global.thread_pool_commit_burst_threads
++0
++show global status like 'Threadpool_statistics_detail';
++Variable_name	Value
++Threadpool_statistics_detail	n_cpu: N, cpu_pct: N, nivcsw_freq: N, nvcsw_freq: N, active_threads_quota: N
++set global thread_pool_commit_burst_threads=1;
++select @@global.thread_pool_commit_burst_threads;
++@@global.thread_pool_commit_burst_threads
++1
++show global status like 'Threadpool_statistics_detail';
++Variable_name	Value
++Threadpool_statistics_detail	n_cpu: N, cpu_pct: N, nivcsw_freq: N, nvcsw_freq: N, active_threads_quota: N
++set session thread_pool_commit_burst_threads=1;
++ERROR HY000: Variable 'thread_pool_commit_burst_threads' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_commit_burst_threads=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_commit_burst_threads'
++set global thread_pool_commit_burst_threads=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_commit_burst_threads'
++set global thread_pool_commit_burst_threads="foo";
++ERROR 42000: Variable 'thread_pool_commit_burst_threads' can't be set to the value of 'foo'
++SET @@global.thread_pool_commit_burst_threads = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+new file mode 100644
+index 00000000000..fdbbe928113
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+@@ -0,0 +1,47 @@
++SET @start_global_value = @@global.thread_pool_cpu_usage_threshold;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++90
++select @@session.thread_pool_cpu_usage_threshold;
++ERROR HY000: Variable 'thread_pool_cpu_usage_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_cpu_usage_threshold';
++Variable_name	Value
++thread_pool_cpu_usage_threshold	90
++show session variables like 'thread_pool_cpu_usage_threshold';
++Variable_name	Value
++thread_pool_cpu_usage_threshold	90
++select * from performance_schema.global_variables where variable_name='thread_pool_cpu_usage_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_cpu_usage_threshold	90
++select * from performance_schema.session_variables where variable_name='thread_pool_cpu_usage_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_cpu_usage_threshold	90
++set global thread_pool_cpu_usage_threshold=0;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++0
++set global thread_pool_cpu_usage_threshold=100;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++100
++set session thread_pool_cpu_usage_threshold=1;
++ERROR HY000: Variable 'thread_pool_cpu_usage_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_cpu_usage_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_cpu_usage_threshold value: '-1'
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++0
++set global thread_pool_cpu_usage_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_cpu_usage_threshold value: '10000000000'
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++100
++set @@global.thread_pool_cpu_usage_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+new file mode 100644
+index 00000000000..392f9869cf3
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+@@ -0,0 +1,47 @@
++SET @start_global_value = @@global.thread_pool_nivcsw_freq_threshold;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++4294967295
++select @@session.thread_pool_nivcsw_freq_threshold;
++ERROR HY000: Variable 'thread_pool_nivcsw_freq_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_nivcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nivcsw_freq_threshold	4294967295
++show session variables like 'thread_pool_nivcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nivcsw_freq_threshold	4294967295
++select * from performance_schema.global_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_nivcsw_freq_threshold	4294967295
++select * from performance_schema.session_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_nivcsw_freq_threshold	4294967295
++set global thread_pool_nivcsw_freq_threshold=0;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++0
++set global thread_pool_nivcsw_freq_threshold=1000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++1000
++set session thread_pool_nivcsw_freq_threshold=1;
++ERROR HY000: Variable 'thread_pool_nivcsw_freq_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_nivcsw_freq_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nivcsw_freq_threshold value: '-1'
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++0
++set global thread_pool_nivcsw_freq_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nivcsw_freq_threshold value: '10000000000'
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++4294967295
++set @@global.thread_pool_nivcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+new file mode 100644
+index 00000000000..80cda29d3e4
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+@@ -0,0 +1,47 @@
++SET @start_global_value = @@global.thread_pool_nvcsw_freq_threshold;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++10000
++select @@session.thread_pool_nvcsw_freq_threshold;
++ERROR HY000: Variable 'thread_pool_nvcsw_freq_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_nvcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nvcsw_freq_threshold	10000
++show session variables like 'thread_pool_nvcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nvcsw_freq_threshold	10000
++select * from performance_schema.global_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_nvcsw_freq_threshold	10000
++select * from performance_schema.session_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++thread_pool_nvcsw_freq_threshold	10000
++set global thread_pool_nvcsw_freq_threshold=0;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++0
++set global thread_pool_nvcsw_freq_threshold=1000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++1000
++set session thread_pool_nvcsw_freq_threshold=1;
++ERROR HY000: Variable 'thread_pool_nvcsw_freq_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_nvcsw_freq_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nvcsw_freq_threshold value: '-1'
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++0
++set global thread_pool_nvcsw_freq_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nvcsw_freq_threshold value: '10000000000'
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++4294967295
++set @@global.thread_pool_nvcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic-master.opt b/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic-master.opt
+new file mode 100644
+index 00000000000..5b919d3093b
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic-master.opt
+@@ -0,0 +1 @@
++--thread-handling=pool-of-threads
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic.test
+new file mode 100644
+index 00000000000..3213bfabb98
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_commit_burst_threads_basic.test
+@@ -0,0 +1,40 @@
++# bool global
++--source include/not_windows.inc
++SET @start_global_value = @@global.thread_pool_commit_burst_threads;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_commit_burst_threads in (0,1);
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_commit_burst_threads;
++show global variables like 'thread_pool_commit_burst_threads';
++show session variables like 'thread_pool_commit_burst_threads';
++select * from performance_schema.global_variables where variable_name='thread_pool_commit_burst_threads';
++select * from performance_schema.session_variables where variable_name='thread_pool_commit_burst_threads';
++
++#
++# show that it's writable
++#
++set global thread_pool_commit_burst_threads=0;
++select @@global.thread_pool_commit_burst_threads;
++--replace_regex /n_cpu: -?[0-9]+/n_cpu: N/ /cpu_pct: -?[0-9]+/cpu_pct: N/ /nivcsw_freq: [0-9]+/nivcsw_freq: N/ /nvcsw_freq: [0-9]+/nvcsw_freq: N/ /active_threads_quota: [0-9]+/active_threads_quota: N/
++show global status like 'Threadpool_statistics_detail';
++set global thread_pool_commit_burst_threads=1;
++select @@global.thread_pool_commit_burst_threads;
++--replace_regex /n_cpu: -?[0-9]+/n_cpu: N/ /cpu_pct: -?[0-9]+/cpu_pct: N/ /nivcsw_freq: [0-9]+/nivcsw_freq: N/ /nvcsw_freq: [0-9]+/nvcsw_freq: N/ /active_threads_quota: [0-9]+/active_threads_quota: N/
++show global status like 'Threadpool_statistics_detail';
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_commit_burst_threads=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_commit_burst_threads=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_commit_burst_threads=1e1;
++--error ER_WRONG_VALUE_FOR_VAR
++set global thread_pool_commit_burst_threads="foo";
++
++SET @@global.thread_pool_commit_burst_threads = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+new file mode 100644
+index 00000000000..155c11c9b71
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+@@ -0,0 +1,41 @@
++# uint global
++--source include/not_windows.inc
++SET @start_global_value = @@global.thread_pool_cpu_usage_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_cpu_usage_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_cpu_usage_threshold;
++show global variables like 'thread_pool_cpu_usage_threshold';
++show session variables like 'thread_pool_cpu_usage_threshold';
++select * from performance_schema.global_variables where variable_name='thread_pool_cpu_usage_threshold';
++select * from performance_schema.session_variables where variable_name='thread_pool_cpu_usage_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_cpu_usage_threshold=0;
++select @@global.thread_pool_cpu_usage_threshold;
++set global thread_pool_cpu_usage_threshold=100;
++select @@global.thread_pool_cpu_usage_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_cpu_usage_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold="foo";
++
++set global thread_pool_cpu_usage_threshold=-1;
++select @@global.thread_pool_cpu_usage_threshold;
++set global thread_pool_cpu_usage_threshold=10000000000;
++select @@global.thread_pool_cpu_usage_threshold;
++
++set @@global.thread_pool_cpu_usage_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+new file mode 100644
+index 00000000000..69180a9904d
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+@@ -0,0 +1,41 @@
++# uint global
++--source include/not_windows.inc
++SET @start_global_value = @@global.thread_pool_nivcsw_freq_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_nivcsw_freq_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_nivcsw_freq_threshold;
++show global variables like 'thread_pool_nivcsw_freq_threshold';
++show session variables like 'thread_pool_nivcsw_freq_threshold';
++select * from performance_schema.global_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++select * from performance_schema.session_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_nivcsw_freq_threshold=0;
++select @@global.thread_pool_nivcsw_freq_threshold;
++set global thread_pool_nivcsw_freq_threshold=1000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_nivcsw_freq_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold="foo";
++
++set global thread_pool_nivcsw_freq_threshold=-1;
++select @@global.thread_pool_nivcsw_freq_threshold;
++set global thread_pool_nivcsw_freq_threshold=10000000000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++
++set @@global.thread_pool_nivcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+new file mode 100644
+index 00000000000..58df910a352
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+@@ -0,0 +1,41 @@
++# uint global
++--source include/not_windows.inc
++SET @start_global_value = @@global.thread_pool_nvcsw_freq_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_nvcsw_freq_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_nvcsw_freq_threshold;
++show global variables like 'thread_pool_nvcsw_freq_threshold';
++show session variables like 'thread_pool_nvcsw_freq_threshold';
++select * from performance_schema.global_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++select * from performance_schema.session_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_nvcsw_freq_threshold=0;
++select @@global.thread_pool_nvcsw_freq_threshold;
++set global thread_pool_nvcsw_freq_threshold=1000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_nvcsw_freq_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold="foo";
++
++set global thread_pool_nvcsw_freq_threshold=-1;
++select @@global.thread_pool_nvcsw_freq_threshold;
++set global thread_pool_nvcsw_freq_threshold=10000000000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++
++set @@global.thread_pool_nvcsw_freq_threshold = @start_global_value;
+diff --git a/sql/rpl_commit_stage_manager.cc b/sql/rpl_commit_stage_manager.cc
+index c07896b2137..438271d6d4d 100644
+--- a/sql/rpl_commit_stage_manager.cc
++++ b/sql/rpl_commit_stage_manager.cc
+@@ -25,6 +25,7 @@
+ 
+ #include "mutex_lock.h"            // MUTEX_LOCK
+ #include "mysql/psi/mysql_cond.h"  // mysql_cond_timedwait
++#include "mysql/service_thd_wait.h"
+ #include "sql/binlog.h"
+ #include "sql/binlog/group_commit/bgc_ticket_manager.h"  // Bgc_ticket_manager
+ #include "sql/debug_sync.h"                              // DEBUG_SYNC
+@@ -402,6 +403,16 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+     mysql_mutex_unlock(&m_lock_done);
+ #endif
+ #endif
++
++#if defined(__aarch64__) && defined(__linux__)
++    const bool wait_group_commit_pending =
++        (stage <= Commit_stage_manager::SYNC_STAGE) && thd->tx_commit_pending;
++
++    if (wait_group_commit_pending) {
++      thd_wait_begin(thd, THD_WAIT_GROUP_COMMIT_PENDING);
++    }
++#endif
++
+     while (thd->tx_commit_pending) {
+       if (stage == COMMIT_ORDER_FLUSH_STAGE) {
+         mysql_cond_wait(&m_stage_cond_commit_order, pending_lock);
+@@ -410,6 +421,12 @@ bool Commit_stage_manager::enroll_for(StageID stage, THD *thd,
+       }
+     }
+ 
++#if defined(__aarch64__) && defined(__linux__)
++    if (wait_group_commit_pending) {
++      thd_wait_end(thd);
++    }
++#endif
++
+     mysql_mutex_unlock(pending_lock);
+ #if defined(__aarch64__) && defined(__linux__)
+     thd->get_transaction()->reset_pending_commit_lock();
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 667a1eb737b..bed772746da 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -5414,6 +5414,13 @@ static bool fix_threadpool_stall_limit(sys_var *, THD *,
+   tp_set_threadpool_stall_limit(threadpool_stall_limit);
+   return false;
+ }
++
++static bool fix_threadpool_commit_burst_threads(sys_var *, THD *,
++                                                enum_var_type) noexcept {
++  tp_set_threadpool_commit_burst_threads(threadpool_commit_burst_threads);
++  return false;
++}
++
+ #endif
+ 
+ static inline int my_getncpus() noexcept {
+@@ -5460,6 +5467,36 @@ static Sys_var_uint Sys_threadpool_stall_limit(
+     GLOBAL_VAR(threadpool_stall_limit), CMD_LINE(REQUIRED_ARG),
+     VALID_RANGE(10, UINT_MAX), DEFAULT(500), BLOCK_SIZE(1), NO_MUTEX_GUARD,
+     NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(fix_threadpool_stall_limit));
++static Sys_var_bool Sys_threadpool_commit_burst_threads(
++    "thread_pool_commit_burst_threads",
++    "Enable thread pool commit burst worker creation and wakeup on ordered "
++    "commit waits.",
++    GLOBAL_VAR(threadpool_commit_burst_threads), CMD_LINE(OPT_ARG),
++    DEFAULT(true), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
++    ON_UPDATE(fix_threadpool_commit_burst_threads));
++static Sys_var_uint Sys_threadpool_cpu_usage_threshold(
++    "thread_pool_cpu_usage_threshold",
++    "Maximum process CPU busy percentage threshold before thread pool "
++    "scheduling should stop increasing concurrency.",
++    GLOBAL_VAR(threadpool_cpu_usage_threshold), CMD_LINE(REQUIRED_ARG),
++    VALID_RANGE(0, 100), DEFAULT(90), BLOCK_SIZE(1), NO_MUTEX_GUARD,
++    NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
++static Sys_var_uint Sys_threadpool_nvcsw_freq_threshold(
++    "thread_pool_nvcsw_freq_threshold",
++    "Maximum voluntary context-switch frequency threshold in counts per "
++    "second per CPU core before thread pool scheduling should stop "
++    "increasing concurrency.",
++    GLOBAL_VAR(threadpool_nvcsw_freq_threshold), CMD_LINE(REQUIRED_ARG),
++    VALID_RANGE(0, UINT_MAX), DEFAULT(10000), BLOCK_SIZE(1), NO_MUTEX_GUARD,
++    NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
++static Sys_var_uint Sys_threadpool_nivcsw_freq_threshold(
++    "thread_pool_nivcsw_freq_threshold",
++    "Maximum passive context-switch frequency threshold in counts per second "
++    "per CPU core before thread pool scheduling should stop increasing "
++    "concurrency.",
++    GLOBAL_VAR(threadpool_nivcsw_freq_threshold), CMD_LINE(REQUIRED_ARG),
++    VALID_RANGE(0, UINT_MAX), DEFAULT(UINT_MAX), BLOCK_SIZE(1), NO_MUTEX_GUARD,
++    NOT_IN_BINLOG, ON_CHECK(nullptr), ON_UPDATE(nullptr));
+ static Sys_var_uint Sys_threadpool_high_prio_tickets(
+     "thread_pool_high_prio_tickets",
+     "Number of tickets to enter the high priority event queue for each "
+diff --git a/sql/threadpool.h b/sql/threadpool.h
+index 187206faf00..d4c6cdc640f 100644
+--- a/sql/threadpool.h
++++ b/sql/threadpool.h
+@@ -39,6 +39,10 @@ extern uint
+     threadpool_stall_limit; /* time interval in 10 ms units for stall checks*/
+ extern uint threadpool_max_threads;   /* Maximum threads in pool */
+ extern uint threadpool_oversubscribe; /* Maximum active threads in group */
++extern bool threadpool_commit_burst_threads;
++extern uint threadpool_cpu_usage_threshold;
++extern uint threadpool_nvcsw_freq_threshold;
++extern uint threadpool_nivcsw_freq_threshold;
+ 
+ /* Possible values for thread_pool_high_prio_mode */
+ extern const char *threadpool_high_prio_mode_names[];
+@@ -79,6 +83,7 @@ extern void tp_set_min_threads(uint val);
+ extern void tp_set_max_threads(uint val);
+ extern void tp_set_threadpool_size(uint val) noexcept;
+ extern void tp_set_threadpool_stall_limit(uint val) noexcept;
++extern void tp_set_threadpool_commit_burst_threads(bool enabled) noexcept;
+ 
+ /* Function to start the timer thread */
+ extern void tp_start_timer_thread() noexcept;
+diff --git a/sql/threadpool_common.cc b/sql/threadpool_common.cc
+index 39d95db5bdc..f5f3a823426 100644
+--- a/sql/threadpool_common.cc
++++ b/sql/threadpool_common.cc
+@@ -39,6 +39,10 @@ uint threadpool_size;
+ uint threadpool_stall_limit;
+ uint threadpool_max_threads;
+ uint threadpool_oversubscribe;
++bool threadpool_commit_burst_threads;
++uint threadpool_cpu_usage_threshold;
++uint threadpool_nvcsw_freq_threshold;
++uint threadpool_nivcsw_freq_threshold;
+ 
+ /* Stats */
+ TP_STATISTICS tp_stats;
+diff --git a/sql/threadpool_unix.cc b/sql/threadpool_unix.cc
+index d6abbebd53c..b9a8cedf322 100644
+--- a/sql/threadpool_unix.cc
++++ b/sql/threadpool_unix.cc
+@@ -14,22 +14,29 @@
+    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
+    USA */
+ 
+-#include <atomic>
+-
++#include <sys/resource.h>
+ #include <time.h>
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <climits>
++#include <cstdint>
+ #include "my_sys.h"
+ #include "my_systime.h"
++#include "mysql/components/library_mysys/my_system.h"
+ #include "mysql/psi/mysql_socket.h"
++#include "mysql/service_thd_wait.h"
+ #include "mysql/thread_pool_priv.h"  // thd_is_transaction_active()
+ #include "sql/debug_sync.h"
+ #include "sql/log.h"
+ #include "sql/mysqld.h"
+ #include "sql/mysqld_thd_manager.h"
++#include "sql/protocol_classic.h"
+ #include "sql/sql_class.h"
+ #include "sql/sql_connect.h"
+ #include "sql/sql_plist.h"
++#include "sql/sql_show.h"
+ #include "sql/threadpool.h"
+-#include "sql/protocol_classic.h"
+ #include "violite.h"
+ #ifdef __linux__
+ #include <sys/epoll.h>
+@@ -154,6 +161,27 @@ static_assert(sizeof(thread_group_t) == 512,
+ static thread_group_t all_groups[MAX_THREAD_GROUPS];
+ static uint group_count;
+ 
++class Atomic_relaxed_counter {
++ public:
++  void inc(uint32_t thread_count) noexcept {
++    m_counter.fetch_add(thread_count, std::memory_order_relaxed);
++  }
++
++  void dec(uint32_t thread_count) noexcept {
++    m_counter.fetch_sub(thread_count, std::memory_order_relaxed);
++  }
++
++  uint_fast32_t load(
++      std::memory_order order = std::memory_order_relaxed) const noexcept {
++    return m_counter.load(order);
++  }
++
++ private:
++  std::atomic_uint_fast32_t m_counter{0};
++};
++
++static Atomic_relaxed_counter tp_global_active_threads_counter;
++
+ /**
+  Used for printing "pool blocked" message, see
+  print_pool_blocked_message();
+@@ -358,6 +386,207 @@ static void *native_event_get_userdata(native_event *event) noexcept {
+ #error not ported yet to this OS
+ #endif
+ 
++class Tp_statistics {
++ public:
++  int time_pct() const noexcept {
++    return m_time_pct.load(std::memory_order_relaxed);
++  }
++
++  ulonglong nivcsw_freq() const noexcept {
++    return m_nivcsw_freq.load(std::memory_order_relaxed);
++  }
++
++  ulonglong nvcsw_freq() const noexcept {
++    return m_nvcsw_freq.load(std::memory_order_relaxed);
++  }
++
++  int active_threads_quota() const noexcept {
++    return m_active_threads_quota.load(std::memory_order_relaxed);
++  }
++
++  void to_cstring(char *buff, size_t buff_size) const noexcept {
++    snprintf(buff, buff_size,
++             "n_cpu: %d, cpu_pct: %d, nivcsw_freq: %llu, nvcsw_freq: %llu, "
++             "active_threads_quota: %d",
++             m_n_cpu.load(std::memory_order_relaxed), time_pct(),
++             static_cast<unsigned long long>(nivcsw_freq()),
++             static_cast<unsigned long long>(nvcsw_freq()),
++             active_threads_quota());
++  }
++
++  void reset() noexcept {
++    m_n_cpu.store(kInvalidValue, std::memory_order_relaxed);
++    m_active_threads_quota.store(tp_max_threads_quota(),
++                                 std::memory_order_relaxed);
++    m_time_pct.store(kInvalidValue, std::memory_order_relaxed);
++    m_nivcsw_freq.store(0, std::memory_order_relaxed);
++    m_nvcsw_freq.store(0, std::memory_order_relaxed);
++  }
++
++  void update() noexcept;
++
++ private:
++  static constexpr int kInvalidValue{-1};
++
++  void evaluate_active_threads_quota() noexcept;
++
++  static longlong timeval_diff_us(const timeval &a, const timeval &b) noexcept {
++    return (static_cast<longlong>(a.tv_sec) - static_cast<longlong>(b.tv_sec)) *
++               1000000LL +
++           static_cast<longlong>(a.tv_usec) - static_cast<longlong>(b.tv_usec);
++  }
++
++  static int tp_max_threads_quota() noexcept {
++    /*
++      Reserve one active thread per group, since the per-group threshold is
++      threadpool_oversubscribe + 1.
++    */
++    return static_cast<int>(threadpool_oversubscribe) * threadpool_size;
++  }
++
++  static uint tp_min_threads_quota() noexcept { return threadpool_size; }
++
++  static double thread_quota_scale_factor() noexcept {
++    constexpr double kMinScaleFactor = 0.25;
++    return kMinScaleFactor;
++  }
++
++  /* Number of CPUs used to normalize the process CPU percentage. */
++  std::atomic<int> m_n_cpu{kInvalidValue};
++  /* Target active threads quota, capped by threadpool_oversubscribe. */
++  std::atomic<int> m_active_threads_quota{INT_MAX};
++  /* Process CPU percentage over the most recent sampling window. */
++  std::atomic<int> m_time_pct{kInvalidValue};
++  /* Passive context-switch frequency in counts per second per vCPU. */
++  std::atomic<ulonglong> m_nivcsw_freq{0};
++  /* Voluntary context-switch frequency in counts per second per vCPU. */
++  std::atomic<ulonglong> m_nvcsw_freq{0};
++};
++
++void Tp_statistics::update() noexcept {
++  using Clock = std::chrono::steady_clock;
++  const auto RELAX_ORDER = std::memory_order_relaxed;
++
++  static auto last_time = Clock::now();
++  static struct rusage last_cpu_usage {};
++
++  const auto current_time = Clock::now();
++  const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                              current_time - last_time)
++                              .count();
++  struct rusage usage;
++  if (getrusage(RUSAGE_SELF, &usage) != 0) return;
++
++  const int n_cpu = std::max(1, static_cast<int>(my_num_vcpus()));
++  if (m_n_cpu.load(RELAX_ORDER) == kInvalidValue) {
++    last_time = current_time;
++    last_cpu_usage = usage;
++    m_time_pct.store(kInvalidValue, RELAX_ORDER);
++    m_nivcsw_freq.store(0, RELAX_ORDER);
++    m_nvcsw_freq.store(0, RELAX_ORDER);
++    m_n_cpu.store(n_cpu, RELAX_ORDER);
++    m_active_threads_quota.store(tp_min_threads_quota(), RELAX_ORDER);
++    return;
++  }
++
++  if (elapsed_us <= 0) return;
++
++  const longlong utime_diff =
++      timeval_diff_us(usage.ru_utime, last_cpu_usage.ru_utime);
++  const longlong stime_diff =
++      timeval_diff_us(usage.ru_stime, last_cpu_usage.ru_stime);
++  const longlong nvcsw_diff =
++      std::max<longlong>(0, static_cast<longlong>(usage.ru_nvcsw) -
++                                static_cast<longlong>(last_cpu_usage.ru_nvcsw));
++  const longlong nivcsw_diff = std::max<longlong>(
++      0, static_cast<longlong>(usage.ru_nivcsw) -
++             static_cast<longlong>(last_cpu_usage.ru_nivcsw));
++
++  last_time = current_time;
++  last_cpu_usage = usage;
++
++  const int cpu_time_pct = static_cast<int>(
++      std::max(0.0, ((utime_diff + stime_diff) * 100.0 / elapsed_us) / n_cpu));
++
++  const ulonglong nivcsw_freq = static_cast<ulonglong>(
++      std::max(0.0, (nivcsw_diff * 1000000.0 / elapsed_us) / n_cpu));
++  const ulonglong nvcsw_freq = static_cast<ulonglong>(
++      std::max(0.0, (nvcsw_diff * 1000000.0 / elapsed_us) / n_cpu));
++
++  m_time_pct.store(cpu_time_pct, RELAX_ORDER);
++  m_nivcsw_freq.store(nivcsw_freq, RELAX_ORDER);
++  m_nvcsw_freq.store(nvcsw_freq, RELAX_ORDER);
++  evaluate_active_threads_quota();
++}
++
++void Tp_statistics::evaluate_active_threads_quota() noexcept {
++  const auto RELAX_ORDER = std::memory_order_relaxed;
++  const int cpu_time_pct = m_time_pct.load(RELAX_ORDER);
++  const int cpu_usage_threshold =
++      static_cast<int>(threadpool_cpu_usage_threshold);
++  const ulonglong nvcsw_freq = m_nvcsw_freq.load(RELAX_ORDER);
++  const ulonglong nivcsw_freq = m_nivcsw_freq.load(RELAX_ORDER);
++  int active_threads_quota = m_active_threads_quota.load(RELAX_ORDER);
++
++  /*
++    High cpu_time_pct means workers are already consuming most CPU time.
++    High nvcsw_freq usually means workers frequently yield on mutex/cond waits
++    or short sleeps, so extra concurrency would mostly add scheduler churn.
++    High nivcsw_freq usually means the OS is preempting runnable workers under
++    CPU pressure, so adding more runnable threads would increase contention.
++  */
++  if (cpu_time_pct <= 0) {
++    /*
++      Integer sampling can round a very low CPU load down to 0. Treat that as a
++      no-pressure window and avoid dividing by zero when estimating the quota.
++    */
++    m_active_threads_quota.store(tp_max_threads_quota(), RELAX_ORDER);
++    return;
++  }
++
++  const int min_active_threads_quota = tp_min_threads_quota();
++  const int max_active_threads_quota = tp_max_threads_quota();
++  if (cpu_time_pct > cpu_usage_threshold ||
++      nvcsw_freq > threadpool_nvcsw_freq_threshold ||
++      nivcsw_freq > threadpool_nivcsw_freq_threshold) {
++    const int quota_delta = std::max(
++        1, static_cast<int>(threadpool_size * thread_quota_scale_factor()));
++
++    /* Quickly reduce the quota when there are too many active threads. */
++    if (active_threads_quota >= (max_active_threads_quota / 2)) {
++      active_threads_quota = min_active_threads_quota + quota_delta;
++      if (active_threads_quota > max_active_threads_quota) {
++        active_threads_quota = max_active_threads_quota;
++      }
++    } else {
++      active_threads_quota -= quota_delta;
++      if (active_threads_quota < min_active_threads_quota) {
++        active_threads_quota = min_active_threads_quota;
++      }
++    }
++
++    m_active_threads_quota.store(active_threads_quota, RELAX_ORDER);
++  } else {
++    const int evaluate_quota =
++        tp_global_active_threads_counter.load(RELAX_ORDER) * 100 / cpu_time_pct;
++
++    if (active_threads_quota < evaluate_quota) {
++      active_threads_quota = evaluate_quota;
++    } else {
++      active_threads_quota +=
++        static_cast<int>(threadpool_size * thread_quota_scale_factor());
++    }
++
++    if (active_threads_quota > max_active_threads_quota) {
++      active_threads_quota = max_active_threads_quota;
++    }
++
++    m_active_threads_quota.store(active_threads_quota, RELAX_ORDER);
++  }
++}
++
++static Tp_statistics tp_statistics;
++
+ namespace {
+ 
+ /*
+@@ -372,6 +601,14 @@ inline bool too_many_active_threads(
+           !thread_group.stalled);
+ }
+ 
++inline bool has_threads_burst_quota() noexcept {
++  const int active_threads_quota = tp_statistics.active_threads_quota();
++  const int active_threads = tp_global_active_threads_counter.load();
++  const int threads_threshold = static_cast<int>(threadpool_size);
++  return active_threads > threads_threshold &&
++         active_threads_quota > active_threads;
++}
++
+ /*
+   Limit the number of 'busy' threads by 1 + thread_pool_oversubscribe. A thread
+   is busy if it is in either the active state or the waiting state (i.e. between
+@@ -428,6 +665,47 @@ static connection_t *queue_get(thread_group_t *thread_group) noexcept {
+   DBUG_RETURN(c);
+ }
+ 
++static int show_statistics_detail(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_CHAR;
++  var->value = buff;
++  tp_statistics.to_cstring(buff, SHOW_VAR_FUNC_BUFF_SIZE);
++  return 0;
++}
++
++static int show_threadpool_active_threads(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_LONGLONG;
++  var->value = buff;
++  *reinterpret_cast<longlong *>(buff) = tp_global_active_threads_counter.load();
++  return 0;
++}
++
++static longlong threadpool_waiting_threads() noexcept {
++  longlong sum = 0;
++
++  for (uint i = 0;
++       i < array_elements(all_groups) && (all_groups[i].pollfd >= 0); i++) {
++    sum += all_groups[i].waiting_thread_count;
++  }
++
++  return sum;
++}
++
++static int show_threadpool_waiting_threads(THD *, SHOW_VAR *var, char *buff) {
++  var->type = SHOW_LONGLONG;
++  var->value = buff;
++  *reinterpret_cast<longlong *>(buff) = threadpool_waiting_threads();
++  return 0;
++}
++
++static SHOW_VAR threadpool_status_variables[] = {
++    {"Threadpool_statistics_detail", (char *)&show_statistics_detail, SHOW_FUNC,
++     SHOW_SCOPE_GLOBAL},
++    {"Threadpool_active_threads", (char *)&show_threadpool_active_threads,
++     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++    {"Threadpool_waiting_threads", (char *)&show_threadpool_waiting_threads,
++     SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++    {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
++
+ class Thd_timeout_checker : public Do_THD_Impl {
+  private:
+   pool_timer_t *const m_timer;
+@@ -513,6 +791,7 @@ static void *timer_thread(void *param) noexcept {
+     if (err == ETIMEDOUT) {
+       timer->current_microtime.store(my_microsecond_getsystime(),
+                                      std::memory_order_relaxed);
++      if (threadpool_commit_burst_threads) tp_statistics.update();
+ 
+       /* Check stalls in thread groups */
+       for (size_t i = 0; i < array_elements(all_groups); i++) {
+@@ -771,6 +1050,11 @@ static void add_thread_count(thread_group_t *thread_group,
+   thread_group->thread_count += count;
+   /* worker starts out and end in "active" state */
+   thread_group->active_thread_count += count;
++  if (count > 0) {
++    tp_global_active_threads_counter.inc(count);
++  } else if (count < 0) {
++    tp_global_active_threads_counter.dec(-count);
++  }
+   tp_stats.num_worker_threads.fetch_add(count, std::memory_order_relaxed);
+ }
+ 
+@@ -1051,12 +1335,14 @@ static connection_t *get_event(worker_thread_t *current_thread,
+     if (!thread_group->listener) {
+       thread_group->listener = current_thread;
+       thread_group->active_thread_count--;
++      tp_global_active_threads_counter.dec(1);
+       mysql_mutex_unlock(&thread_group->mutex);
+ 
+       connection = listener(thread_group);
+ 
+       mysql_mutex_lock(&thread_group->mutex);
+       thread_group->active_thread_count++;
++      tp_global_active_threads_counter.inc(1);
+       /* There is no listener anymore, it just returned. */
+       thread_group->listener = nullptr;
+       break;
+@@ -1111,6 +1397,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
+     thread_group->waiting_threads.push_front(current_thread);
+ 
+     thread_group->active_thread_count--;
++    tp_global_active_threads_counter.dec(1);
+     if (abstime) {
+       err = mysql_cond_timedwait(&current_thread->cond, &thread_group->mutex,
+                                  abstime);
+@@ -1118,6 +1405,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
+       err = mysql_cond_wait(&current_thread->cond, &thread_group->mutex);
+     }
+     thread_group->active_thread_count++;
++    tp_global_active_threads_counter.inc(1);
+ 
+     if (!current_thread->woken) {
+       /*
+@@ -1142,10 +1430,50 @@ static connection_t *get_event(worker_thread_t *current_thread,
+   sleep() or similar.
+ */
+ 
++static void group_commit_pending_wait_begin(
++    thread_group_t *thread_group) noexcept {
++  DBUG_ENTER("group_commit_pending_wait_begin");
++
++  /* Dirty read for fast filter. */
++  if (!threadpool_commit_burst_threads || !has_threads_burst_quota() ||
++      too_many_active_threads(*thread_group) ||
++      too_many_busy_threads(*thread_group) || queues_are_empty(*thread_group)) {
++    DBUG_VOID_RETURN;
++  }
++
++  if (mysql_mutex_trylock(&thread_group->mutex) != 0) {
++    DBUG_VOID_RETURN;
++  }
++
++  /* Why don't we adjust active_thread_count ?
++   1. Generally, committing's io latency is vary fast, so we don't want
++   launch threads so fast.
++   2. Keep the same metrics in sql layer,such as: thread_running,
++  we will adjust active_thread_count. */
++  assert(thread_group->active_thread_count >= 0);
++  assert(thread_group->connection_count > 0);
++
++#ifdef THREADPOOL_CREATE_THREADS_ON_WAIT
++  if (!queues_are_empty(*thread_group) && has_threads_burst_quota() &&
++      !too_many_busy_threads(*thread_group) &&
++      !too_many_active_threads(*thread_group)) {
++    /*
++      Group might stall while this thread waits, thus wake
++      or create a worker to prevent stall.
++    */
++    wake_or_create_thread(thread_group);
++  }
++#endif
++
++  mysql_mutex_unlock(&thread_group->mutex);
++  DBUG_VOID_RETURN;
++}
++
+ static void wait_begin(thread_group_t *thread_group) noexcept {
+   DBUG_ENTER("wait_begin");
+   mysql_mutex_lock(&thread_group->mutex);
+   thread_group->active_thread_count--;
++  tp_global_active_threads_counter.dec(1);
+   thread_group->waiting_thread_count++;
+ 
+   assert(thread_group->active_thread_count >= 0);
+@@ -1174,6 +1502,7 @@ static void wait_end(thread_group_t *thread_group) noexcept {
+   DBUG_ENTER("wait_end");
+   mysql_mutex_lock(&thread_group->mutex);
+   thread_group->active_thread_count++;
++  tp_global_active_threads_counter.inc(1);
+   thread_group->waiting_thread_count--;
+   mysql_mutex_unlock(&thread_group->mutex);
+   DBUG_VOID_RETURN;
+@@ -1292,14 +1621,18 @@ void tp_post_kill_notification(THD *thd) noexcept {
+   MySQL scheduler callback: wait begin
+ */
+ 
+-void tp_wait_begin(THD *thd, int type [[maybe_unused]]) {
++void tp_wait_begin(THD *thd, int type) {
+   DBUG_ENTER("tp_wait_begin");
+   assert(thd);
+   connection_t *connection = (connection_t *)thd->event_scheduler.data;
+   if (connection) {
+     assert(!connection->waiting);
+-    connection->waiting = true;
+-    wait_begin(connection->thread_group);
++    if (type == THD_WAIT_GROUP_COMMIT_PENDING) {
++      group_commit_pending_wait_begin(connection->thread_group);
++    } else {
++      wait_begin(connection->thread_group);
++      connection->waiting = true;
++    }
+   }
+   DBUG_VOID_RETURN;
+ }
+@@ -1313,8 +1646,7 @@ void tp_wait_end(THD *thd) {
+   assert(thd);
+ 
+   connection_t *connection = (connection_t *)thd->event_scheduler.data;
+-  if (connection) {
+-    assert(connection->waiting);
++  if (connection && connection->waiting) {
+     connection->waiting = false;
+     wait_end(connection->thread_group);
+   }
+@@ -1502,6 +1834,14 @@ bool tp_init() {
+   mysql_cond_register("threadpool", cond_list, array_elements(cond_list));
+   mysql_thread_register("threadpool", thread_list, array_elements(thread_list));
+ #endif
++  if (add_status_vars(threadpool_status_variables)) {
++    threadpool_started = false;
++    DBUG_RETURN(true);
++  }
++
++#if defined(__aarch64__) && defined(__linux__)
++  tp_set_threadpool_commit_burst_threads(threadpool_commit_burst_threads);
++#endif
+ 
+   DBUG_RETURN(false);
+ }
+@@ -1514,6 +1854,7 @@ void tp_end() noexcept {
+   for (uint i = 0; i < array_elements(all_groups); i++) {
+     thread_group_close(&all_groups[i]);
+   }
++  remove_status_vars(threadpool_status_variables);
+   threadpool_started = false;
+   DBUG_VOID_RETURN;
+ }
+@@ -1551,6 +1892,21 @@ void tp_set_threadpool_stall_limit(uint limit) noexcept {
+   mysql_cond_signal(&(pool_timer.cond));
+ }
+ 
++static void update_threadpool_commit_burst_statistics(bool enabled [[maybe_unused]]) noexcept {
++#if defined(__aarch64__) && defined(__linux__)
++  tp_statistics.reset();
++  if (enabled) tp_statistics.update();
++#endif
++}
++
++void tp_set_threadpool_commit_burst_threads(bool enabled) noexcept {
++  if (!threadpool_started) return;
++
++  if (timer_thread_started) mysql_mutex_lock(&(pool_timer.mutex));
++  update_threadpool_commit_burst_statistics(enabled);
++  if (timer_thread_started) mysql_mutex_unlock(&(pool_timer.mutex));
++}
++
+ /**
+  Calculate number of idle/waiting threads in the pool.
+ 
+-- 
+2.34.1
+

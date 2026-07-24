@@ -1,0 +1,16 @@
+# Build artifacts
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Skill runtime artifacts (not source)
+intermediate/
+state/
+output/
+*.log
+
+# Secrets
+.env

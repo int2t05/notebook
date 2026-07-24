@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "drawio": {
+      "command": "/bin/zsh",
+      "args": [
+        "<DRAWIO_BUNDLE>/mcp/run-drawio-mcp.sh"
+      ],
+      "env": {
+        "PORT": "6002"
+      }
+    }
+  }
+}

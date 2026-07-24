@@ -1,0 +1,38 @@
+From e2abef4b507c8dd72c903517942179bfb7db19e4 Mon Sep 17 00:00:00 2001
+From: zhengyuanyue <im_zyy@hotmail.com>
+Date: Sat, 21 Mar 2026 17:11:33 +0800
+Subject: [PATCH 4/4] Enhance log write conditions to prevent CPU
+ overutilization
+
+Description:
+  Updated the conditions under which the log thread will spin based on
+  CPU usage metrics. The new logic prevents spinning when CPU usage is
+  too high, ensuring efficient resource utilization. This change aims
+  to optimize performance by avoiding unnecessary CPU cycles during low
+  log write request frequency.
+---
+ storage/innobase/log/log0write.cc | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/storage/innobase/log/log0write.cc b/storage/innobase/log/log0write.cc
+index c26786852..a0953daa3 100644
+--- a/storage/innobase/log/log0write.cc
++++ b/storage/innobase/log/log0write.cc
+@@ -1240,11 +1240,13 @@ struct Log_thread_waiting {
+         m_log.write_to_file_requests_interval.load(std::memory_order_relaxed);
+ 
+     if (srv_cpu_usage.utime_abs < srv_log_spin_cpu_abs_lwm ||
++        srv_cpu_usage.utime_pct >= srv_log_spin_cpu_pct_hwm ||
+         !log_write_to_file_requests_are_frequent(req_interval)) {
+       /* Either:
+       1. CPU usage is very low on the server, which means the server is most
+          likely idle or almost idle.
+-      2. Request to write/flush redo to disk comes only once per 1ms in average
++      2. CPU usage is too high to risk increasing it by spinning.
++      3. Request to write/flush redo to disk comes only once per 1ms in average
+          or even less often.
+       In both cases we prefer not to spend on CPU power, because there is no
+       real gain from spinning in log threads then. */
+-- 
+2.34.1
+

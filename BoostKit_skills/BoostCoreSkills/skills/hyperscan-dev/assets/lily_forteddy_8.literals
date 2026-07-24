@@ -1,0 +1,17 @@
+# LilyForTeddy (2-4字节短规则) 触发规则集 — 8条
+# 触发条件 (shortcut_literal.cpp:215-221 → rose_build_add.cpp:addShortLit):
+#   1. 纯字面量, 长度 >= 2 且 <= 4
+#   2. grey.allowLily == true (config.txt: allowLily:1)
+#   3. ng.allowLilyForTeddy == true (默认true, count_2_4_byte_literals <= 8)
+#   4. Block 模式 (!streaming)
+#   5. 不被逻辑组合规则引用
+#   6. addShortLit 成功: lilyForTeddyPQ size < 8
+# PQ 按长度降序排列: 4字节规则在前, 2字节在后
+1:/abcd/
+2:/efgh/
+3:/ijkl/
+4:/mnop/
+5:/qrs/
+6:/tuv/
+7:/wx/
+8:/yz/

@@ -1,0 +1,16 @@
+{
+  "server": {
+    "ip": "server_ip",
+    "user": "user_name",
+    "password": "your_password"
+  },
+  "spark_commands": {
+    "原生": "/usr/local/spark/bin/spark-sql --master yarn --database default",
+    "omni": "source ~/.bashrc;/usr/local/spark/bin/spark-sql --master yarn --conf spark.plugins=org.apache.gluten.GlutenPlugin --conf spark.gluten.sql.columnar.backend.lib=omni --conf spark.driver.extraClassPath=/opt/omni-operator/lib/gluten-omni-bundle.jar --database default"
+  },
+  "test_config": {
+    "timeout_seconds": 300,
+    "retry_count": 3,
+    "report_format": "html"
+  }
+}

@@ -1,0 +1,515 @@
+From bf380f7501ca25339989c63e5274f3d98517eb6b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jakub=20=C5=81opusza=C5=84ski?=
+ <jakub.lopuszanski@oracle.com>
+Date: Fri, 14 Mar 2025 18:11:16 +0100
+Subject: [PATCH 2/2] Bug#37628911 Crash caused by race condition between
+ MVCC::view_open and purge view
+
+Problem:
+
+MVCC::view_open() can reopen a read-view which it used before,
+if it seems to be still up to date w.r.t. to trx_sys state - i.e. if no
+new transaction committed since it was created. But once it makes
+decission to reopen, it is crucial that purge coordinator was already
+informed to not purge the undo logs needed to support this read-view.
+Therefore MVCC::view_open() first marks the view as open, and only then
+makes a decission, perhaps closing it again if it can't be reused.
+Alas, this could lead to an opposite problem, in which the purge
+coordinator selected such a view which was temporarily marked as open,
+even if it was very old, i.e. saw less than the previous puge_sys->view.
+This could lead to various problems in places where we traverse undo log
+chains, as purge_sys->view "traveling back in time" gave impression that
+some undo log records should still be available, even though they were
+purged, or - in extreme - the whole undo space was truncated already.
+
+Solution:
+
+The purge coordinator should only switch the purge_sys->view to a new
+one, if it has strictly larger low_limit_no(). While it's easy to see
+that this is sufficient to prevent "travel back in time", and that it
+shouldn't impact speed of purge, it's a bit more challanging to prove
+that such restrictive rule still ensures that any read view which is in
+use or becomes reused, has no problem accessing necessary undo logs.
+This patch adds the proof of correctness.
+
+We would like to thank Yin Peng from Tencent who contributed the bug
+report, repro scripts, and the sketch of solution.
+
+Change-Id: I86888c896b499a34dd7dec1cf736bde4094039a7
+(cherry picked from commit f6c3b6baf0aa5630b7da924b0d71f4b1b306d787)
+Signed-off-by: libiao <1102510224@qq.com>
+---
+ storage/innobase/include/read0read.h  |  22 +++-
+ storage/innobase/include/read0types.h |  23 ----
+ storage/innobase/include/trx0purge.h  |   7 ++
+ storage/innobase/read/read0read.cc    | 153 +++++++++++++++++++++++---
+ storage/innobase/srv/srv0srv.cc       |   2 +-
+ storage/innobase/trx/trx0purge.cc     |  75 +++++++++----
+ 6 files changed, 213 insertions(+), 69 deletions(-)
+
+diff --git a/storage/innobase/include/read0read.h b/storage/innobase/include/read0read.h
+index d9806354d..5bd2580fa 100644
+--- a/storage/innobase/include/read0read.h
++++ b/storage/innobase/include/read0read.h
+@@ -73,12 +73,22 @@ class MVCC {
+   @param view           View to release */
+   void view_release(ReadView *&view);
+ 
+-  /** Clones the oldest view and stores it in view. No need to
+-  call view_close(). The caller owns the view that is passed in.
+-  It will also move the closed views from the m_views list to the
+-  m_free list. This function is called by Purge to determine whether it should
+-  purge the delete marked record or not.
+-  @param view           Preallocated view, owned by the caller */
++  /** Clones the oldest view into the provided view, unless the function
++  determines that the provided view is already a good enough lower bound.
++  The caller owns the view that is passed in, which is interpreted to be a
++  previous lower bound known to the caller.
++  No need to call view_close(view,..).
++
++  Note: This function is called by Purge to determine the purge_sys->view used
++  to distinguish which transactions are considered committed by everybody, and
++  thus their undo logs can be purged.
++  Purge mainly uses purge_sys->view->low_limit_no(), which is a safe
++  lower-bound on what can be purged based on NO, and further limits it to the
++  lowest needed NO reported by GTID Persistor. But other places like ROLLBACK
++  use purge_sys->view->changes_visible(ID,..).
++  @param[in,out] view   Preallocated view, owned by the caller. Can be either
++                        default constructed (m_low_limit_no is 0) or a fully
++                        initialized ReadView object. */
+   void clone_oldest_view(ReadView *view);
+ 
+   /**
+diff --git a/storage/innobase/include/read0types.h b/storage/innobase/include/read0types.h
+index 612cf3075..064a4c179 100644
+--- a/storage/innobase/include/read0types.h
++++ b/storage/innobase/include/read0types.h
+@@ -210,17 +210,6 @@ class ReadView {
+             m_low_limit_id, m_up_limit_id);
+   }
+ 
+-  /** Check and reduce low limit number for read view. Used to
+-  block purge till GTID is persisted on disk table.
+-  @param[in]    trx_no  transaction number to check with */
+-  void reduce_low_limit(trx_id_t trx_no) {
+-    if (trx_no < m_low_limit_no) {
+-      /* Save low limit number set for Read View for MVCC. */
+-      ut_d(m_view_low_limit_no = m_low_limit_no);
+-      m_low_limit_no = trx_no;
+-    }
+-  }
+-
+   /**
+   @return the low limit no */
+   trx_id_t low_limit_no() const { return (m_low_limit_no); }
+@@ -252,10 +241,6 @@ class ReadView {
+   void clone(ReadView *&result, trx_t *from_trx) const;
+ 
+ #ifdef UNIV_DEBUG
+-  /**
+-  @return the view low limit number */
+-  trx_id_t view_low_limit_no() const { return (m_view_low_limit_no); }
+-
+   /**
+   @param rhs            view to compare with
+   @return truen if this view is less than or equal rhs */
+@@ -333,14 +318,6 @@ class ReadView {
+   they can be removed in purge if not needed by other views */
+   trx_id_t m_low_limit_no;
+ 
+-#ifdef UNIV_DEBUG
+-  /** The low limit number up to which read views don't need to access
+-  undo log records for MVCC. This could be higher than m_low_limit_no
+-  if purge is blocked for GTID persistence. Currently used for debug
+-  variable INNODB_PURGE_VIEW_TRX_ID_AGE. */
+-  trx_id_t m_view_low_limit_no;
+-#endif /* UNIV_DEBUG */
+-
+   /** AC-NL-RO transaction view that has been "closed". */
+   bool m_closed;
+ 
+diff --git a/storage/innobase/include/trx0purge.h b/storage/innobase/include/trx0purge.h
+index 0f604dce2..bc3585044 100644
+--- a/storage/innobase/include/trx0purge.h
++++ b/storage/innobase/include/trx0purge.h
+@@ -1020,6 +1020,13 @@ struct trx_purge_t {
+   /** true if view is active */
+   bool view_active;
+ 
++  /** This is computed as a lower-bound of minimum of:
++  - the smallest trx->no still needed by the oldest open read view
++  - the smallest trx->no still needed by GTID persistor
++  The purge can remove only the Undo Logs which have TRX_UNDO_TRX_NO strictly
++  smaller than this value. */
++  trx_id_t m_lowest_needed_trx_no;
++
+   /** Count of total tasks submitted to the task queue */
+   volatile ulint n_submitted;
+ 
+diff --git a/storage/innobase/read/read0read.cc b/storage/innobase/read/read0read.cc
+index 30cd832cb..29a5ef454 100644
+--- a/storage/innobase/read/read0read.cc
++++ b/storage/innobase/read/read0read.cc
+@@ -322,7 +322,6 @@ ReadView::ReadView()
+       m_cloned(false),
+       m_version() {
+   ut_d(::memset(&m_view_list, 0x0, sizeof(m_view_list)));
+-  ut_d(m_view_low_limit_no = 0);
+ }
+ 
+ /**
+@@ -485,7 +484,6 @@ void ReadView::prepare(trx_id_t id) {
+ 
+   m_version = trx_sys->readview_version.load(std::memory_order_relaxed);
+ 
+-  ut_d(m_view_low_limit_no = m_low_limit_no);
+   m_closed = false;
+ }
+ 
+@@ -558,19 +556,128 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
+ 
+     ut_ad(view->m_closed);
+ 
+-    /* NOTE: This can be optimised further, for now we only
+-    reuse the view if the source data used to build the view
+-    has not changed.
+-
+-    There is an inherent race here between purge and this
+-    thread. Purge will skip views that are marked as closed.
+-    Therefore we must reset the closed status before the
+-    final check. */
++    /* The following method of reopening views, makes following assumptions:
++        * view->empty() == true
++        * removing an ID from trx_sys->rw_trx_ids requires trx_sys->mutex
++        * the purge coordinator holds trx_sys->mutex when determining new
++          purge_sys->view
++        * the purge coordinator refuses to update purge_sys->view to one with
++          a lower-or-equal value of m_low_limit_no.
++        * adding a view to the trx_sys->mvcc->m_views happens in a critical
++          section under trx_sys->mutex spanning reading the values used for
++          initialization and storing them in view
++        * trx_sys->serialisation_min_trx_no is monotonic w.r.t. happens-before
++    Keep in mind, the complicating factors like:
++        * bumping trx_sys->next_trx_id_or_no for assignment to trx->no, and
++          adding it to serialization_list happens without trx_sys->mutex - it
++          uses trx_sys->serialization mutex instead, and is sequenced-before
++          removing he trx->id from trx_sys->rw_trx_ids
++        * the purge coordinator doesn't acquire trx_sys->serialization_mutex
++        * the purge coordinator might create an "artificial" view if it could
++          not find any suitable open view in the list
++        * two views can have same m_low_limit_no, yet represent different sets
++          of committed transactions
++        * two views can represent the same set of committed transactions, but
++          differ in m_low_limit_no
++
++    Let's define "V1 is-subset-of V2" to mean that the set of transaction IDs
++    that V1 considers visible/committed, is a subset of those for V2.
++    (In particular, if a given natural number is used as NO, instead of ID, then
++    the answer for this number doesn't influence the is-subset-of relation.)
++
++    We need following properties:
++
++    P1. If we decide to reopen the view, then if someone at any moment observes
++    that "purge_sys->view is-subset-of the view" doesn't hold, then the
++    observation must have happened-after the view became closed again.
++
++    P2. If any observation of purge_sys->view == V1 happens-before
++    an observation of purge_sys->view == V2, then V1 is-subset-of V2.
++
++    The P1 is needed, so that we don't crash when using this view when trying to
++    restore older version of a record by traversing undo log chains.
++
++    The P2 is definitely helpful to traverse undo chains "until trx seen by V2",
++    without having to worry about undo log record being already purged when
++    purge_sys->view was V1. We also need P2 in the rollback logic to properly
++    decide if the record should be physically removed by the transaction thread
++    as no longer needed or should it be deleted later lazily by purge thread -
++    a wrong decision here can lead to a leak or a crash.
++
++    We achieve P2 "trivially" in purge coordinator logic of clone_oldest_view(),
++    by simply refusing to change purge_sys->view to a view which has smaller
++    or equal m_low_limit_no, which ensures that V2 must have strictly larger
++    m_low_limit_no than V1. Because m_low_limit_no values are assigned a value
++    loaded from trx_sys->serialisation_min_trx_no which we know to be
++    non-decreasing in time, and load and assignment happen under trx_sys->mutex,
++    it follows the assignment to V2->m_low_limit_no happened-after the one for
++    V1. The m_ids is also initialized by copying trx_sys->rw_trx_ids inside same
++    critical section protected by trx_sys->mutex, so it follows that V1 copied
++    an older state of trx_sys->rw_trx_ids than V2, and thus V1 is-subset-of V2,
++    as needed.
++
++    The proof that P1 holds works only if we pretend that instead of non-atomic
++    view->m_closed = false, we have view->m_closed.store(false, seq_cst). Later,
++    we will show why in practice it works with non-atomic variable and no memory
++    barrier.
++
++    The proof is by contradiction:
++    Assume that someone sees "purge_sys->view is-subset-of the view" doesn't
++    hold and we did reopen. This means purge_sys->view can see an ID which view
++    can't. Observers of purge_sys->view hold purge_sys->latch, so this
++    observation had to happened-after the purge coordinator has set the
++    purge_sys->view, which it does while x-latching the purge_sys->latch, which
++    means such assignments are well ordered, so lets focus on the oldest such
++    assignment which violated "purge_sys->view is-subset-of the view" for the
++    first time. Let's call the purge_sys->view assigned then V2, and the one
++    before it V1. The purge coordinator assigns purge_sys->view under
++    trx_sys->mutex, and removing ID from trx_sys->rw_trx_ids is done under
++    this mutex, so it had to happen-before V2 was constructed if V2 can see
++    ID. This means trx_sys->next_trx_id_or_no was already > ID before purge
++    coordinator started iterating the trx_sys->mvcc->m_views list. Our view can
++    not see ID, and view->empty() == true, so view->m_low_limit_id <= ID. As we
++    assumed we will reopen it means we saw trx_sys->next_trx_id_or_no ==
++    view->m_low_limit_id, so <= ID, which implies the `S-order` relation between
++    our load() and fetch_add() in the following timeline:
++
++    view->m_closed = false `sequenced-before`
++    trx_sys->next_trx_id_or_no.load() == view->m_low_limit_id `S-ordered-before`
++    ID=trx_sys->next_trx_id_or_no.fetch_add() `sequenced-before`
++    trx_sys->mutex.exit() in commit of ID `happens-before`
++    trx_sys->mutex.enter() of purge coordinator `sequenced-before`
++    purge coordinator reads view->m_closed `sequenced-before`
++    purge coordinator selects purge_sys->view which sees ID.
++
++    If accesses to view->m_closed were std::memory_order_seq_cst, then the first
++    `sequenced-before` becomes `S-ordered-before` and `S-order` must be
++    consistent with `happens-before` and modification order of view->m_closed,
++    so to avoid a cycle it has to be that purge coordinator sees either the
++    false stored by us to view->m_closed, or some later store, which could
++    happen if we closed it again. But, seeing view->m_closed == false, the
++    purge coordinator should either select our view as V2, or keep the old V1,
++    both of which contradict definition of V2 as first such that it sees ID.
++
++    Above proof relies on the assumption that view->m_closed=false becomes
++    visible to purge coordinator before we load next_trx_id_or_no. For,
++    consider:
++    1. putting m_closed = false in store buffer, but not flushing it yet
++    2. seeing trx_sys->next_trx_id_or_no == view->m_low_limit_id
++    3. another thread doing ID=trx_sys->next_trx_id_or_no.fetch_add(), adding
++       ID to trx_sys->rw_trx_ids, then commits, removing ID from
++       trx_sys->rw_trx_ids under trx_sys->mutex
++    4. purge coordinator acquires trx_sys->mutex released by trx from step 3
++    5. purge coordinator still does not see our m_closed=false and thus
++       selects a purge_sys->view which sees ID
++    This was never seen to happen in practice - probably because x64 CPUs keep
++    writing from store buffer ASAP and context-switch is a memory barrier, uet
++    somehow whole step 3 has to happen before store gets published. Moreover, to
++    really cause a crash the transaction has to produce undo logs. */
+ 
+     if (view->version() ==
+         trx_sys->readview_version.load(std::memory_order_relaxed)) {
+       view->m_closed = false;
+ 
++      DEBUG_SYNC_C("after_setting_m_closed_false");
+       std::atomic_thread_fence(std::memory_order_seq_cst);
+       const ulint readview_version =
+           trx_sys->readview_version.load(std::memory_order_relaxed);
+@@ -658,8 +765,6 @@ void ReadView::copy_prepare(const ReadView &other) {
+ 
+   m_low_limit_no = other.m_low_limit_no;
+ 
+-  ut_d(m_view_low_limit_no = other.m_view_low_limit_no);
+-
+   m_low_limit_id = other.m_low_limit_id;
+ 
+   m_creator_trx_id = other.m_creator_trx_id;
+@@ -747,7 +852,25 @@ purge the delete marked record or not.
+ void MVCC::clone_oldest_view(ReadView *view) {
+   trx_sys_mutex_enter();
+ 
+-  ReadView *oldest_view = get_oldest_view();
++  ReadView *oldest_view;
++  for (oldest_view = UT_LIST_GET_LAST(m_views); oldest_view != nullptr;
++       oldest_view = UT_LIST_GET_PREV(m_view_list, oldest_view)) {
++    if (!oldest_view->is_closed()) {
++      if (oldest_view->low_limit_no() <= view->low_limit_no()) {
++        /* We won't gain anything by switching to oldest_view - as purge will
++        not be able to move any further than low_limit_no(). More importantly,
++        switching to oldest_view poses a risk of a crash, if it saw a strictly
++        smaller subset of transaction than view. Thankfully, we can prove the
++        later case happens only when a transaction is considering to reopen the
++        oldest_view, but will decide not to do it, so we can - and should! -
++        ignore it. See the proof in MVCC::view_open(). In either case not
++        updating purge's view is the right decision here. */
++        trx_sys_mutex_exit();
++        return;
++      }
++      break;
++    }
++  }
+ 
+   if (oldest_view == nullptr) {
+     view->prepare(0);
+@@ -761,10 +884,6 @@ void MVCC::clone_oldest_view(ReadView *view) {
+ 
+     view->copy_complete();
+   }
+-  /* Update view to block purging transaction till GTID is persisted. */
+-  auto &gtid_persistor = clone_sys->get_gtid_persistor();
+-  auto gtid_oldest_trxno = gtid_persistor.get_oldest_trx_no();
+-  view->reduce_low_limit(gtid_oldest_trxno);
+ }
+ 
+ /**
+diff --git a/storage/innobase/srv/srv0srv.cc b/storage/innobase/srv/srv0srv.cc
+index 57a56cf82..e33aec17d 100644
+--- a/storage/innobase/srv/srv0srv.cc
++++ b/storage/innobase/srv/srv0srv.cc
+@@ -1924,7 +1924,7 @@ void srv_export_innodb_status(void) {
+   below the low limit. */
+   ReadView oldest_view;
+   trx_sys->mvcc->clone_oldest_view(&oldest_view);
+-  trx_id_t low_limit_no = oldest_view.view_low_limit_no();
++  trx_id_t low_limit_no = oldest_view.low_limit_no();
+ 
+   rw_lock_s_unlock(&purge_sys->latch);
+ 
+diff --git a/storage/innobase/trx/trx0purge.cc b/storage/innobase/trx/trx0purge.cc
+index fd9ce6b3e..15771c45d 100644
+--- a/storage/innobase/trx/trx0purge.cc
++++ b/storage/innobase/trx/trx0purge.cc
+@@ -39,6 +39,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ #include <sql_class.h>
+ #include "clone0api.h"
+ #include "clone0clone.h"
++#include "debug_sync.h" /* CONDITIONAL_SYNC_POINT */
+ #include "dict0dd.h"
+ #include "fil0fil.h"
+ #include "fsp0fsp.h"
+@@ -239,6 +240,45 @@ void trx_purge_sys_mem_create() {
+   purge_sys->heap = mem_heap_create(8 * 1024, UT_LOCATION_HERE);
+ }
+ 
++/** Updates the purge_sys->view and purge_sys->m_lowest_needed_trx_no, to the
++safe, most current estimates which are based on oldest currently open read view
++and progress of GTID persistor.
++Because the value of lowest needed transaction number returned by
++Clone_persist_gtid::get_oldest_trx_no() is not monotone over time, the
++m_lowest_needed_trx_no may sometimes get smaller, perhaps smaller than already
++purged trx no - when this happens it doesn't mean that we've lost important data
++as the value returned by GTID persistor in such cases is lower than really
++needed.
++The estimates should eventually converge on the right value if system is idle.
++This function is called at startup and then periodically by purge thread, to
++learn how much can be purged - which is limited by m_lowest_needed_trx_no.
++Note that m_lowest_needed_trx_no might be lower than needed by purge_sys->view
++in case GTID persistor is lagging. */
++static void trx_purge_update_oldest_needed() {
++  rw_lock_x_lock(&purge_sys->latch, UT_LOCATION_HERE);
++  purge_sys->view_active = false;
++  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
++  const auto needed_by_purge_view = purge_sys->view.low_limit_no();
++  /* The Clone_persist_gtid::get_oldest_trx_no() can return TRX_ID_MAX, if there
++  are no GTIDs pending to be persisted. It is crucial for correctness, that
++  get_oldest_trx_no() must be called after the oldest view was cloned, so that
++  in case it returns TRX_ID_MAX, we properly cap it to no more than
++  trx_sys->serialisation_min_trx_no seen at an earlier moment (which is an upper
++  bound for purge_sys->view->low_limit_no() on the one hand, and at
++  the same time a lower bound for trx->no of any trx assigned a new GTID since
++  then and at the same time ). If we do that in opposite order, it could be the
++  case that new GTIDs were assigned after the get_oldest_trx_no() has returned
++  TRX_ID_MAX and we clone an oldest read view even later and thus decide to
++  remove all Undo Logs not needed by this read view, including the Undo Log
++  Header which stored the newly assigned GTID, before it is persisted.*/
++  const auto needed_by_persistor =
++      clone_sys->get_gtid_persistor().get_oldest_trx_no();
++  purge_sys->m_lowest_needed_trx_no =
++      std::min(needed_by_purge_view, needed_by_persistor);
++  purge_sys->view_active = true;
++  rw_lock_x_unlock(&purge_sys->latch);
++}
++
+ void trx_purge_sys_initialize(uint32_t n_purge_threads,
+                               purge_pq_t *purge_queue) {
+   /* Take ownership of purge_queue, we are responsible for freeing it. */
+@@ -265,8 +305,7 @@ void trx_purge_sys_initialize(uint32_t n_purge_threads,
+   purge_sys->query = trx_purge_graph_build(purge_sys->trx, n_purge_threads);
+ 
+   new (&purge_sys->view) ReadView();
+-
+-  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
++  trx_purge_update_oldest_needed();
+ 
+   purge_sys->view_active = true;
+ 
+@@ -1626,23 +1665,22 @@ static bool trx_purge_truncate_marked_undo() {
+ NOTE that when this function is called, the caller must not
+ have any latches on undo log pages!
+ @param[in]  limit  Truncate limit
+-@param[in]  view   Purge view */
+-static void trx_purge_truncate_history(purge_iter_t *limit,
+-                                       const ReadView *view) {
++*/
++static void trx_purge_truncate_history(purge_iter_t *limit) {
+   MONITOR_INC_VALUE(MONITOR_PURGE_TRUNCATE_HISTORY_COUNT, 1);
+ 
+   auto counter_time_truncate_history = std::chrono::steady_clock::now();
+-
++  const auto lowest_needed_trx_no = purge_sys->m_lowest_needed_trx_no;
+   /* We play safe and set the truncate limit at most to the purge view
+   low_limit number, though this is not necessary */
+ 
+-  if (limit->trx_no >= view->low_limit_no()) {
+-    limit->trx_no = view->low_limit_no();
++  if (limit->trx_no >= lowest_needed_trx_no) {
++    limit->trx_no = lowest_needed_trx_no;
+     limit->undo_no = 0;
+     limit->undo_rseg_space = SPACE_UNKNOWN;
+   }
+ 
+-  ut_ad(limit->trx_no <= purge_sys->view.low_limit_no());
++  ut_ad(limit->trx_no <= lowest_needed_trx_no);
+ 
+   /* Purge rollback segments in all undo tablespaces.  This may take
+   some time and we do not want an undo DDL to attempt an x_lock during
+@@ -1926,7 +1964,7 @@ static trx_undo_rec_t *trx_purge_get_next_rec(
+   mtr_t mtr;
+ 
+   ut_ad(purge_sys->next_stored);
+-  ut_ad(purge_sys->iter.trx_no < purge_sys->view.low_limit_no());
++  ut_ad(purge_sys->iter.trx_no < purge_sys->m_lowest_needed_trx_no);
+ 
+   space = purge_sys->rseg->space_id;
+   page_no = purge_sys->page_no;
+@@ -2246,7 +2284,7 @@ void Purge_groups_t::distribute_if_needed() {
+     }
+   }
+ 
+-  if (purge_sys->iter.trx_no >= purge_sys->view.low_limit_no()) {
++  if (purge_sys->iter.trx_no >= purge_sys->m_lowest_needed_trx_no) {
+     return nullptr;
+   }
+ 
+@@ -2410,9 +2448,9 @@ static void trx_purge_truncate(void) {
+   ut_ad(trx_purge_check_limit());
+ 
+   if (purge_sys->limit.trx_no == 0) {
+-    trx_purge_truncate_history(&purge_sys->iter, &purge_sys->view);
++    trx_purge_truncate_history(&purge_sys->iter);
+   } else {
+-    trx_purge_truncate_history(&purge_sys->limit, &purge_sys->view);
++    trx_purge_truncate_history(&purge_sys->limit);
+   }
+ 
+   /* Attempt to truncate an undo tablespace. */
+@@ -2437,16 +2475,9 @@ ulint trx_purge(ulint n_purge_threads, /*!< in: number of purge tasks
+   /* The number of tasks submitted should be completed. */
+   ut_a(purge_sys->n_submitted == purge_sys->n_completed);
+ 
+-  rw_lock_x_lock(&purge_sys->latch, UT_LOCATION_HERE);
+-
+-  purge_sys->view_active = false;
+-
+-  trx_sys->mvcc->clone_oldest_view(&purge_sys->view);
+-
+-  purge_sys->view_active = true;
+-
+-  rw_lock_x_unlock(&purge_sys->latch);
++  trx_purge_update_oldest_needed();
+ 
++  CONDITIONAL_SYNC_POINT("after_clone_oldest_view");
+ #ifdef UNIV_DEBUG
+   if (srv_purge_view_update_only_debug) {
+     return (0);
+-- 
+2.34.1
+

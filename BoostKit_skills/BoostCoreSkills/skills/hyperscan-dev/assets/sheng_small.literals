@@ -1,0 +1,6 @@
+# Sheng 触发规则集 — 小规模 NFA
+# 条件: NFA 状态数 < shengLimit (~64), grey.allowSheng
+# 简单正则产生小型 Glushkov NFA, 小于 Sheng 阈值
+# shengcompile.cpp:703
+1:/abc/
+2:/def/

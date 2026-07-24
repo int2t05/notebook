@@ -1,0 +1,82 @@
+[
+  {
+    "query": "我在给 LLVM 的 AArch64 backend 加 codegen，想确认 FEAT_LSE128 是从哪个 Armv 版本开始的、可选还是强制？",
+    "should_trigger": true
+  },
+  {
+    "query": "arm64 的 BFCVT 这条指令的汇编格式和 encoding 长啥样？属于哪个扩展？",
+    "should_trigger": true
+  },
+  {
+    "query": "sve2 的 HISTSEG 指令需要哪个 feature flag 才能用？最低哪个架构版本？",
+    "should_trigger": true
+  },
+  {
+    "query": "ARM 的 MTE 内存标记是哪个版本引入的？只有 AArch64 还是 AArch32 也支持？",
+    "should_trigger": true
+  },
+  {
+    "query": "帮我把 a64 里所有 pointer authentication 相关的指令列一下，像 PACIA、AUTIA 那些",
+    "should_trigger": true
+  },
+  {
+    "query": "ldapr 是 acquire 语义的 load 吗？它受哪个 ARM feature 门控？",
+    "should_trigger": true
+  },
+  {
+    "query": "写 arm 后端的 feature 检测，想对齐 FEAT_DotProd 的官方名字和引入版本",
+    "should_trigger": true
+  },
+  {
+    "query": "sme2 的外积指令有哪些？FMOPA 到底需要 FEAT_SME 还是 FEAT_SME2？",
+    "should_trigger": true
+  },
+  {
+    "query": "aarch64 的 CASAL 原子比较交换，汇编模板是什么？地址支持立即数偏移吗？",
+    "should_trigger": true
+  },
+  {
+    "query": "把 Armv9.0 里所有强制（mandatory）实现的架构特性给我列出来",
+    "should_trigger": true
+  },
+  {
+    "query": "帮我用 NEON intrinsics 写一个 arm64 的向量点积，给我完整可编译的 C 代码",
+    "should_trigger": false
+  },
+  {
+    "query": "x86 的 AVX-512 有哪些常用指令？给我分类讲讲",
+    "should_trigger": false
+  },
+  {
+    "query": "我的 ARM 服务器 CPU 温度有点高，怎么排查散热和降频问题？",
+    "should_trigger": false
+  },
+  {
+    "query": "帮我分析一下 Arm 公司最近一季的财报和股价走势",
+    "should_trigger": false
+  },
+  {
+    "query": "在 Go 编译器里跑一下 arm64 的 benchmark，看看我的改动有没有性能回归",
+    "should_trigger": false
+  },
+  {
+    "query": "qemu-system-aarch64 怎么配置才能跑起来一个 ARM64 的 Ubuntu 镜像？",
+    "should_trigger": false
+  },
+  {
+    "query": "ARM64 函数的 prologue/epilogue 按 AAPCS64 该怎么保存 callee-saved 寄存器？",
+    "should_trigger": false
+  },
+  {
+    "query": "把这段 ARM 架构手册的英文段落帮我翻译成中文：The PE asserts ...",
+    "should_trigger": false
+  },
+  {
+    "query": "RISC-V 的向量扩展 RVV 和 ARM SVE 在可伸缩向量设计上有什么区别？",
+    "should_trigger": false
+  },
+  {
+    "query": "aarch64 Linux 上 mmap 的 MAP_FIXED 行为和页表项有什么关系？",
+    "should_trigger": false
+  }
+]

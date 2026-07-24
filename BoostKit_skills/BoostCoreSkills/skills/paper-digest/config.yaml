@@ -1,0 +1,120 @@
+# paper-digest skill configuration
+
+output:
+  # Where archives land. Relative paths resolve against the current working
+  # directory of the caller (so users running from their project root get
+  # ./paper-digest-output/<slug>-<window>/ next to their other docs).
+  base_dir: "paper-digest-output"
+  # Archive subdirectory naming: "{slug}-{window}" (e.g. mem-opt-1y) is the
+  # default; set include_date_label=true to fall back to the older
+  # "{slug}_{window}_{YYYY-MM-DD}" form for tracking multiple runs over time.
+  include_date_label: false
+
+# Quality tiers. `standard` is the end-to-end-validated default; `fast` and
+# `deep` run the same pipeline with different top_N / budget / yellow-extract
+# settings and should be considered preview-quality.
+quality_tiers:
+  fast:
+    top_n_conferences: 10
+    extract_yellow: false
+    produce_trends: false
+    max_budget_tokens: 50000
+  standard:
+    # 25 covers all 21 conferences currently in references/conferences-metadata.yaml
+    # with headroom for newly-added entries.
+    top_n_conferences: 25
+    extract_yellow: true
+    produce_trends: false
+    max_budget_tokens: 200000
+  deep:
+    top_n_conferences: 40
+    extract_yellow: true
+    produce_trends: true
+    max_budget_tokens: 500000
+
+# Authoritative sources for conference discovery (Phase 1A)
+conference_sources:
+  - name: ccf
+    url: "https://www.ccf.org.cn/Academic_Evaluation/ARCH_DCP_SS/"
+  - name: core
+    url: "https://portal.core.edu.au/conf-ranks/"
+  - name: scholar_metrics
+    url: "https://scholar.google.com/citations?view_op=top_venues&hl=en&vq=eng_computingsystems"
+
+# LLM configuration
+llm:
+  # Default backend: "cli" prefers a local agent CLI (subscription auth, no key
+  # needed); "api" requires an API key (DeepSeek / OpenAI-compatible endpoint).
+  # `auto` picks cli if a CLI binary is on PATH, else api if API key is set.
+  backend_default: "auto"
+
+  # ============ API backend ============
+  # Only used when --backend api (or when --backend auto AND no CLI is found
+  # AND PAPER_DIGEST_LLM_API_KEY is set). Truly optional — you do not need
+  # to set an API key for the CLI backend.
+  api:
+    base_url_env: "PAPER_DIGEST_LLM_BASE_URL"
+    base_url_default: "https://api.deepseek.com/v1"
+    api_key_env: "PAPER_DIGEST_LLM_API_KEY"
+    model_flash: "deepseek-chat"
+    model_strong: "deepseek-reasoner"
+    max_retries: 3
+    timeout_seconds: 60
+
+  # ============ CLI subprocess backend ============
+  # Default. Spawns an agent CLI per LLM call; auth is whatever that CLI uses.
+  # Switch backends by editing `binary` + `model_flash/strong` + (if needed)
+  # `prompt_arg` / `model_arg` / `extra_args`. See alternates below.
+  cli_backend:
+    binary: claude
+    prompt_arg: "-p"
+    model_arg: "--model"
+    extra_args:
+      - "--no-session-persistence"
+    model_flash: haiku
+    model_strong: sonnet
+    timeout_flash_seconds: 120
+    timeout_strong_seconds: 240
+
+    # --- Alternates ---
+    # Uncomment and copy into the active `cli_backend:` block above to switch
+    # to another agent CLI. None of these need code changes.
+    #
+    # # Gemini CLI:
+    # binary: gemini
+    # prompt_arg: "-p"
+    # model_arg: "-m"
+    # extra_args: []
+    # model_flash: "gemini-2.5-flash"
+    # model_strong: "gemini-2.5-pro"
+    #
+    # # OpenAI Codex CLI (sample; check `codex --help`):
+    # binary: codex
+    # prompt_arg: "--prompt"
+    # model_arg: "--model"
+    # extra_args: ["--non-interactive"]
+    # model_flash: "gpt-5-mini"
+    # model_strong: "gpt-5"
+
+  # Phase 2 batch size for classify (applies to both backends)
+  batch_size_classify: 25
+
+# 3-tag dimension emoji map
+tags:
+  industry:
+    industry: "🏭 工业主导"
+    hybrid:   "🤝 学+工合作"
+    academic: "🏛️ 纯学术"
+  opensource:
+    "yes":    "📦 已开源"
+    partial:  "📋 部分开源"
+    "no":     "🔒 未开源"
+  deployability:
+    high:     "🚀 高（产品级/已上生产）"
+    medium:   "🔬 中（PoC/原型）"
+    low:      "📐 低（理论/形式化）"
+
+# Runtime
+runtime:
+  parallel_phase_1: true
+  parallel_papers: 5

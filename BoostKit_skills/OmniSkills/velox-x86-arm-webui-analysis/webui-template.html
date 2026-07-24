@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gluten+Velox 性能对比报告 — {日期}</title>
+  <style>
+    /* ===== 基础样式 ===== */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      background: #f0f2f5;
+      color: #1a1a2e;
+      padding: 0 0 40px;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    a { color: #1677ff; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px;
+           background: #f5f5f5; padding: 1px 5px; border-radius: 3px; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 20px; }
+
+    /* ===== 页头 ===== */
+    .page-header {
+      background: linear-gradient(135deg, #0a2342 0%, #1a3a6b 50%, #0d4f8c 100%);
+      color: #fff;
+      padding: 28px 20px 22px;
+      margin-bottom: 24px;
+    }
+    .page-header .container { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+    .page-header h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; }
+    .page-header .meta { font-size: 12px; color: rgba(255,255,255,0.7); line-height: 1.8; }
+    .page-header .meta span { margin-right: 16px; }
+    .gen-time { font-size: 11px; color: rgba(255,255,255,0.5); }
+
+    /* ===== 导航栏 ===== */
+    .nav-bar {
+      background: #fff;
+      border-bottom: 2px solid #e8e8e8;
+      padding: 10px 20px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+    .nav-bar > span { color: #888; font-size: 12px; margin-right: 4px; }
+    .nav-link {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+      background: #f5f5f5;
+      color: #444;
+      border: 1px solid #e0e0e0;
+      text-decoration: none;
+    }
+    .nav-link:hover { background: #e6f4ff; color: #1677ff; border-color: #91caff; text-decoration: none; }
+    .nav-link.slow { background: #fff1f0; color: #cf1322; border-color: #ffa39e; }
+    .nav-link.slow:hover { background: #ffe6e4; }
+
+    /* ===== 通用卡片 ===== */
+    .card {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+    .card h2 {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 16px;
+      color: #1a1a2e;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    .card h3 { font-size: 14px; font-weight: 600; margin: 16px 0 10px; color: #333; }
+
+    /* ===== 应用总览：双栏架构区块 ===== */
+    .arch-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+    .arch-block { border-radius: 8px; padding: 14px 16px; }
+    .arch-block.x86 { background: #e6f4ff; border: 1px solid #91caff; }
+    .arch-block.arm { background: #fff7e6; border: 1px solid #ffd591; }
+    .arch-label {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: 0.5px; margin-bottom: 5px;
+    }
+    .arch-block.x86 .arch-label { color: #1677ff; }
+    .arch-block.arm .arch-label { color: #d46b08; }
+    .arch-appid { font-size: 11px; color: #555; font-family: monospace; margin-bottom: 7px; word-break: break-all; }
+    .arch-time { font-size: 14px; font-weight: 700; }
+    .arch-block.x86 .arch-time { color: #1677ff; }
+    .arch-block.arm .arch-time { color: #d46b08; }
+    .arch-detail { font-size: 11px; color: #777; margin-top: 4px; }
+    .total-ratio-row { text-align: center; padding: 12px 0 4px; font-size: 14px; }
+
+    /* ===== 比值徽章 ===== */
+    .ratio-badge {
+      display: inline-block;
+      font-size: 12px; font-weight: 700;
+      padding: 3px 10px; border-radius: 20px;
+    }
+    .ratio-ok       { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+    .ratio-warn     { background: #fffbe6; color: #d46b08; border: 1px solid #ffe58f; }
+    .ratio-critical { background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; }
+    .ratio-severe   { background: #fff1f0; color: #820014; border: 1px solid #ff7875; font-size: 13px; }
+
+    /* ===== 状态徽章 ===== */
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge-red    { background: #fff1f0; color: #cf1322; border: 1px solid #ffa39e; }
+    .badge-orange { background: #fff7e6; color: #d46b08; border: 1px solid #ffc069; }
+    .badge-green  { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+    .badge-blue   { background: #e6f4ff; color: #1677ff; border: 1px solid #91caff; }
+
+    /* ===== 表格通用 ===== */
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th {
+      background: #fafafa; font-weight: 600; text-align: left;
+      padding: 8px 12px; border-bottom: 2px solid #e8e8e8; color: #555;
+      font-size: 12px; white-space: nowrap;
+    }
+    td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+    .slow-row td { background: #fff5f5 !important; }
+    .slow-row:hover td { background: #ffe9e9 !important; }
+    td strong { font-weight: 600; }
+
+    /* ===== 链接样式 ===== */
+    .needs-detail { color: #cf1322; font-weight: 600; }
+
+    /* ===== Stage 详细分析卡片 ===== */
+    .stage-detail {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+      margin-bottom: 20px;
+      border-left: 4px solid #cf1322;
+      overflow: hidden;
+    }
+    .stage-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 20px;
+      background: #fafafa;
+      border-bottom: 1px solid #f0f0f0;
+      flex-wrap: wrap;
+    }
+    .stage-id-badge {
+      background: #cf1322;
+      color: #fff;
+      border-radius: 5px;
+      padding: 3px 10px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .stage-title { font-size: 14px; font-weight: 600; flex: 1; color: #333; }
+    .stage-body { padding: 16px 20px; }
+
+    /* ===== CSS 柱状图 ===== */
+    .bar-legend {
+      display: flex;
+      gap: 16px;
+      font-size: 12px;
+      color: #555;
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    .legend-dot {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 2px;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .bar-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .bar-label {
+      width: 200px;
+      font-size: 12px;
+      color: #444;
+      text-align: right;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex-shrink: 0;
+    }
+    .bar-wrap { flex: 1; min-width: 0; }
+    .bar-track {
+      height: 16px;
+      background: #f5f5f5;
+      border-radius: 3px;
+      margin-bottom: 3px;
+      overflow: hidden;
+    }
+    .bar-x86 { height: 100%; background: #1677ff; border-radius: 3px; transition: width 0.3s; }
+    .bar-arm { height: 100%; background: #e65100; border-radius: 3px; transition: width 0.3s; }
+    .bar-values {
+      width: 200px;
+      font-size: 11px;
+      color: #666;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .bar-values strong { color: #cf1322; }
+
+    /* ===== 瓶颈排名 ===== */
+    .rank-1 { color: #cf1322; font-weight: 700; }
+    .rank-2 { color: #d46b08; font-weight: 700; }
+    .rank-3 { color: #595959; font-weight: 600; }
+
+    /* ===== 总结框 ===== */
+    .summary-box {
+      background: #fffbe6;
+      border: 1px solid #ffe58f;
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin-top: 16px;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #595959;
+    }
+    .summary-box strong { color: #d46b08; }
+
+    /* ===== 代码热点区块 ===== */
+    .code-section {
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+    .code-section h2 {
+      font-size: 16px;
+      font-weight: 700;
+      margin-bottom: 14px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #f0f0f0;
+    }
+    details { border: 1px solid #e8e8e8; border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+    summary {
+      cursor: pointer;
+      padding: 12px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: #fafafa;
+      list-style: none;
+      user-select: none;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: "▶"; font-size: 10px; color: #888; margin-right: 6px; transition: transform 0.2s; }
+    details[open] > summary::before { transform: rotate(90deg); }
+    summary .summary-title { flex: 1; color: #1a1a2e; }
+    summary .summary-ratio { font-size: 11px; color: #888; }
+    .detail-content { padding: 14px 16px; border-top: 1px solid #f0f0f0; background: #fff; }
+    .code-block {
+      background: #1e1e2e;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      color: #cdd6f4;
+      margin: 6px 0 10px;
+      overflow-x: auto;
+      line-height: 1.5;
+    }
+    .code-block.x86 { border-left: 3px solid #1677ff; }
+    .code-block.arm { border-left: 3px solid #e65100; }
+    .code-block .comment { color: #6c7086; }
+    .hotspot-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+    .tag {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 500;
+      background: #f0f0f0;
+      color: #555;
+    }
+    .tag-high   { background: #fff1f0; color: #cf1322; }
+    .tag-medium { background: #fff7e6; color: #d46b08; }
+    .tag-low    { background: #f6ffed; color: #389e0d; }
+    .tag-file   { background: #e6f4ff; color: #1677ff; font-family: monospace; }
+
+    /* ===== WebUI 链接区块 ===== */
+    .links-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 6px;
+    }
+    .link-item { display: flex; align-items: center; gap: 6px; }
+    .link-arch {
+      font-size: 10px; font-weight: 700;
+      padding: 1px 5px; border-radius: 3px; flex-shrink: 0;
+    }
+    .link-arch.x86 { background: #1677ff; color: #fff; }
+    .link-arch.arm { background: #d46b08; color: #fff; }
+    .link-btn {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 5px 10px; border-radius: 5px;
+      font-size: 12px; font-weight: 500;
+      text-decoration: none; cursor: pointer;
+      transition: opacity 0.15s; flex: 1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .link-btn:hover { opacity: 0.8; text-decoration: none; }
+    .link-btn.sql    { background: #f0f5ff; color: #2f54eb; border: 1px solid #adc6ff; }
+    .link-btn.gluten { background: #f6ffed; color: #389e0d; border: 1px solid #b7eb8f; }
+    .link-btn.stages { background: #fff0f6; color: #c41d7f; border: 1px solid #ffadd2; }
+    .link-btn.jobs   { background: #e6fffb; color: #08979c; border: 1px solid #87e8de; }
+    .link-btn.env    { background: #f9f0ff; color: #531dab; border: 1px solid #d3adf7; }
+
+    /* ===== 页脚 ===== */
+    .page-footer {
+      text-align: center;
+      font-size: 11px;
+      color: #aaa;
+      margin-top: 24px;
+      padding-bottom: 16px;
+    }
+
+    /* ===== 响应式 ===== */
+    @media (max-width: 640px) {
+      .arch-row { grid-template-columns: 1fr; }
+      .bar-label { width: 120px; }
+      .bar-values { width: 140px; font-size: 10px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ============================
+     区块①: 页面头部
+     变量: {日期} {x86_appId} {arm_appId} {生成时间}
+     ============================ -->
+<div class="page-header">
+  <div class="container">
+    <div>
+      <h1>⚡ Gluten+Velox x86 vs ARM 性能对比报告</h1>
+      <div class="meta">
+        <span>📅 数据日期：{日期}</span>
+        <span>🖥️ x86 AppID：<code style="background:rgba(255,255,255,0.15);color:#fff">{x86_appId}</code></span>
+        <span>🦾 ARM AppID：<code style="background:rgba(255,255,255,0.15);color:#fff">{arm_appId}</code></span>
+      </div>
+      <div class="gen-time">生成时间：{生成时间} &nbsp;|&nbsp; History Server：spark35-his.data.sankuai.com</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================
+     导航栏（慢 Stage 快速跳转）
+     ============================ -->
+<div class="nav-bar">
+  <span>🔗 快速跳转:</span>
+  <a class="nav-link" href="#overview">📊 应用总览</a>
+  <a class="nav-link" href="#stage-overview">📋 Stage 总览</a>
+  <!-- 每个慢 Stage 一个链接，复制以下行 -->
+  <a class="nav-link slow" href="#stage-{S1}">Stage {S1} ({R1}x 🔴)</a>
+  <!-- <a class="nav-link slow" href="#stage-{S2}">Stage {S2} ({R2}x 🔴)</a> -->
+  <a class="nav-link" href="#code-hotspots">🔧 代码热点</a>
+  <a class="nav-link" href="#webui-links">🔗 WebUI 链接</a>
+</div>
+
+<div class="container">
+
+<!-- ============================
+     区块②: 应用总览（双栏卡片）
+     变量: {x86_appId} {arm_appId} {x86_total} {arm_total}
+           {x86_branch} {arm_branch} {x86_stages} {arm_stages}
+           {total_ratio} {ratio_class} {emoji}
+     ============================ -->
+<div class="card" id="overview">
+  <h2>📊 应用总览</h2>
+  <div class="arch-row">
+    <div class="arch-block x86">
+      <div class="arch-label">x86 Baseline</div>
+      <div class="arch-appid">{x86_appId}</div>
+      <div class="arch-time">⏱ {x86_total}</div>
+      <div class="arch-detail">Stages: {x86_stages} &nbsp;|&nbsp; Velox: {x86_branch}</div>
+    </div>
+    <div class="arch-block arm">
+      <div class="arch-label">ARM 鲲鹏 (New)</div>
+      <div class="arch-appid">{arm_appId}</div>
+      <div class="arch-time">⏱ {arm_total}</div>
+      <div class="arch-detail">Stages: {arm_stages} &nbsp;|&nbsp; Velox: {arm_branch}</div>
+    </div>
+  </div>
+  <div class="total-ratio-row">
+    ARM/x86 总耗时比 = <span class="ratio-badge {ratio_class}">{total_ratio}x {emoji}</span>
+    &nbsp;&nbsp;
+    <span style="font-size:12px;color:#888">
+      慢 Stage 数：<strong style="color:#cf1322">{slow_count}</strong> 个（共 {total_stages} 个）
+    </span>
+  </div>
+</div>
+
+<!-- ============================
+     区块③: Stage 总览表
+     变量: {total_stages} {slow_count}
+     每行: {S} {desc} {x86_dur} {arm_dur} {ratio} {badge_class} {badge_text} {detail_yn}
+     ============================ -->
+<div class="card" id="stage-overview">
+  <h2>📋 Stage 总览（{total_stages} 个，其中 {slow_count} 个需精细分析）</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Stage</th>
+        <th>描述</th>
+        <th>x86 耗时</th>
+        <th>ARM 耗时</th>
+        <th>ARM/x86</th>
+        <th>差异</th>
+        <th>精细分析</th>
+      </tr>
+    </thead>
+    <tbody>
+      <!-- 差异 > 1.5x 的行加 class="slow-row" -->
+      <tr class="slow-row">
+        <td><a href="#stage-{S}" class="needs-detail">Stage {S}</a></td>
+        <td style="max-width:300px;word-break:break-all">{desc}</td>
+        <td>{x86_dur}</td>
+        <td><strong>{arm_dur}</strong></td>
+        <td><span class="ratio-badge ratio-critical">{ratio}x</span></td>
+        <td><span class="badge badge-red">🔴 显著慢</span></td>
+        <td>✅</td>
+      </tr>
+      <!-- 差异 1.2~1.5x -->
+      <tr>
+        <td>Stage {S}</td>
+        <td style="max-width:300px;word-break:break-all">{desc}</td>
+        <td>{x86_dur}</td>
+        <td>{arm_dur}</td>
+        <td><span class="ratio-badge ratio-warn">{ratio}x</span></td>
+        <td><span class="badge badge-orange">🟡 轻微慢</span></td>
+        <td>⚠️</td>
+      </tr>
+      <!-- 正常 < 1.2x -->
+      <tr>
+        <td>Stage {S}</td>
+        <td style="max-width:300px;word-break:break-all">{desc}</td>
+        <td>{x86_dur}</td>
+        <td>{arm_dur}</td>
+        <td><span class="ratio-badge ratio-ok">{ratio}x</span></td>
+        <td><span class="badge badge-green">🟢 正常</span></td>
+        <td>—</td>
+      </tr>
+      <!-- ARM 更快 -->
+      <tr>
+        <td>Stage {S}</td>
+        <td style="max-width:300px;word-break:break-all">{desc}</td>
+        <td>{x86_dur}</td>
+        <td>{arm_dur}</td>
+        <td><span class="ratio-badge ratio-ok">{ratio}x</span></td>
+        <td><span class="badge badge-blue">⚡ ARM 更快</span></td>
+        <td>—</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- ============================
+     区块④: 慢 Stage 详细分析卡片
+     每个慢 Stage 复制一份，替换所有 {变量}
+     ============================ -->
+<div class="stage-detail" id="stage-{S}">
+  <div class="stage-header">
+    <span class="stage-id-badge">Stage {S}</span>
+    <span class="stage-title">{desc}</span>
+    <span class="ratio-badge ratio-critical">{ratio}x 🔴</span>
+  </div>
+
+  <div class="stage-body">
+
+    <!-- Stage 背景信息 -->
+    <h3>📌 Stage 背景</h3>
+    <table style="margin-bottom:16px">
+      <tbody>
+        <tr><td style="width:140px;color:#888">Stage ID</td>
+            <td style="width:260px"><span class="badge badge-blue">Stage {S}</span></td>
+            <td style="width:140px;color:#888">Query ID</td>
+            <td><a href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/SQL/execution/?id={queryId}" target="_blank">Query {queryId}</a></td>
+        </tr>
+        <tr><td style="color:#888">主要算子</td>
+            <td colspan="3">{op_list}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- Stage 总耗时 -->
+    <h3>🕐 Stage 级总耗时</h3>
+    <table style="margin-bottom:16px">
+      <thead>
+        <tr><th>指标</th><th>x86</th><th>ARM</th><th>ARM/x86</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Total Time Across All Tasks</td>
+          <td>{x86_total_time}</td>
+          <td><strong>{arm_total_time}</strong></td>
+          <td><span class="badge badge-red">{ratio_total}x 🔴</span></td>
+        </tr>
+        <tr>
+          <td>GC Time</td>
+          <td>{x86_gc}</td>
+          <td><strong>{arm_gc}</strong></td>
+          <td><span class="badge badge-orange">{ratio_gc}x 🟡</span></td>
+        </tr>
+        <tr>
+          <td>Median Task Duration</td>
+          <td>{x86_med}</td>
+          <td><strong>{arm_med}</strong></td>
+          <td><span class="badge badge-red">{ratio_med}x 🔴</span></td>
+        </tr>
+        <tr>
+          <td>KILLED Tasks（推测执行）</td>
+          <td>{x86_killed}</td>
+          <td><strong>{arm_killed}</strong></td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>Input Size</td>
+          <td>{x86_input}</td>
+          <td>{arm_input}</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td>Shuffle Write Size</td>
+          <td>{x86_shuf}</td>
+          <td>{arm_shuf}</td>
+          <td>—</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- 算子级柱状图 -->
+    <h3>🔬 算子级耗时对比（柱状图）</h3>
+    <div class="bar-legend">
+      <span><span class="legend-dot" style="background:#1677ff"></span>x86</span>
+      <span><span class="legend-dot" style="background:#e65100"></span>ARM 鲲鹏</span>
+      <span style="font-size:11px;color:#aaa">（宽度以同 Stage 最大算子耗时为 100%）</span>
+    </div>
+    <!-- 每个算子复制以下 .bar-row，调整 style="width:{pct}%" -->
+    <!-- x86_pct = (x86_val / max_val) * 100; arm_pct = (arm_val / max_val) * 100 -->
+    <div class="bar-row">
+      <div class="bar-label">HashJoin probe</div>
+      <div class="bar-wrap">
+        <div class="bar-track"><div class="bar-x86" style="width:{x86_probe_pct}%"></div></div>
+        <div class="bar-track"><div class="bar-arm" style="width:{arm_probe_pct}%"></div></div>
+      </div>
+      <div class="bar-values">x86:{x86_probe} ARM:{arm_probe} <strong>({ratio_probe}x)</strong></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">VeloxColumnarToRow</div>
+      <div class="bar-wrap">
+        <div class="bar-track"><div class="bar-x86" style="width:{x86_c2r_pct}%"></div></div>
+        <div class="bar-track"><div class="bar-arm" style="width:{arm_c2r_pct}%"></div></div>
+      </div>
+      <div class="bar-values">x86:{x86_c2r} ARM:{arm_c2r} <strong>({ratio_c2r}x)</strong></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">ColumnarExchange split</div>
+      <div class="bar-wrap">
+        <div class="bar-track"><div class="bar-x86" style="width:{x86_split_pct}%"></div></div>
+        <div class="bar-track"><div class="bar-arm" style="width:{arm_split_pct}%"></div></div>
+      </div>
+      <div class="bar-values">x86:{x86_split} ARM:{arm_split} <strong>({ratio_split}x)</strong></div>
+    </div>
+    <div class="bar-row">
+      <div class="bar-label">ProjectExecTransformer</div>
+      <div class="bar-wrap">
+        <div class="bar-track"><div class="bar-x86" style="width:{x86_proj_pct}%"></div></div>
+        <div class="bar-track"><div class="bar-arm" style="width:{arm_proj_pct}%"></div></div>
+      </div>
+      <div class="bar-values">x86:{x86_proj} ARM:{arm_proj} <strong>({ratio_proj}x)</strong></div>
+    </div>
+    <!-- 更多算子行，按需复制上方 .bar-row 结构 -->
+
+    <!-- 瓶颈排序表 -->
+    <h3 style="margin-top:20px">📊 瓶颈排序（按绝对耗时差降序）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>算子 / 阶段</th>
+          <th>x86 耗时</th>
+          <th>ARM 耗时</th>
+          <th>差值</th>
+          <th>倍差</th>
+          <th>根因推断</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong class="rank-1">#1 🥇</strong></td>
+          <td>{算子1}</td>
+          <td>{x86_1}</td>
+          <td><strong>{arm_1}</strong></td>
+          <td><strong style="color:#cf1322">+{diff_1}</strong></td>
+          <td><span class="ratio-badge ratio-severe">{r1}x</span></td>
+          <td style="font-size:12px;color:#555">{根因1}</td>
+        </tr>
+        <tr>
+          <td><strong class="rank-2">#2 🥈</strong></td>
+          <td>{算子2}</td>
+          <td>{x86_2}</td>
+          <td><strong>{arm_2}</strong></td>
+          <td><strong style="color:#cf1322">+{diff_2}</strong></td>
+          <td><span class="ratio-badge ratio-critical">{r2}x</span></td>
+          <td style="font-size:12px;color:#555">{根因2}</td>
+        </tr>
+        <tr>
+          <td><strong class="rank-3">#3 🥉</strong></td>
+          <td>{算子3}</td>
+          <td>{x86_3}</td>
+          <td><strong>{arm_3}</strong></td>
+          <td><strong style="color:#d46b08">+{diff_3}</strong></td>
+          <td><span class="ratio-badge ratio-warn">{r3}x</span></td>
+          <td style="font-size:12px;color:#555">{根因3}</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <!-- 一句话总结 -->
+    <div class="summary-box">
+      🎯 <strong>总结</strong>：Stage {S} ARM 比 x86 慢 <strong>{ratio}x</strong>，
+      核心瓶颈是 <strong>{算子1}（{r1}x）</strong> 和 <strong>{算子2}（{r2}x）</strong>，
+      根本原因是 {根因描述}。
+    </div>
+
+  </div><!-- .stage-body -->
+</div><!-- .stage-detail -->
+<!-- ===== 更多慢 Stage 卡片，复制上方 .stage-detail 并修改 id 和变量 ===== -->
+
+
+<!-- ============================
+     区块⑤: 代码热点分析（可选）
+     当仓库中存在 huawei_kunpeng_gluten/ 或 huawei_kunpeng_velox/ 时输出
+     ============================ -->
+<div class="code-section" id="code-hotspots">
+  <h2>🔧 代码级热点分析（Phase 3）</h2>
+
+  <!-- 热点 #1：高优 -->
+  <details>
+    <summary>
+      <span class="summary-title">
+        <span class="badge badge-red">🔴 高优</span>&nbsp;
+        {算子名} — {差异描述简述}
+      </span>
+      <span class="summary-ratio">预计劣势: {ratio}x &nbsp;|&nbsp; 优先级: 高</span>
+    </summary>
+    <div class="detail-content">
+      <p style="margin-bottom:8px">
+        <strong>文件</strong>：<code class="tag tag-file">{文件路径}</code>
+        &nbsp;&nbsp;<strong>函数</strong>：<code>{函数名}</code>
+      </p>
+      <p style="color:#555;font-size:12px;margin-bottom:4px">⚡ <strong>x86 实现</strong>（利用 AVX2 / AES-NI / CMOV 等硬件指令）：</p>
+      <div class="code-block x86"><span class="comment">// x86: AVX2 gather 单指令处理 8 个 32-bit 元素</span>
+{x86代码片段}</div>
+      <p style="color:#555;font-size:12px;margin-bottom:4px">🦾 <strong>ARM 现状</strong>（缺失 NEON/SVE 等效实现）：</p>
+      <div class="code-block arm"><span class="comment">// ARM: 逐元素 fallback，无法利用 NEON gather</span>
+{arm代码片段}</div>
+      <div class="hotspot-tags">
+        <span class="tag tag-high">🔴 高优先级</span>
+        <span class="tag tag-file">{文件名}</span>
+        <span class="tag">预计劣势: {ratio}x</span>
+        <span class="tag">对应算子: {算子}</span>
+      </div>
+      <p style="color:#2e7d32;font-size:13px;margin-top:12px">
+        💡 <strong>优化建议</strong>：{具体优化方向，1-2句话}
+      </p>
+    </div>
+  </details>
+
+  <!-- 热点 #2：中优 -->
+  <details>
+    <summary>
+      <span class="summary-title">
+        <span class="badge badge-orange">🟡 中优</span>&nbsp;
+        {算子名2} — {差异描述简述2}
+      </span>
+      <span class="summary-ratio">预计劣势: {ratio2}x &nbsp;|&nbsp; 优先级: 中</span>
+    </summary>
+    <div class="detail-content">
+      <p style="margin-bottom:8px">
+        <strong>文件</strong>：<code class="tag tag-file">{文件路径2}</code>
+        &nbsp;&nbsp;<strong>函数</strong>：<code>{函数名2}</code>
+      </p>
+      <p style="color:#555;font-size:12px;margin-bottom:4px">⚡ <strong>x86 实现</strong>：</p>
+      <div class="code-block x86">{x86代码片段2}</div>
+      <p style="color:#555;font-size:12px;margin-bottom:4px">🦾 <strong>ARM 现状</strong>：</p>
+      <div class="code-block arm">{arm代码片段2}</div>
+      <div class="hotspot-tags">
+        <span class="tag tag-medium">🟡 中优先级</span>
+        <span class="tag tag-file">{文件名2}</span>
+        <span class="tag">预计劣势: {ratio2}x</span>
+      </div>
+      <p style="color:#2e7d32;font-size:13px;margin-top:12px">
+        💡 <strong>优化建议</strong>：{优化方向2}
+      </p>
+    </div>
+  </details>
+
+  <!-- 更多热点，复制上方 <details> 块 -->
+
+</div><!-- .code-section -->
+
+
+<!-- ============================
+     区块⑥: WebUI 快捷链接
+     变量: {x86_appId} {arm_appId}
+     ============================ -->
+<div class="card" id="webui-links">
+  <h2>🔗 WebUI 快捷链接</h2>
+  <div class="links-grid">
+    <div class="link-item">
+      <span class="link-arch x86">x86</span>
+      <a class="link-btn sql" href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/SQL/" target="_blank">🗂 SQL 列表</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch arm">ARM</span>
+      <a class="link-btn sql" href="http://spark35-his.data.sankuai.com/history/{arm_appId}/1/SQL/" target="_blank">🗂 SQL 列表</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch x86">x86</span>
+      <a class="link-btn gluten" href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/gluten/" target="_blank">⚡ Gluten 指标</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch arm">ARM</span>
+      <a class="link-btn gluten" href="http://spark35-his.data.sankuai.com/history/{arm_appId}/1/gluten/" target="_blank">⚡ Gluten 指标</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch x86">x86</span>
+      <a class="link-btn stages" href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/stages/" target="_blank">📊 Stages</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch arm">ARM</span>
+      <a class="link-btn stages" href="http://spark35-his.data.sankuai.com/history/{arm_appId}/1/stages/" target="_blank">📊 Stages</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch x86">x86</span>
+      <a class="link-btn jobs" href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/jobs/" target="_blank">🔧 Jobs</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch arm">ARM</span>
+      <a class="link-btn jobs" href="http://spark35-his.data.sankuai.com/history/{arm_appId}/1/jobs/" target="_blank">🔧 Jobs</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch x86">x86</span>
+      <a class="link-btn env" href="http://spark35-his.data.sankuai.com/history/{x86_appId}/1/environment/" target="_blank">🔍 Environment</a>
+    </div>
+    <div class="link-item">
+      <span class="link-arch arm">ARM</span>
+      <a class="link-btn env" href="http://spark35-his.data.sankuai.com/history/{arm_appId}/1/environment/" target="_blank">🔍 Environment</a>
+    </div>
+  </div>
+</div>
+
+
+</div><!-- .container -->
+
+<p class="page-footer">
+  生成时间：{生成时间} &nbsp;|&nbsp;
+  x86: {x86_appId} &nbsp;|&nbsp; ARM: {arm_appId} &nbsp;|&nbsp;
+  由 CatPaw + spark-gluten-arm-perf-analysis skill 自动生成
+</p>
+
+</body>
+</html>

@@ -1,0 +1,193 @@
+From 06cd147f4d5ffa0549e508460067fd685f1a4a0e Mon Sep 17 00:00:00 2001
+From: zhengyuanyue <im_zyy@hotmail.com>
+Date: Fri, 6 Mar 2026 17:13:19 +0800
+Subject: [PATCH 1/2] innodb: enhance read view management with version
+ tracking
+
+- Introduced a new versioning mechanism for read views to optimize reuse based on data changes.
+- Updated trx_sys_t to include rw_trx_version for tracking the version of data used in read views.
+- Modified ReadView to store and utilize the rw_trx_version for efficient view management.
+- Adjusted locking behavior in ha_innobase::external_lock to improve performance during view closure.
+---
+ storage/innobase/handler/ha_innodb.cc |  6 +-----
+ storage/innobase/include/read0types.h |  7 ++++++
+ storage/innobase/include/trx0sys.h    |  4 ++++
+ storage/innobase/read/read0read.cc    | 31 ++++++++++++++++++---------
+ storage/innobase/trx/trx0sys.cc       |  1 +
+ storage/innobase/trx/trx0trx.cc       |  5 +++++
+ 6 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index 2f9b06c56..8610e09a7 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -19625,11 +19625,7 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
+ 
+     } else if (trx->isolation_level <= TRX_ISO_READ_COMMITTED &&
+                MVCC::is_view_active(trx->read_view)) {
+-      mutex_enter(&trx_sys->mutex);
+-
+-      trx_sys->mvcc->view_close(trx->read_view, true);
+-
+-      mutex_exit(&trx_sys->mutex);
++      trx_sys->mvcc->view_close(trx->read_view, false);
+     }
+   }
+ 
+diff --git a/storage/innobase/include/read0types.h b/storage/innobase/include/read0types.h
+index 1837e7116..612cf3075 100644
+--- a/storage/innobase/include/read0types.h
++++ b/storage/innobase/include/read0types.h
+@@ -237,6 +237,10 @@ class ReadView {
+   @return true if there are no transaction ids in the snapshot */
+   bool empty() const { return (m_ids.empty()); }
+ 
++  /**
++  @return the version of this view */
++  ulint version() const { return (m_version); }
++
+   /**
+   Clones a read view object. The resulting read view has identical change
+   visibility as the donor read view
+@@ -350,6 +354,9 @@ class ReadView {
+   /** List of read views in trx_sys */
+   byte pad1[64 - sizeof(node_t)];
+   node_t m_view_list;
++
++  /** Version of the data used to build this view. */
++  ulint m_version;
+ };
+ 
+ #endif
+diff --git a/storage/innobase/include/trx0sys.h b/storage/innobase/include/trx0sys.h
+index 72293554c..ca7fdd409 100644
+--- a/storage/innobase/include/trx0sys.h
++++ b/storage/innobase/include/trx0sys.h
+@@ -555,6 +555,10 @@ struct trx_sys_t {
+   releasing locks to ensure right order of removal and consistent snapshot. */
+   trx_ids_t rw_trx_ids;
+ 
++  /** Version of the data used to build read views. It is updated whenever
++  rw_trx_ids changes and read without trx_sys->mutex during view reuse. */
++  std::atomic<ulint> readview_version;
++
+   char pad7[ut::INNODB_CACHE_LINE_SIZE];
+ 
+   /** Mapping from transaction id to transaction instance. */
+diff --git a/storage/innobase/read/read0read.cc b/storage/innobase/read/read0read.cc
+index ad2ee4e0a..30cd832cb 100644
+--- a/storage/innobase/read/read0read.cc
++++ b/storage/innobase/read/read0read.cc
+@@ -319,7 +319,8 @@ ReadView::ReadView()
+       m_creator_trx_id(),
+       m_ids(),
+       m_low_limit_no(),
+-      m_cloned(false) {
++      m_cloned(false),
++      m_version() {
+   ut_d(::memset(&m_view_list, 0x0, sizeof(m_view_list)));
+   ut_d(m_view_low_limit_no = 0);
+ }
+@@ -482,6 +483,8 @@ void ReadView::prepare(trx_id_t id) {
+ 
+   ut_a(m_up_limit_id <= m_low_limit_id);
+ 
++  m_version = trx_sys->readview_version.load(std::memory_order_relaxed);
++
+   ut_d(m_view_low_limit_no = m_low_limit_no);
+   m_closed = false;
+ }
+@@ -546,8 +549,8 @@ freed by calling view_close()
+ void MVCC::view_open(ReadView *&view, trx_t *trx) {
+   ut_ad(!srv_read_only_mode);
+ 
+-  /** If no new RW transaction has been started since the last view
+-  was created then reuse the the existing view. */
++  /** If the data used to build the previous view has not changed,
++  reuse the existing view. */
+   if (view != nullptr) {
+     uintptr_t p = reinterpret_cast<uintptr_t>(view);
+ 
+@@ -556,22 +559,28 @@ void MVCC::view_open(ReadView *&view, trx_t *trx) {
+     ut_ad(view->m_closed);
+ 
+     /* NOTE: This can be optimised further, for now we only
+-    reuse the view if there are no active RW transactions.
++    reuse the view if the source data used to build the view
++    has not changed.
+ 
+     There is an inherent race here between purge and this
+     thread. Purge will skip views that are marked as closed.
+-    Therefore we must set the low limit id after we reset the
+-    closed status after the check. */
++    Therefore we must reset the closed status before the
++    final check. */
+ 
+-    if (trx_is_autocommit_non_locking(trx) && view->empty()) {
++    if (view->version() ==
++        trx_sys->readview_version.load(std::memory_order_relaxed)) {
+       view->m_closed = false;
+ 
+-      if (view->m_low_limit_id == trx_sys_get_next_trx_id_or_no()) {
++      std::atomic_thread_fence(std::memory_order_seq_cst);
++      const ulint readview_version =
++          trx_sys->readview_version.load(std::memory_order_relaxed);
++
++      if (view->version() == readview_version) {
+         return;
+-      } else {
+-        view->m_closed = true;
+       }
+     }
++
++    view->m_closed = true;
+   }
+ 
+   trx_sys_mutex_enter();
+@@ -654,6 +663,8 @@ void ReadView::copy_prepare(const ReadView &other) {
+   m_low_limit_id = other.m_low_limit_id;
+ 
+   m_creator_trx_id = other.m_creator_trx_id;
++
++  m_version = other.m_version;
+ }
+ 
+ /**
+diff --git a/storage/innobase/trx/trx0sys.cc b/storage/innobase/trx/trx0sys.cc
+index 19d7d5e63..3e8cf0541 100644
+--- a/storage/innobase/trx/trx0sys.cc
++++ b/storage/innobase/trx/trx0sys.cc
+@@ -607,6 +607,7 @@ void trx_sys_create(void) {
+   trx_sys->mvcc = ut::new_withkey<MVCC>(UT_NEW_THIS_FILE_PSI_KEY, 1024);
+ 
+   trx_sys->serialisation_min_trx_no.store(0);
++  trx_sys->readview_version.store(0, std::memory_order_relaxed);
+ 
+   ut_d(trx_sys->rw_max_trx_no = 0);
+ 
+diff --git a/storage/innobase/trx/trx0trx.cc b/storage/innobase/trx/trx0trx.cc
+index 264e5ee91..e8843c4c2 100644
+--- a/storage/innobase/trx/trx0trx.cc
++++ b/storage/innobase/trx/trx0trx.cc
+@@ -1292,6 +1292,9 @@ void trx_assign_rseg_durable(trx_t *trx) {
+ static void trx_assign_id_for_rw(trx_t *trx) {
+   ut_ad(trx_sys_mutex_own());
+ 
++  trx_sys->readview_version.fetch_add(1, std::memory_order_relaxed);
++  std::atomic_thread_fence(std::memory_order_seq_cst);
++
+   trx->id =
+       trx->preallocated_id ? trx->preallocated_id : trx_sys_allocate_trx_id();
+ 
+@@ -1862,6 +1865,8 @@ static void trx_erase_lists(trx_t *trx) {
+                                             trx_sys->rw_trx_ids.end(), trx->id);
+ 
+   ut_ad(*it == trx->id);
++  trx_sys->readview_version.fetch_add(1, std::memory_order_relaxed);
++  std::atomic_thread_fence(std::memory_order_seq_cst);
+   trx_sys->rw_trx_ids.erase(it);
+ 
+   if (trx->read_only || trx->rsegs.m_redo.rseg == nullptr) {
+-- 
+2.34.1
+

@@ -1,0 +1,261 @@
+From c57ac98d4b870dc52ed5325d5c9bec97539e84a1 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Mon, 1 Sep 2025 11:20:29 +0800
+Subject: [PATCH] binlog order commit optimize generally
+
+---
+ sql/binlog.cc           | 54 ++++++++++++++++++++++++++++++++++++-----
+ sql/binlog.h            | 49 ++++++++++++++++++++++++++++++++-----
+ sql/transaction_info.cc |  1 +
+ sql/transaction_info.h  | 12 +++++++++
+ 4 files changed, 104 insertions(+), 12 deletions(-)
+
+diff --git a/sql/binlog.cc b/sql/binlog.cc
+index 0c576a404b7..ef129855193 100644
+--- a/sql/binlog.cc
++++ b/sql/binlog.cc
+@@ -2235,11 +2235,14 @@ Stage_manager::Mutex_queue::append(THD *first)
+     moderately short. If they are not, we need to track the end of
+     the queue as well.
+   */
++  assign_pending_lock(empty, first);
+ 
+   while (first->next_to_commit)
+   {
+     count++;
+     first= first->next_to_commit;
++    assert(first->get_transaction()->m_pending_commit_lock != NULL);
++    assert(first->get_transaction()->m_pending_commit_cond != NULL);
+   }
+   my_atomic_add32(&m_size, count);
+ 
+@@ -2350,7 +2353,18 @@ Stage_manager::enroll_for(StageID stage, THD *thd, mysql_mutex_t *stage_mutex)
+   */
+   if (!leader)
+   {
++    mysql_mutex_t *pending_lock = NULL;
++    mysql_cond_t *pending_cond = NULL;
++    pending_lock= thd->get_transaction()->m_pending_commit_lock;
++    pending_cond= thd->get_transaction()->m_pending_commit_cond;
++#ifndef NDEBUG
++    /* Protect leader_await_preempt_status. */
+     mysql_mutex_lock(&m_lock_done);
++#endif
++
++    assert(pending_lock != NULL);
++    assert(pending_cond != NULL);
++    mysql_mutex_lock(pending_lock);
+ #ifndef NDEBUG
+     /*
+       Leader can be awaiting all-clear to preempt follower's execution.
+@@ -2360,10 +2374,14 @@ Stage_manager::enroll_for(StageID stage, THD *thd, mysql_mutex_t *stage_mutex)
+     thd->get_transaction()->m_flags.ready_preempt= 1;
+     if (leader_await_preempt_status)
+       mysql_cond_signal(&m_cond_preempt);
++    mysql_mutex_unlock(&m_lock_done);
+ #endif
++
+     while (thd->get_transaction()->m_flags.pending)
+-      mysql_cond_wait(&m_cond_done, &m_lock_done);
+-    mysql_mutex_unlock(&m_lock_done);
++      mysql_cond_wait(pending_cond, pending_lock);
++    mysql_mutex_unlock(pending_lock);
++
++    thd->get_transaction()->reset_pending_commit_lock();
+   }
+   return leader;
+ }
+@@ -2417,11 +2435,35 @@ void Stage_manager::wait_count_or_timeout(ulong count, long usec, StageID stage)
+ 
+ void Stage_manager::signal_done(THD *queue)
+ {
+-  mysql_mutex_lock(&m_lock_done);
+-  for (THD *thd= queue ; thd ; thd = thd->next_to_commit)
++  std::set<mysql_cond_t *> conds;
++  std::set<mysql_cond_t *>::iterator it;
++  mysql_mutex_t *current_lock= NULL;
++
++/* Note: The leader in this queue is not assgined lock. */
++  assert(queue->get_transaction()->m_pending_commit_lock == current_lock);
++
++  for (THD *thd= queue ; thd ; thd= thd->next_to_commit) {
++    if (current_lock != thd->get_transaction()->m_pending_commit_lock) {
++      if (current_lock != NULL) {
++        mysql_mutex_unlock(current_lock);
++      }
++      current_lock = thd->get_transaction()->m_pending_commit_lock;
++      assert(thd->get_transaction()->m_pending_commit_cond != NULL);
++      conds.insert(thd->get_transaction()->m_pending_commit_cond);
++      assert(current_lock != NULL);
++      mysql_mutex_lock(current_lock);
++    }
++
+     thd->get_transaction()->m_flags.pending= false;
+-  mysql_mutex_unlock(&m_lock_done);
+-  mysql_cond_broadcast(&m_cond_done);
++  }
++
++  if (current_lock != NULL) {
++    mysql_mutex_unlock(current_lock);
++  }
++
++  for (it= conds.begin(); it != conds.end(); it++) {
++    mysql_cond_broadcast(*it);
++  }
+ }
+ 
+ #ifndef NDEBUG
+diff --git a/sql/binlog.h b/sql/binlog.h
+index 34f44aba9ca..57d40f2e600 100644
+--- a/sql/binlog.h
++++ b/sql/binlog.h
+@@ -61,6 +61,7 @@ public:
+   public:
+     Mutex_queue()
+       : m_first(NULL), m_last(&m_first), m_size(0)
++      , m_to_assign_lock(-1)
+     {
+     }
+ 
+@@ -70,10 +71,18 @@ public:
+ #endif
+               ) {
+       mysql_mutex_init(key_LOCK_queue, &m_lock, MY_MUTEX_INIT_FAST);
++      for(size_t i= 0; i < N_LOCKS_PER_COMMIT_QUEUE; i++) {
++        mysql_mutex_init(PSI_NOT_INSTRUMENTED, &m_pending_locks[i], MY_MUTEX_INIT_FAST);
++        mysql_cond_init(PSI_NOT_INSTRUMENTED, &m_pending_conds[i]);
++      }
+     }
+ 
+     void deinit() {
+       mysql_mutex_destroy(&m_lock);
++      for(size_t i= 0; i < N_LOCKS_PER_COMMIT_QUEUE; i++) {
++        mysql_mutex_destroy(&m_pending_locks[i]);
++        mysql_cond_destroy(&m_pending_conds[i]);
++      }
+     }
+ 
+     bool is_empty() const {
+@@ -105,6 +114,22 @@ public:
+     void lock() { mysql_mutex_lock(&m_lock); }
+     void unlock() { mysql_mutex_unlock(&m_lock); }
+ 
++    void assign_pending_lock(bool is_header, THD *first) {
++      Transaction_ctx *tx= first->get_transaction();
++      assert(tx->m_pending_commit_lock == NULL);
++      assert(tx->m_pending_commit_cond == NULL);
++      if (is_header) {
++        /* leader will reserve lock for followers. */
++        m_to_assign_lock++;
++        assert(m_to_assign_lock >= 0);
++        assert(m_to_assign_lock <= static_cast<int>(N_LOCKS_PER_COMMIT_QUEUE));
++        m_to_assign_lock= (m_to_assign_lock) % N_LOCKS_PER_COMMIT_QUEUE;
++      } else {
++        tx->m_pending_commit_lock= &m_pending_locks[m_to_assign_lock];
++        tx->m_pending_commit_cond= &m_pending_conds[m_to_assign_lock];
++      }
++    }
++
+     /**
+        Pointer to the first thread in the queue, or NULL if the queue is
+        empty.
+@@ -124,6 +149,14 @@ public:
+ 
+     /** Lock for protecting the queue. */
+     mysql_mutex_t m_lock;
++
++    int m_to_assign_lock;
++
++    const static size_t N_LOCKS_PER_COMMIT_QUEUE= 8;
++
++    mysql_mutex_t m_pending_locks[N_LOCKS_PER_COMMIT_QUEUE];
++
++    mysql_cond_t m_pending_conds[N_LOCKS_PER_COMMIT_QUEUE];
+     /*
+       This attribute did not have the desired effect, at least not according
+       to -fsanitize=undefined with gcc 5.2.1
+@@ -160,8 +193,10 @@ public:
+ #endif
+             )
+   {
++#if !defined(NDEBUG)
+     mysql_mutex_init(key_LOCK_done, &m_lock_done, MY_MUTEX_INIT_FAST);
+-    mysql_cond_init(key_COND_done, &m_cond_done);
++#endif
++
+ #ifndef NDEBUG
+     /* reuse key_COND_done 'cos a new PSI object would be wasteful in !NDEBUG */
+     mysql_cond_init(key_COND_done, &m_cond_preempt);
+@@ -187,8 +222,9 @@ public:
+   {
+     for (size_t i = 0 ; i < STAGE_COUNTER ; ++i)
+       m_queue[i].deinit();
+-    mysql_cond_destroy(&m_cond_done);
++#if !defined(NDEBUG)
+     mysql_mutex_destroy(&m_lock_done);
++#endif
+   }
+ 
+   /**
+@@ -269,11 +305,12 @@ private:
+    */
+   Mutex_queue m_queue[STAGE_COUNTER];
+ 
+-  /** Condition variable to indicate that the commit was processed */
+-  mysql_cond_t m_cond_done;
+-
+-  /** Mutex used for the condition variable above */
++#if !defined(NDEBUG)
++  /** In x86 platform, Mutex used for the condition variable above. In aarch
++  platform, Mutex used for leader_await_preempt_status.*/
+   mysql_mutex_t m_lock_done;
++#endif
++
+ #ifndef NDEBUG
+   /** Flag is set by Leader when it starts waiting for follower's all-clear */
+   bool leader_await_preempt_status;
+diff --git a/sql/transaction_info.cc b/sql/transaction_info.cc
+index 3136b8642ad..98268b0c2be 100644
+--- a/sql/transaction_info.cc
++++ b/sql/transaction_info.cc
+@@ -28,6 +28,7 @@
+ Transaction_ctx::Transaction_ctx()
+   : m_savepoints(NULL), m_xid_state(), m_changed_tables(NULL),
+     last_committed(0), sequence_number(0),
++    m_pending_commit_lock(NULL), m_pending_commit_cond(NULL),
+     m_rpl_transaction_ctx(), m_transaction_write_set_ctx()
+ {
+   memset(&m_scope_info, 0, sizeof(m_scope_info));
+diff --git a/sql/transaction_info.h b/sql/transaction_info.h
+index 1fe017a525d..774b358d0e5 100644
+--- a/sql/transaction_info.h
++++ b/sql/transaction_info.h
+@@ -393,6 +393,12 @@ public:
+   */
+   int64 sequence_number;
+ 
++  /** following lock and condition will assigned in binlog's order commit to
++  void "thundering herd" */
++  mysql_mutex_t *m_pending_commit_lock;
++
++  mysql_cond_t *m_pending_commit_cond;
++
+   void store_commit_parent(int64 last_arg)
+   {
+     last_committed= last_arg;
+@@ -593,6 +599,12 @@ public:
+     m_scope_info[scope].m_rw_ha_count= 0;
+   }
+ 
++  void reset_pending_commit_lock()
++  {
++    m_pending_commit_lock= NULL;
++    m_pending_commit_cond= NULL;
++  }
++
+ private:
+   CHANGED_TABLE_LIST* changed_table_dup(const char *key, long key_length);
+ 
+-- 
+2.27.0
+

@@ -1,0 +1,129 @@
+# SQL 执行端到端链路重点文件清单（精讲，用强模型出 mermaid + 说明）
+# 可自由增删。stage 为该文件在链路中的环节标签。
+files:
+  # ===== OmniAdaptor：桥接层（计划翻译/决策/JNI） =====
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/org/apache/flink/runtime/taskexecutor/TaskManagerRunner.java", stage: "入口-TM启动加载tnel"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/TNELLibrary.java", stage: "入口-加载native库"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/org/apache/flink/streaming/api/graph/StreamingJobGraphGenerator.java", stage: "入口-JobGraph hook"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/OmniGraphOverride.java", stage: "入口-下沉/回退核心hook"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/execution/OmniRuntimeEnvironment.java", stage: "入口-native执行环境"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/taskexecutor/OmniTaskExecutor.java", stage: "入口-TaskExecutor部署native任务"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/taskexecutor/OmniTaskManagerServices.java", stage: "入口-TM服务扩展"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/common/CommonExecCalc.java", stage: "翻译-Calc算子/表达式"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/common/CommonExecTableSourceScan.java", stage: "翻译-Source扫描"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/stream/StreamExecJoin.java", stage: "翻译-Join"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/stream/StreamExecGlobalGroupAggregate.java", stage: "翻译-全局聚合"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/common/CommonExecLookupJoin.java", stage: "翻译-LookupJoin"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/stream/StreamExecWindowJoin.java", stage: "翻译-窗口Join"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/util/RexNodeUtil.java", stage: "翻译-RexNode/表达式字典"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/omni-table-planner/src/main/java/org/apache/flink/table/planner/plan/nodes/exec/util/DescriptionUtil.java", stage: "翻译-native算子描述工具"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/StreamNodeOptimized.java", stage: "翻译-装配native task JSON"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/api/graph/json/operatorchain/OperatorChainDescriptorHelper.java", stage: "翻译-算子链描述符"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/api/graph/json/JsonHelper.java", stage: "翻译-native计划JSON互转"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/validate/strategy/ValidateOperatorStrategyFactory.java", stage: "决策-策略工厂"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/validate/strategy/AbstractValidateOperatorStrategy.java", stage: "决策-基类/类型映射"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/validate/strategy/ValidateCalcOPStrategy.java", stage: "决策-Calc下沉"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/validate/strategy/ValidateAggOPStrategy.java", stage: "决策-聚合下沉"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/streaming/api/graph/validate/strategy/ValidateJoinOPStrategy.java", stage: "决策-Join下沉"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/tasks/OmniStreamTask.java", stage: "JNI-native StreamTask总枢纽"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/tasks/OmniOneInputStreamTaskV2.java", stage: "JNI-单输入任务"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/tasks/OmniTwoInputStreamTaskV2.java", stage: "JNI-双输入任务"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/runtime/tasks/OmniSourceStreamTaskV2.java", stage: "JNI-Source任务"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/org/apache/flink/streaming/runtime/tasks/OmniOperatorChain.java", stage: "JNI-算子链装配"}
+  - {project: OmniAdaptor, path: "omnistream/omniop-flink-extension/java/src/main/java/com/huawei/omniruntime/flink/client/NativeMain.java", stage: "JNI-UDF翻译入口"}
+  - {project: OmniAdaptor, path: "omnihelper/flink/operator/op_parse.py", stage: "工具-算子计划解析"}
+  - {project: OmniAdaptor, path: "omnihelper/flink_log_parser.py", stage: "工具-日志解析"}
+
+  # ===== OmniStream：Flink native 运行时 =====
+  - {project: OmniStream, path: "cpp/jni/init.cpp", stage: "JNI-库初始化"}
+  - {project: OmniStream, path: "cpp/jni/taskmanager/jni_OmniTask.cpp", stage: "JNI-OmniTask桥"}
+  - {project: OmniStream, path: "cpp/jni/tasks/jni_OmniStreamTask.cpp", stage: "JNI-createNativeStreamTask"}
+  - {project: OmniStream, path: "cpp/jni/bridge/OmniTaskBridgeImpl2.cpp", stage: "JNI-回调反向桥"}
+  - {project: OmniStream, path: "cpp/jni/io/jni_OmniStreamTaskNetworkInput.cpp", stage: "JNI-网络输入桥"}
+  - {project: OmniStream, path: "cpp/jni/taskexecutor/jni_OmniTaskExecutor.cpp", stage: "JNI-TaskExecutor桥"}
+  - {project: OmniStream, path: "cpp/runtime/executiongraph/descriptor/TaskDeploymentDescriptorPOD.cpp", stage: "translate-TDD反序列化"}
+  - {project: OmniStream, path: "cpp/runtime/executiongraph/StreamConfigPOD.cpp", stage: "translate-StreamConfig反序列化"}
+  - {project: OmniStream, path: "cpp/runtime/executiongraph/operatorchain/OperatorPOD.h", stage: "translate-算子POD"}
+  - {project: OmniStream, path: "cpp/runtime/executiongraph/operatorchain/OperatorChainPOD.h", stage: "translate-算子链POD"}
+  - {project: OmniStream, path: "cpp/streaming/api/operators/StreamOperatorFactory.cpp", stage: "translate-算子工厂核心翻译器"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/OperatorChain.cpp", stage: "translate-运行时算子链"}
+  - {project: OmniStream, path: "cpp/runtime/taskmanager/OmniTask.cpp", stage: "runtime-Task生命周期"}
+  - {project: OmniStream, path: "cpp/runtime/taskmanager/OmniRuntimeEnvironment.cpp", stage: "runtime-运行时环境装配"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/StreamTask.cpp", stage: "runtime-StreamTask基类"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/omni/OmniStreamTask.cpp", stage: "runtime-native StreamTask"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/omni/OmniOneInputStreamTask.cpp", stage: "runtime-单输入StreamTask"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/omni/OmniTwoInputStreamTask.cpp", stage: "runtime-双输入StreamTask"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/mailbox/MailboxProcessor.cpp", stage: "runtime-mailbox事件循环"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/tasks/mailbox/MailboxExecutorImpl.cpp", stage: "runtime-mailbox执行器"}
+  - {project: OmniStream, path: "cpp/runtime/buffer/LocalBufferPool.cpp", stage: "core-本地缓冲池"}
+  - {project: OmniStream, path: "cpp/runtime/io/network/OmniShuffleEnvironment.cpp", stage: "core-Shuffle环境"}
+  - {project: OmniStream, path: "cpp/runtime/io/network/api/writer/RecordWriter.cpp", stage: "core-结果分区写入"}
+  - {project: OmniStream, path: "cpp/runtime/io/network/netty/OmniCreditBasedSequenceNumberingViewReader.cpp", stage: "core-Netty credit流控"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/io/OmniStreamOneInputProcessor.cpp", stage: "core-单输入处理器"}
+  - {project: OmniStream, path: "cpp/streaming/runtime/io/StreamTaskNetworkInput.cpp", stage: "core-网络输入解码"}
+  - {project: OmniStream, path: "cpp/core/memory/MemorySegment.cpp", stage: "core-内存段"}
+  - {project: OmniStream, path: "cpp/streaming/api/operators/AbstractStreamOperator.h", stage: "operator-流算子基类"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/TableStreamOperator.cpp", stage: "operator-表算子基类"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/aggregate/GroupAggFunction.cpp", stage: "operator-SQL聚合"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/window/SlicingWindowOperator.h", stage: "operator-切片窗口"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/window/processor/AbstractWindowAggProcessor.cpp", stage: "operator-窗口聚合处理器"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/window/AggregateWindowOperator.cpp", stage: "operator-窗口聚合算子"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/join/StreamingJoinOperator.cpp", stage: "operator-流式Join"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/join/window/InnerJoinOperator.cpp", stage: "operator-窗口Join"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/rank/AppendOnlyTopNFunction.cpp", stage: "operator-TopN"}
+  - {project: OmniStream, path: "cpp/table/runtime/operators/deduplicate/RowTimeDeduplicateFunction.cpp", stage: "operator-去重"}
+  - {project: OmniStream, path: "cpp/streaming/api/operators/StreamCalc.cpp", stage: "operator-Calc算子"}
+  - {project: OmniStream, path: "cpp/connector/kafka/source/KafkaSource.cpp", stage: "connector-Kafka Source"}
+  - {project: OmniStream, path: "cpp/connector/kafka/source/reader/KafkaSourceReader.cpp", stage: "connector-Kafka Reader"}
+
+  # ===== OmniOperator：native 算子/表达式 =====
+  - {project: OmniOperator, path: "core/src/operator/operator.h", stage: "operator-算子基类"}
+  - {project: OmniOperator, path: "core/src/operator/operator_factory.h", stage: "operator-算子工厂"}
+  - {project: OmniOperator, path: "core/src/operator/execution_context.h", stage: "operator-执行上下文"}
+  - {project: OmniOperator, path: "core/src/operator/filter/filter_and_project.cpp", stage: "operator-Filter/Project"}
+  - {project: OmniOperator, path: "core/src/operator/projection/projection.cpp", stage: "operator-Projection"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/aggregation.h", stage: "operator-聚合基类"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/group_aggregation.cpp", stage: "operator-Hash聚合"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/group_aggregation_expr.cpp", stage: "operator-聚合表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/non_group_aggregation.cpp", stage: "operator-无group聚合"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/aggregator/aggregator.h", stage: "operator-Aggregator接口"}
+  - {project: OmniOperator, path: "core/src/operator/aggregation/aggregator/aggregator_factory.cpp", stage: "operator-Aggregator工厂"}
+  - {project: OmniOperator, path: "core/src/operator/sort/sort.cpp", stage: "operator-Sort"}
+  - {project: OmniOperator, path: "core/src/operator/sort/sort_expr.cpp", stage: "operator-Sort表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/topn/topn.cpp", stage: "operator-TopN"}
+  - {project: OmniOperator, path: "core/src/operator/topn/topn_expr.cpp", stage: "operator-TopN表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/window/window.cpp", stage: "operator-Window"}
+  - {project: OmniOperator, path: "core/src/operator/window/window_expr.cpp", stage: "operator-Window表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/window/window_function.cpp", stage: "operator-窗口函数"}
+  - {project: OmniOperator, path: "core/src/operator/join/hash_builder.cpp", stage: "operator-HashJoin build"}
+  - {project: OmniOperator, path: "core/src/operator/join/hash_builder_expr.cpp", stage: "operator-HashBuilder表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/join/lookup_join.cpp", stage: "operator-LookupJoin probe"}
+  - {project: OmniOperator, path: "core/src/operator/join/lookup_join_expr.cpp", stage: "operator-LookupJoin表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/join/sortmergejoin/sort_merge_join_v3.cpp", stage: "operator-SortMergeJoin"}
+  - {project: OmniOperator, path: "core/src/operator/join/sortmergejoin/sort_merge_join_expr_v3.cpp", stage: "operator-SMJ表达式入口"}
+  - {project: OmniOperator, path: "core/src/operator/hashmap/base_hash_map.h", stage: "operator-哈希表基类"}
+  - {project: OmniOperator, path: "core/src/operator/hashmap/vector_marshaller.cpp", stage: "operator-列行互转"}
+  - {project: OmniOperator, path: "core/src/operator/hashmap/row_container.cpp", stage: "operator-行容器"}
+  - {project: OmniOperator, path: "core/src/operator/tablescan/TableScan.cpp", stage: "operator-TableScan"}
+  - {project: OmniOperator, path: "core/src/operator/pages_index.cpp", stage: "operator-PagesIndex行式存储"}
+  - {project: OmniOperator, path: "core/src/expression/expressions.h", stage: "expression-表达式树节点"}
+  - {project: OmniOperator, path: "core/src/expression/expr_visitor.h", stage: "expression-访问者基类"}
+  - {project: OmniOperator, path: "core/src/vectorization/ExprEval.cpp", stage: "vectorization-向量化求值入口"}
+  - {project: OmniOperator, path: "core/src/vectorization/VectorFunction.h", stage: "vectorization-VectorFunction注册表"}
+  - {project: OmniOperator, path: "core/src/vectorization/SimpleFunction.h", stage: "vectorization-SimpleFunction模板"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/Register.cpp", stage: "vectorization-注册总入口"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/RegisterMath.cpp", stage: "vectorization-数学函数注册"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/RegisterString.cpp", stage: "vectorization-字符串函数注册"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/RegisterDateTime.cpp", stage: "vectorization-日期时间注册"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/RegisterComparison.cpp", stage: "vectorization-比较函数注册"}
+  - {project: OmniOperator, path: "core/src/vectorization/registration/RegisterArray.cpp", stage: "vectorization-数组函数注册"}
+  - {project: OmniOperator, path: "core/src/vector/vector.h", stage: "vector-OmniVec基类"}
+  - {project: OmniOperator, path: "core/src/vector/vector_batch.cpp", stage: "vector-VectorBatch"}
+  - {project: OmniOperator, path: "core/src/vector/vector_helper.cpp", stage: "vector-向量工具"}
+  - {project: OmniOperator, path: "core/src/vector/decoded_vector.h", stage: "vector-解码器"}
+  - {project: OmniOperator, path: "core/src/vector/selectivity_vector.h", stage: "vector-行选择位图"}
+  - {project: OmniOperator, path: "core/src/compute/driver.cpp", stage: "compute-算子链驱动"}
+  - {project: OmniOperator, path: "core/src/compute/local_planner.cpp", stage: "compute-planNode→Operator装配"}
+  - {project: OmniOperator, path: "core/src/compute/task.cpp", stage: "compute-任务调度单元"}
+  - {project: OmniOperator, path: "core/src/codegen/llvm_engine.cpp", stage: "codegen-LLVM JIT引擎"}
+  - {project: OmniOperator, path: "core/src/codegen/expr_evaluator.cpp", stage: "codegen-row JIT表达式"}

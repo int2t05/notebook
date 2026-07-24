@@ -1,0 +1,4 @@
+interface:
+  display_name: "Environment Deploy for Codex"
+  short_description: "Automate Codex Linux environment deployment"
+  default_prompt: "Use $env-deploy-for-codex to detect this project, plan or apply its Linux environment deployment, run applicable tests, and generate deployment artifacts."

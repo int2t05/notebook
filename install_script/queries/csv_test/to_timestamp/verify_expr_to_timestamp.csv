@@ -1,0 +1,13 @@
+r01,2021-01-01 00:00:00,null,null
+r02,1994-09-27 15:30:45,null,null
+r03,2020-02-29 12:34:56,null,null
+r04,2024-12-31 23:59:59,null,null
+r05,2024-06-15 08:30:00,null,null
+r06,null,2024-06-15,yyyy-MM-dd
+r07,null,2020-02-29 12:34:56.789,yyyy-MM-dd HH:mm:ss.SSS
+r08,null,1994-09-27,yyyy-MM-dd
+r09,null,not-a-date,yyyy-MM-dd
+r10,null,2021-13-01 00:00:00,yyyy-MM-dd HH:mm:ss
+r11,null,null,null
+r12,2024-01-01 00:00:00,null,null
+r13,null,2024-06-15 08:30:00,yyyy-MM-dd HH:mm:ss

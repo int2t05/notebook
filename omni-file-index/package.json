@@ -1,0 +1,22 @@
+{
+  "name": "omni-file-index",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "pipeline",
+    "web"
+  ],
+  "scripts": {
+    "scan": "tsx pipeline/src/scan.ts",
+    "extract": "tsx pipeline/src/extract.ts",
+    "build-data": "tsx pipeline/src/build-data.ts",
+    "build:web": "npm -C web run build",
+    "dev:web": "npm -C web run dev",
+    "serve": "tsx pipeline/src/server.ts",
+    "build": "npm run scan && npm run extract && npm run build-data && npm run build:web"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

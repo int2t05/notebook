@@ -1,0 +1,12 @@
+o01,xxxxxtest,xxxx,6,2
+o02,abcdef,XY,1,2
+o03,abcdef,XY,3,2
+o04,abcdef,XYZW,5,2
+o05,hello,***,2,3
+o06,你好世界,XX,2,1
+o07,abcdef,XY,6,1
+o08,abcdef,XYZW,3,4
+o09,null,XY,1,1
+o10,abcdef,null,1,1
+o11,abcdef,XY,null,1
+o12,abcdef,XY,1,null

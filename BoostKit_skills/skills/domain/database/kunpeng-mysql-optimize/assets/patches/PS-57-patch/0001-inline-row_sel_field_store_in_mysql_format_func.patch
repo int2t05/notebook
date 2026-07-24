@@ -1,0 +1,531 @@
+From de4846d17457fbc82c53ef61b290593a6573e632 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Tue, 22 Jul 2025 11:14:56 +0800
+Subject: [PATCH]   inline row_sel_field_store_in_mysql_format_func
+
+---
+ storage/innobase/include/row0sel.h  |  37 -----
+ storage/innobase/include/row0sel.ic | 224 +++++++++++++++++++++++++++
+ storage/innobase/row/row0sel.cc     | 225 ----------------------------
+ 3 files changed, 224 insertions(+), 262 deletions(-)
+
+diff --git a/storage/innobase/include/row0sel.h b/storage/innobase/include/row0sel.h
+index 3e16f013ff6..783e0ab4ced 100644
+--- a/storage/innobase/include/row0sel.h
++++ b/storage/innobase/include/row0sel.h
+@@ -505,43 +505,6 @@ enum row_sel_match_mode {
+ 	row_sel_field_store_in_mysql_format_func(dest,templ,src,len,prebuilt)
+ #endif /* UNIV_DEBUG */
+ 
+-/** Stores a non-SQL-NULL field in the MySQL format. The counterpart of this
+-function is row_mysql_store_col_in_innobase_format() in row0mysql.cc.
+-@param[in,out]	dest		buffer where to store; NOTE
+-				that BLOBs are not in themselves stored
+-				here: the caller must allocate and copy
+-				the BLOB into buffer before, and pass
+-				the pointer to the BLOB in 'data'
+-@param[in]	templ		MySQL column template. Its following fields
+-				are referenced: type, is_unsigned, mysql_col_len,
+-				mbminlen, mbmaxlen
+-@param[in]	index		InnoDB index
+-@param[in]	field_no	templ->rec_field_no or templ->clust_rec_field_no
+-				or templ->icp_rec_field_no
+-@param[in]	data		data to store
+-@param[in]	len		length of the data
+-@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+-                        and compress_heap (used for compression)
+-@param[in]	sec_field	secondary index field no if the secondary index
+-				record but the prebuilt template is in
+-				clustered index format and used only for end
+-				range comparison. */
+-void
+-row_sel_field_store_in_mysql_format_func(
+-	byte*				dest,
+-	const mysql_row_templ_t*	templ,
+-#ifdef UNIV_DEBUG
+-	const dict_index_t*		index,
+-	ulint				field_no,
+-#endif /* UNIV_DEBUG */
+-	const byte*			data,
+-	ulint				len,
+-	row_prebuilt_t*			prebuilt
+-#ifdef UNIV_DEBUG
+-	,ulint				sec_field
+-#endif /* UNIV_DEBUG */
+-	);
+-
+ #ifndef UNIV_NONINL
+ #include "row0sel.ic"
+ #endif
+diff --git a/storage/innobase/include/row0sel.ic b/storage/innobase/include/row0sel.ic
+index 61b19565ee4..77b6ab078bc 100644
+--- a/storage/innobase/include/row0sel.ic
++++ b/storage/innobase/include/row0sel.ic
+@@ -151,3 +151,227 @@ row_search_for_mysql(
+ 	}
+ }
+ 
++/** Stores a non-SQL-NULL field in the MySQL format. The counterpart of this
++function is row_mysql_store_col_in_innobase_format() in row0mysql.cc.
++@param[in,out]	dest		buffer where to store; NOTE
++				that BLOBs are not in themselves stored
++				here: the caller must allocate and copy
++				the BLOB into buffer before, and pass
++				the pointer to the BLOB in 'data'
++@param[in]	templ		MySQL column template. Its following fields
++				are referenced: type, is_unsigned, mysql_col_len,
++				mbminlen, mbmaxlen
++@param[in]	index		InnoDB index
++@param[in]	field_no	templ->rec_field_no or templ->clust_rec_field_no
++				or templ->icp_rec_field_no
++@param[in]	data		data to store
++@param[in]	len		length of the data
++@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
++                        and compress_heap (used for compression)
++@param[in]	sec_field	secondary index field no if the secondary index
++				record but the prebuilt template is in
++				clustered index format and used only for end
++				range comparison. */
++MY_ATTRIBUTE((always_inline)) inline void
++row_sel_field_store_in_mysql_format_func(
++	byte*				dest,
++	const mysql_row_templ_t*	templ,
++#ifdef UNIV_DEBUG
++	const dict_index_t*		index,
++	ulint				field_no,
++#endif /* UNIV_DEBUG */
++	const byte*			data,
++	ulint				len,
++	row_prebuilt_t*			prebuilt
++#ifdef UNIV_DEBUG
++	,ulint				sec_field
++#endif /* UNIV_DEBUG */
++)
++{
++	byte*			ptr;
++#ifdef UNIV_DEBUG
++	const dict_field_t*	field
++		= templ->is_virtual
++			 ? NULL : dict_index_get_nth_field(index, field_no);
++	bool	clust_templ_for_sec = (sec_field != ULINT_UNDEFINED);
++#endif /* UNIV_DEBUG */
++
++	ut_ad(len != UNIV_SQL_NULL);
++	UNIV_MEM_ASSERT_RW(data, len);
++	UNIV_MEM_ASSERT_W(dest, templ->mysql_col_len);
++	UNIV_MEM_INVALID(dest, templ->mysql_col_len);
++
++	switch (templ->type) {
++		const byte*	field_end;
++		byte*		pad;
++	case DATA_INT:
++		/* Convert integer data from Innobase to a little-endian
++		format, sign bit restored to normal */
++
++		ptr = dest + len;
++
++		for (;;) {
++			ptr--;
++			*ptr = *data;
++			if (ptr == dest) {
++				break;
++			}
++			data++;
++		}
++
++		if (!templ->is_unsigned) {
++			dest[len - 1] = (byte) (dest[len - 1] ^ 128);
++		}
++
++		ut_ad(templ->mysql_col_len == len);
++		break;
++
++	case DATA_VARCHAR:
++	case DATA_VARMYSQL:
++	case DATA_BINARY:
++		field_end = dest + templ->mysql_col_len;
++
++		if (templ->mysql_type == DATA_MYSQL_TRUE_VARCHAR) {
++			/* If this is a compressed column,
++			decompress it first */
++			if (templ->compressed)
++				data = row_decompress_column(data, &len,
++					reinterpret_cast<const byte*>(
++						templ->zip_dict_data.str),
++					templ->zip_dict_data.length,
++					prebuilt);
++
++			/* This is a >= 5.0.3 type true VARCHAR. Store the
++			length of the data to the first byte or the first
++			two bytes of dest. */
++
++			dest = row_mysql_store_true_var_len(
++				dest, len, templ->mysql_length_bytes);
++			/* Copy the actual data. Leave the rest of the
++			buffer uninitialized. */
++			memcpy(dest, data, len);
++			break;
++		}
++
++		/* Copy the actual data */
++		ut_memcpy(dest, data, len);
++
++		/* Pad with trailing spaces. */
++
++		pad = dest + len;
++
++		ut_ad(templ->mbminlen <= templ->mbmaxlen);
++
++		/* We treat some Unicode charset strings specially. */
++		switch (templ->mbminlen) {
++		case 4:
++			/* InnoDB should never have stripped partial
++			UTF-32 characters. */
++			ut_a(!(len & 3));
++			break;
++		case 2:
++			/* A space char is two bytes,
++			0x0020 in UCS2 and UTF-16 */
++
++			if (UNIV_UNLIKELY(len & 1)) {
++				/* A 0x20 has been stripped from the column.
++				Pad it back. */
++
++				if (pad < field_end) {
++					*pad++ = 0x20;
++				}
++			}
++		}
++
++		row_mysql_pad_col(templ->mbminlen, pad, field_end - pad);
++		break;
++
++	case DATA_BLOB:
++		/* Store a pointer to the BLOB buffer to dest: the BLOB was
++		already copied to the buffer in row_sel_store_mysql_rec */
++
++		row_mysql_store_blob_ref(dest, templ->mysql_col_len, data,
++					len, templ->compressed,
++					reinterpret_cast<const byte*>(
++						templ->zip_dict_data.str),
++					templ->zip_dict_data.length,
++					prebuilt);
++		break;
++
++	case DATA_POINT:
++	case DATA_VAR_POINT:
++	case DATA_GEOMETRY:
++		/* We store all geometry data as BLOB data at server layer. */
++		row_mysql_store_geometry(dest, templ->mysql_col_len, data, len);
++		break;
++
++	case DATA_MYSQL:
++		memcpy(dest, data, len);
++
++		ut_ad(templ->mysql_col_len >= len);
++		ut_ad(templ->mbmaxlen >= templ->mbminlen);
++
++		/* If field_no equals to templ->icp_rec_field_no,
++		we are examining a row pointed by "icp_rec_field_no".
++		There is possibility that icp_rec_field_no refers to
++		a field in a secondary index while templ->rec_field_no
++		points to field in a primary index. The length
++		should still be equal, unless the field pointed
++		by icp_rec_field_no has a prefix */
++		ut_ad(templ->mbmaxlen > templ->mbminlen
++		      || templ->mysql_col_len == len
++		      || (field_no == templ->icp_rec_field_no
++			  && field->prefix_len > 0));
++
++		/* The following assertion would fail for old tables
++		containing UTF-8 ENUM columns due to Bug #9526. */
++		ut_ad(!templ->mbmaxlen
++		      || !(templ->mysql_col_len % templ->mbmaxlen));
++		/* Length of the record will be less in case of
++		clust_templ_for_sec is true or if it is fetched
++		from prefix virtual column in virtual index. */
++		ut_ad(templ->is_virtual
++		      || clust_templ_for_sec
++		      || len * templ->mbmaxlen >= templ->mysql_col_len
++		      || (field_no == templ->icp_rec_field_no
++			  && field->prefix_len > 0)
++		      || templ->rec_field_is_prefix);
++		ut_ad(templ->is_virtual
++		      || !(field->prefix_len % templ->mbmaxlen));
++
++		if (templ->mbminlen == 1 && templ->mbmaxlen != 1) {
++			/* Pad with spaces. This undoes the stripping
++			done in row0mysql.cc, function
++			row_mysql_store_col_in_innobase_format(). */
++
++			memset(dest + len, 0x20, templ->mysql_col_len - len);
++		}
++		break;
++
++	default:
++#ifdef UNIV_DEBUG
++	case DATA_SYS_CHILD:
++	case DATA_SYS:
++		/* These column types should never be shipped to MySQL. */
++		ut_ad(0);
++
++	case DATA_CHAR:
++	case DATA_FIXBINARY:
++	case DATA_FLOAT:
++	case DATA_DOUBLE:
++	case DATA_DECIMAL:
++		/* Above are the valid column types for MySQL data. */
++#endif /* UNIV_DEBUG */
++
++		/* If sec_field value is present then mapping of
++		secondary index records to clustered index template
++		happens for end range comparison. So length can
++		vary according to secondary index record length. */
++		ut_ad((templ->is_virtual && !field)
++		      || (field && field->prefix_len
++				? field->prefix_len == len
++				: clust_templ_for_sec ?
++					1 : templ->mysql_col_len == len));
++		memcpy(dest, data, len);
++	}
++}
+\ No newline at end of file
+diff --git a/storage/innobase/row/row0sel.cc b/storage/innobase/row/row0sel.cc
+index b07d62fd2e1..91e2ce57f15 100644
+--- a/storage/innobase/row/row0sel.cc
++++ b/storage/innobase/row/row0sel.cc
+@@ -2853,231 +2853,6 @@ row_sel_store_row_id_to_prebuilt(
+ 	ut_memcpy(prebuilt->row_id, data, len);
+ }
+ 
+-/** Stores a non-SQL-NULL field in the MySQL format. The counterpart of this
+-function is row_mysql_store_col_in_innobase_format() in row0mysql.cc.
+-@param[in,out]	dest		buffer where to store; NOTE
+-				that BLOBs are not in themselves stored
+-				here: the caller must allocate and copy
+-				the BLOB into buffer before, and pass
+-				the pointer to the BLOB in 'data'
+-@param[in]	templ		MySQL column template. Its following fields
+-				are referenced: type, is_unsigned, mysql_col_len,
+-				mbminlen, mbmaxlen
+-@param[in]	index		InnoDB index
+-@param[in]	field_no	templ->rec_field_no or templ->clust_rec_field_no
+-				or templ->icp_rec_field_no
+-@param[in]	data		data to store
+-@param[in]	len		length of the data
+-@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+-                        and compress_heap (used for compression)
+-@param[in]	sec_field	secondary index field no if the secondary index
+-				record but the prebuilt template is in
+-				clustered index format and used only for end
+-				range comparison. */
+-void
+-row_sel_field_store_in_mysql_format_func(
+-	byte*				dest,
+-	const mysql_row_templ_t*	templ,
+-#ifdef UNIV_DEBUG
+-	const dict_index_t*		index,
+-	ulint				field_no,
+-#endif /* UNIV_DEBUG */
+-	const byte*			data,
+-	ulint				len,
+-	row_prebuilt_t*			prebuilt
+-#ifdef UNIV_DEBUG
+-	,ulint				sec_field
+-#endif /* UNIV_DEBUG */
+-	)
+-{
+-	byte*			ptr;
+-#ifdef UNIV_DEBUG
+-	const dict_field_t*	field
+-		= templ->is_virtual
+-			 ? NULL : dict_index_get_nth_field(index, field_no);
+-	bool	clust_templ_for_sec = (sec_field != ULINT_UNDEFINED);
+-#endif /* UNIV_DEBUG */
+-
+-	ut_ad(len != UNIV_SQL_NULL);
+-	UNIV_MEM_ASSERT_RW(data, len);
+-	UNIV_MEM_ASSERT_W(dest, templ->mysql_col_len);
+-	UNIV_MEM_INVALID(dest, templ->mysql_col_len);
+-
+-	switch (templ->type) {
+-		const byte*	field_end;
+-		byte*		pad;
+-	case DATA_INT:
+-		/* Convert integer data from Innobase to a little-endian
+-		format, sign bit restored to normal */
+-
+-		ptr = dest + len;
+-
+-		for (;;) {
+-			ptr--;
+-			*ptr = *data;
+-			if (ptr == dest) {
+-				break;
+-			}
+-			data++;
+-		}
+-
+-		if (!templ->is_unsigned) {
+-			dest[len - 1] = (byte) (dest[len - 1] ^ 128);
+-		}
+-
+-		ut_ad(templ->mysql_col_len == len);
+-		break;
+-
+-	case DATA_VARCHAR:
+-	case DATA_VARMYSQL:
+-	case DATA_BINARY:
+-		field_end = dest + templ->mysql_col_len;
+-
+-		if (templ->mysql_type == DATA_MYSQL_TRUE_VARCHAR) {
+-			/* If this is a compressed column,
+-			decompress it first */
+-			if (templ->compressed)
+-				data = row_decompress_column(data, &len,
+-					reinterpret_cast<const byte*>(
+-						templ->zip_dict_data.str),
+-					templ->zip_dict_data.length,
+-					prebuilt);
+-
+-			/* This is a >= 5.0.3 type true VARCHAR. Store the
+-			length of the data to the first byte or the first
+-			two bytes of dest. */
+-
+-			dest = row_mysql_store_true_var_len(
+-				dest, len, templ->mysql_length_bytes);
+-			/* Copy the actual data. Leave the rest of the
+-			buffer uninitialized. */
+-			memcpy(dest, data, len);
+-			break;
+-		}
+-
+-		/* Copy the actual data */
+-		ut_memcpy(dest, data, len);
+-
+-		/* Pad with trailing spaces. */
+-
+-		pad = dest + len;
+-
+-		ut_ad(templ->mbminlen <= templ->mbmaxlen);
+-
+-		/* We treat some Unicode charset strings specially. */
+-		switch (templ->mbminlen) {
+-		case 4:
+-			/* InnoDB should never have stripped partial
+-			UTF-32 characters. */
+-			ut_a(!(len & 3));
+-			break;
+-		case 2:
+-			/* A space char is two bytes,
+-			0x0020 in UCS2 and UTF-16 */
+-
+-			if (UNIV_UNLIKELY(len & 1)) {
+-				/* A 0x20 has been stripped from the column.
+-				Pad it back. */
+-
+-				if (pad < field_end) {
+-					*pad++ = 0x20;
+-				}
+-			}
+-		}
+-
+-		row_mysql_pad_col(templ->mbminlen, pad, field_end - pad);
+-		break;
+-
+-	case DATA_BLOB:
+-		/* Store a pointer to the BLOB buffer to dest: the BLOB was
+-		already copied to the buffer in row_sel_store_mysql_rec */
+-
+-		row_mysql_store_blob_ref(dest, templ->mysql_col_len, data,
+-					len, templ->compressed,
+-					reinterpret_cast<const byte*>(
+-						templ->zip_dict_data.str),
+-					templ->zip_dict_data.length,
+-					prebuilt);
+-		break;
+-
+-	case DATA_POINT:
+-	case DATA_VAR_POINT:
+-	case DATA_GEOMETRY:
+-		/* We store all geometry data as BLOB data at server layer. */
+-		row_mysql_store_geometry(dest, templ->mysql_col_len, data, len);
+-		break;
+-
+-	case DATA_MYSQL:
+-		memcpy(dest, data, len);
+-
+-		ut_ad(templ->mysql_col_len >= len);
+-		ut_ad(templ->mbmaxlen >= templ->mbminlen);
+-
+-		/* If field_no equals to templ->icp_rec_field_no,
+-		we are examining a row pointed by "icp_rec_field_no".
+-		There is possibility that icp_rec_field_no refers to
+-		a field in a secondary index while templ->rec_field_no
+-		points to field in a primary index. The length
+-		should still be equal, unless the field pointed
+-		by icp_rec_field_no has a prefix */
+-		ut_ad(templ->mbmaxlen > templ->mbminlen
+-		      || templ->mysql_col_len == len
+-		      || (field_no == templ->icp_rec_field_no
+-			  && field->prefix_len > 0));
+-
+-		/* The following assertion would fail for old tables
+-		containing UTF-8 ENUM columns due to Bug #9526. */
+-		ut_ad(!templ->mbmaxlen
+-		      || !(templ->mysql_col_len % templ->mbmaxlen));
+-		/* Length of the record will be less in case of
+-		clust_templ_for_sec is true or if it is fetched
+-		from prefix virtual column in virtual index. */
+-		ut_ad(templ->is_virtual
+-		      || clust_templ_for_sec
+-		      || len * templ->mbmaxlen >= templ->mysql_col_len
+-		      || (field_no == templ->icp_rec_field_no
+-			  && field->prefix_len > 0)
+-		      || templ->rec_field_is_prefix);
+-		ut_ad(templ->is_virtual
+-		      || !(field->prefix_len % templ->mbmaxlen));
+-
+-		if (templ->mbminlen == 1 && templ->mbmaxlen != 1) {
+-			/* Pad with spaces. This undoes the stripping
+-			done in row0mysql.cc, function
+-			row_mysql_store_col_in_innobase_format(). */
+-
+-			memset(dest + len, 0x20, templ->mysql_col_len - len);
+-		}
+-		break;
+-
+-	default:
+-#ifdef UNIV_DEBUG
+-	case DATA_SYS_CHILD:
+-	case DATA_SYS:
+-		/* These column types should never be shipped to MySQL. */
+-		ut_ad(0);
+-
+-	case DATA_CHAR:
+-	case DATA_FIXBINARY:
+-	case DATA_FLOAT:
+-	case DATA_DOUBLE:
+-	case DATA_DECIMAL:
+-		/* Above are the valid column types for MySQL data. */
+-#endif /* UNIV_DEBUG */
+-
+-		/* If sec_field value is present then mapping of
+-		secondary index records to clustered index template
+-		happens for end range comparison. So length can
+-		vary according to secondary index record length. */
+-		ut_ad((templ->is_virtual && !field)
+-		      || (field && field->prefix_len
+-				? field->prefix_len == len
+-				: clust_templ_for_sec ?
+-					1 : templ->mysql_col_len == len));
+-		memcpy(dest, data, len);
+-	}
+-}
+-
+ #ifdef UNIV_DEBUG
+ /** Convert a field from Innobase format to MySQL format. */
+ # define row_sel_store_mysql_field(m,p,r,i,o,f,t,s) \
+-- 
+2.27.0
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kunpeng MySQL Optimization"
+  short_description: "Recommend Kunpeng MySQL patches from perf hotspots"
+  default_prompt: "Use $kunpeng-mysql-optimize to analyze MySQL perf hotspots on Kunpeng ARM and recommend version-specific optimization patches."

@@ -1,0 +1,756 @@
+From 0a8d8e507905fe868022942f2c7892a58380a632 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Fri, 10 Oct 2025 15:45:57 +0800
+Subject: [PATCH] optimize binlog write performance: preallocated binlog
+
+---
+ client/mysqlbinlog.cc                       |  6 ++
+ plugin/binlog_utils_udf/binlog_utils_udf.cc | 12 ++--
+ sql/basic_istream.cc                        | 14 +++-
+ sql/basic_istream.h                         | 13 ++++
+ sql/basic_ostream.cc                        | 43 ++++++++++++
+ sql/basic_ostream.h                         | 40 +++++++++++
+ sql/binlog.cc                               | 76 ++++++++++++++++++++-
+ sql/binlog.h                                | 15 ++++
+ sql/binlog_istream.cc                       |  7 +-
+ sql/binlog_istream.h                        | 11 ++-
+ sql/binlog_ostream.h                        | 27 ++++++++
+ sql/binlog_reader.cc                        | 16 ++++-
+ sql/binlog_reader.h                         | 41 ++++++++++-
+ sql/mysqld.cc                               |  1 +
+ sql/mysqld.h                                |  1 +
+ sql/rpl_binlog_sender.cc                    | 23 +++++--
+ sql/rpl_binlog_sender.h                     |  4 +-
+ sql/sys_vars.cc                             |  6 ++
+ 18 files changed, 339 insertions(+), 17 deletions(-)
+
+diff --git a/client/mysqlbinlog.cc b/client/mysqlbinlog.cc
+index e9dc66bfe5d..121efba577b 100644
+--- a/client/mysqlbinlog.cc
++++ b/client/mysqlbinlog.cc
+@@ -3025,6 +3025,12 @@ class Stdin_binlog_istream : public Basic_seekable_istream,
+     assert(0);
+     return 0;
+   }
++
++  /** Stdin has no eof the a file, it should be never be called. */
++  void set_eof(my_off_t offset [[maybe_unused]]) override {
++    assert(0);
++  }
++
+   /* purecov: end */
+ 
+  private:
+diff --git a/plugin/binlog_utils_udf/binlog_utils_udf.cc b/plugin/binlog_utils_udf/binlog_utils_udf.cc
+index 74fd52450ec..2e639af66ba 100644
+--- a/plugin/binlog_utils_udf/binlog_utils_udf.cc
++++ b/plugin/binlog_utils_udf/binlog_utils_udf.cc
+@@ -195,7 +195,8 @@ log_event_ptr find_first_event(std::string_view binlog_name) {
+       check_and_normalize_binlog_name(binlog_name, binlog_name_buffer);
+ 
+   Binlog_file_reader reader(false /* do not verify checksum */);
+-  if (reader.open(search_file_name, 0))
++  if (reader.open(search_file_name, 0, nullptr,
++                  mysql_bin_log.get_valid_log_file_size(search_file_name)))
+     throw std::runtime_error(reader.get_error_str());
+ 
+   binlog::Decompressing_event_object_istream istream{reader};
+@@ -217,7 +218,8 @@ log_event_ptr find_last_event(std::string_view binlog_name) {
+       check_and_normalize_binlog_name(binlog_name, binlog_name_buffer);
+ 
+   Binlog_file_reader reader(false /* do not verify checksum */);
+-  if (reader.open(search_file_name, 0))
++  if (reader.open(search_file_name, 0, nullptr,
++                  mysql_bin_log.get_valid_log_file_size(search_file_name)))
+     throw std::runtime_error(reader.get_error_str());
+ 
+   // Here 'is_active()' is called after 'get_binlog_end_pos()' deliberately
+@@ -252,7 +254,8 @@ log_event_ptr find_previous_gtids_event(std::string_view binlog_name) {
+       check_and_normalize_binlog_name(binlog_name, binlog_name_buffer);
+ 
+   Binlog_file_reader reader(false /* do not verify checksum */);
+-  if (reader.open(search_file_name, 0))
++  if (reader.open(search_file_name, 0, nullptr,
++                  mysql_bin_log.get_valid_log_file_size(search_file_name)))
+     throw std::runtime_error(reader.get_error_str());
+ 
+   // Here 'is_active()' is called after 'get_binlog_end_pos()' deliberately
+@@ -306,7 +309,8 @@ log_event_ptr find_last_gtid_event(std::string_view binlog_name) {
+       check_and_normalize_binlog_name(binlog_name, binlog_name_buffer);
+ 
+   Binlog_file_reader reader(false /* do not verify checksum */);
+-  if (reader.open(search_file_name, 0))
++  if (reader.open(search_file_name, 0, nullptr,
++                  mysql_bin_log.get_valid_log_file_size(search_file_name)))
+     throw std::runtime_error(reader.get_error_str());
+ 
+   // Here 'is_active()' is called after 'get_binlog_end_pos()' deliberately
+diff --git a/sql/basic_istream.cc b/sql/basic_istream.cc
+index 76515d2d631..907e4474fdd 100644
+--- a/sql/basic_istream.cc
++++ b/sql/basic_istream.cc
+@@ -62,7 +62,15 @@ void IO_CACHE_istream::close() {
+   }
+ }
+ 
+-my_off_t IO_CACHE_istream::length() { return my_b_filelength(&m_io_cache); }
++my_off_t IO_CACHE_istream::length() {
++#if defined(__aarch64__) && defined (__linux__)
++  if (m_io_cache.end_of_file != MY_FILEPOS_ERROR) {
++    return std::min(m_io_cache.end_of_file, my_b_filelength(&m_io_cache));
++  }
++#endif
++
++  return my_b_filelength(&m_io_cache);
++}
+ 
+ ssize_t IO_CACHE_istream::read(unsigned char *buffer, size_t length) {
+   DBUG_TRACE;
+@@ -80,6 +88,10 @@ bool IO_CACHE_istream::seek(my_off_t offset) {
+   return res;
+ }
+ 
++void IO_CACHE_istream::set_eof(my_off_t offset) {
++  m_io_cache.end_of_file = offset;
++}
++
+ Stdin_istream::Stdin_istream() = default;
+ 
+ Stdin_istream::~Stdin_istream() { close(); }
+diff --git a/sql/basic_istream.h b/sql/basic_istream.h
+index 70c432be978..4738ee8c2c4 100644
+--- a/sql/basic_istream.h
++++ b/sql/basic_istream.h
+@@ -78,6 +78,13 @@ class Basic_seekable_istream : public Basic_istream {
+      The total length of the stream.
+    */
+   virtual my_off_t length() = 0;
++
++  /**
++     Set the position of a file's end.
++     @param[in]   offset The end of stream for file reading.
++   */
++  virtual void set_eof(my_off_t offset) = 0;
++
+   ~Basic_seekable_istream() override = default;
+ };
+ 
+@@ -121,6 +128,12 @@ class IO_CACHE_istream : public Basic_seekable_istream {
+   */
+   my_off_t length() override;
+ 
++  /**
++     Set the position of a file's end.
++     @param[in]   offset The end of stream for file reading.
++   */
++  void set_eof(my_off_t offset) override;
++
+  private:
+   IO_CACHE m_io_cache;
+ };
+diff --git a/sql/basic_ostream.cc b/sql/basic_ostream.cc
+index a678647ca4b..a03ab7dc5f3 100644
+--- a/sql/basic_ostream.cc
++++ b/sql/basic_ostream.cc
+@@ -92,6 +92,49 @@ bool IO_CACHE_ostream::sync() {
+   return mysql_file_sync(m_io_cache.file, MYF(MY_WME)) != 0;
+ }
+ 
++void IO_CACHE_ostream::preallocate_file(size_t file_size [[maybe_unused]]) {
++#if defined(__aarch64__) && defined (__linux__)
++#if defined(FALLOC_FL_WRITE_ZEROS)
++  /* Some hardware support UMMAP bit or DEAC bit, which can accelerate
++  writting zeros. */
++  const static int BINLOG_FALLOCATE_MODE = FALLOC_FL_WRITE_ZEROS;
++#else
++  const static int BINLOG_FALLOCATE_MODE = FALLOC_FL_ZERO_RANGE;
++#endif
++  my_off_t offset = my_b_get_pos_in_file(&m_io_cache);
++  my_off_t to_size = file_size;
++
++  assert(to_size <= file_size);
++  assert(to_size > offset);
++  int ret = fallocate(m_io_cache.file, BINLOG_FALLOCATE_MODE, offset, to_size);
++  if(ret == 0) {
++    m_preallocated_size = to_size;
++    return;
++  }
++
++  sql_print_warning("failed to fallocate for file: %d, error no: %d",
++                    m_io_cache.file, ret);
++  if (m_preallocated_size <= offset) {
++    m_preallocated_size = 0;
++  }
++#endif /** end of  defined(__aarch64__) && defined (__linux__) */
++}
++
++void IO_CACHE_ostream::reclaim_preallocated_file() {
++  my_off_t pos_written = my_b_get_pos_in_file(&m_io_cache);
++  /* In some error cases, io cache maybe hasn't been flushed. */
++  assert(my_b_tell(&m_io_cache) >= pos_written);
++  assert(m_io_cache.file != -1);
++  if (m_preallocated_size > pos_written &&
++    ftruncate(m_io_cache.file, pos_written) != 0) {
++    sql_print_error("failed to recalain for binlog file: %d, error no: %d",
++                    m_io_cache.file, errno);
++  }
++
++  m_preallocated_size = 0;
++}
++
++
+ bool Compressed_ostream::write(const unsigned char *buffer, my_off_t length) {
+   DBUG_TRACE;
+   m_compressor->feed(buffer, length);
+diff --git a/sql/basic_ostream.h b/sql/basic_ostream.h
+index c6d62d61f82..18ee4341bf2 100644
+--- a/sql/basic_ostream.h
++++ b/sql/basic_ostream.h
+@@ -89,6 +89,24 @@ class Truncatable_ostream : public Basic_ostream {
+   */
+   virtual bool sync() = 0;
+ 
++  /**
++     Pre-allocate the file for writing.
++     @param[in]  file_size  The expected pre-allocated file size.
++  */
++  virtual void preallocate_file(size_t file_size) = 0;
++
++  /**
++     Reclain the file's space owing to file preallocated.
++  */
++  virtual void reclaim_preallocated_file() = 0;
++
++  /**
++     Whether or not current file is succeed preallocated.
++     @retval true   The file has been preallocated.
++     @retval false  The file hasn't been preallocated.
++  */
++  virtual bool is_preallocated() = 0;
++
+   ~Truncatable_ostream() override = default;
+ };
+ 
+@@ -147,8 +165,30 @@ class IO_CACHE_ostream : public Truncatable_ostream {
+   */
+   bool sync() override;
+ 
++  /**
++     Pre-allocate the file for writing.
++     @param[in]  file_size  The expected pre-allocated file size.
++  */
++  void preallocate_file(size_t file_size [[maybe_unused]]) override;
++
++  /**
++     Reclain the file's space owing to file preallocated.
++  */
++  void reclaim_preallocated_file() override;
++
++  /**
++     Whether or not current file is succeed preallocated.
++     @retval true   The file has been preallocated.
++     @retval false  The file hasn't been preallocated.
++  */
++  bool is_preallocated() override {
++    return m_preallocated_size > 0;
++  }
++
+  private:
+   IO_CACHE m_io_cache;
++
++  size_t m_preallocated_size{0};
+ };
+ 
+ /**
+diff --git a/sql/binlog.cc b/sql/binlog.cc
+index f6639b364c0..6a562a7de66 100644
+--- a/sql/binlog.cc
++++ b/sql/binlog.cc
+@@ -612,6 +612,54 @@ class MYSQL_BIN_LOG::Binlog_ofile : public Basic_ostream {
+   */
+   void set_encrypted() { m_encrypted = true; }
+ 
++  /*
++    The size of current preallocated binlog file size. When the binlog was
++    created, we will reallocated all physical block. If current binlog is
++    closed, we will reclain the preallocated physical block.
++
++    Testcases: Writting a full of binlog in Kunpen 920B PCIE 4.0 NVME SSD,
++    binlog size: 512MB
++
++    1. directly write(UNIT: 512(IO_SIZE)) costs: 1280ms
++
++    2. fallocated 512MB && write(512 bytes) costs: 650ms
++
++    3. fallocated a file with size of 512MB and zeros filling only costs 0.6ms
++    So with preallocated binlog, we can save 50% costs during binlog's flush
++    stage.
++
++     Pre-allocate the file for writing.
++     @param[in]  file_size  The expected pre-allocated file size.
++  */
++  void preallocate_log_file(size_t file_size) {
++    if (!opt_binlog_preallocate) {
++      return;
++    }
++    m_pipeline_head->preallocate_file(file_size);
++  }
++
++  /**
++     Reclain the file's space owing to file preallocated.
++  */
++  void reclaim_preallocated_log_file() {
++    if (!opt_binlog_preallocate) {
++      return;
++    }
++    m_pipeline_head->reclaim_preallocated_file();
++  }
++
++  /**
++     Whether or not current file is succeed preallocated.
++     @retval true   The file has been preallocated.
++     @retval false  The file hasn't been preallocated.
++  */
++  bool is_preallocated() {
++    if (!opt_binlog_preallocate) {
++      return false;
++    }
++    return m_pipeline_head->is_preallocated();
++  }
++
+  private:
+   my_off_t m_position = 0;
+   int m_encrypted_header_size = 0;
+@@ -3646,7 +3694,8 @@ bool show_binlog_events(THD *thd, MYSQL_BIN_LOG *binary_log) {
+         std::max(thd->variables.max_allowed_packet,
+                  binlog_row_event_max_size + MAX_LOG_EVENT_HEADER));
+ 
+-    if (binlog_file_reader.open(linfo.log_file_name, pos)) {
++    if (binlog_file_reader.open(linfo.log_file_name, pos, nullptr,
++          binary_log->get_valid_log_file_size(linfo.log_file_name))) {
+       errmsg = binlog_file_reader.get_error_str();
+       goto err;
+     }
+@@ -4483,7 +4532,8 @@ static enum_read_gtids_from_binlog_status read_gtids_from_binlog(
+ #endif
+ 
+   Binlog_file_reader binlog_file_reader(verify_checksum);
+-  if (binlog_file_reader.open(filename)) {
++  if (binlog_file_reader.open(filename, 0, nullptr,
++                              mysql_bin_log.get_valid_log_file_size(filename))) {
+     LogErr(ERROR_LEVEL, ER_BINLOG_FILE_OPEN_FAILED,
+            binlog_file_reader.get_error_str());
+     /*
+@@ -5155,6 +5205,9 @@ bool MYSQL_BIN_LOG::open_binlog(
+   Format_description_log_event s;
+ 
+   if (m_binlog_file->is_empty()) {
++    if (!is_relay_log) {
++      m_binlog_file->preallocate_log_file(max_size);
++    }
+     /*
+       The binary log file was empty (probably newly created)
+       This is the normal case and happens when the user doesn't specify
+@@ -7803,6 +7856,24 @@ void MYSQL_BIN_LOG::adjust_linfo_offsets(my_off_t purge_offset) {
+                 });
+ }
+ 
++my_off_t MYSQL_BIN_LOG::get_valid_log_file_size(const char * log_name) {
++#if defined(__aarch64__) && defined (__linux__)
++  if (!is_relay_log && opt_binlog_preallocate && is_active(log_name)) {
++    auto size = get_binlog_end_pos() +
++                m_binlog_file->get_encrypted_header_size();
++    /* Double check log state. */
++    if (m_binlog_file->is_preallocated() && is_active(log_name)) {
++      return size;
++    }
++  }
++#endif
++
++  return MY_FILEPOS_ERROR;
++}
++
++int MYSQL_BIN_LOG::get_encrypted_log_header_size() {
++  return m_binlog_file->get_encrypted_header_size();
++}
+ /**
+   Write the contents of the given IO_CACHE to the binary log.
+ 
+@@ -8044,6 +8115,7 @@ void MYSQL_BIN_LOG::close(
+ 
+     /* The following update should not be done in relay log files */
+     if (!is_relay_log) {
++      m_binlog_file->reclaim_preallocated_log_file();
+       my_off_t offset = BIN_LOG_HEADER_SIZE + FLAGS_OFFSET;
+       uchar flags = 0;  // clearing LOG_EVENT_BINLOG_IN_USE_F
+       (void)m_binlog_file->update(&flags, 1, offset);
+diff --git a/sql/binlog.h b/sql/binlog.h
+index e73901feeef..5fa29dbf3cf 100644
+--- a/sql/binlog.h
++++ b/sql/binlog.h
+@@ -1102,6 +1102,21 @@ class MYSQL_BIN_LOG : public TC_LOG {
+   */
+   void adjust_linfo_offsets(my_off_t purge_offset);
+ 
++  /**
++     Get the valid end postion of a binlog file. Because of preallocated binlog
++     we must get the actual position of a file, not simplely the physical file
++     EOF. If the file is not prealocated, we return MY_FILEPOS_ERROR.
++     @param log_name
++     @retval The real end of the file(except the preallocated space).
++  */
++  my_off_t get_valid_log_file_size(const char * log_name);
++
++  /**
++    Get the encrypted log header size
++    @retval The encrypted log header size
++  */
++  int get_encrypted_log_header_size();
++
+  private:
+   mysql_mutex_t LOCK_log_info;
+   // Set of log info objects that are in usage and might prevent some other
+diff --git a/sql/binlog_istream.cc b/sql/binlog_istream.cc
+index 265ab2110a5..4128e29b1d6 100644
+--- a/sql/binlog_istream.cc
++++ b/sql/binlog_istream.cc
+@@ -185,11 +185,16 @@ Basic_binlog_ifile::~Basic_binlog_ifile() {
+   close();
+ }
+ 
+-bool Basic_binlog_ifile::open(const char *file_name) {
++bool Basic_binlog_ifile::open(const char *file_name, my_off_t end_pos) {
+   m_istream = open_file(file_name);
+   if (m_istream == nullptr)
+     return m_error->set_type(Binlog_read_error::CANNOT_OPEN);
+   m_file_name = file_name;
++
++  if (end_pos != MY_FILEPOS_ERROR) {
++    m_istream->set_eof(end_pos);
++  }
++
+   return read_binlog_magic();
+ }
+ 
+diff --git a/sql/binlog_istream.h b/sql/binlog_istream.h
+index deb1897536f..13236e95ed4 100644
+--- a/sql/binlog_istream.h
++++ b/sql/binlog_istream.h
+@@ -144,6 +144,10 @@ class Binlog_encryption_istream : public Basic_seekable_istream {
+   bool seek(my_off_t offset) override;
+   my_off_t length() override;
+ 
++  void set_eof(my_off_t offset) override {
++    m_down_istream->set_eof(offset);
++  }
++
+  private:
+   /* The decryptor cypher to decrypt the content read from down stream */
+   std::unique_ptr<Stream_cipher> m_decryptor;
+@@ -172,8 +176,9 @@ class Basic_binlog_ifile : public Basic_seekable_istream {
+      Open a binlog file.
+ 
+      @param[in] file_name  name of the binlog file which will be opened.
++     @param[in] end_pos  The position of end of binlog file
+   */
+-  bool open(const char *file_name);
++  bool open(const char *file_name, my_off_t end_pos = MY_FILEPOS_ERROR);
+   /**
+      Close the binlog file it is reading.
+   */
+@@ -193,6 +198,10 @@ class Basic_binlog_ifile : public Basic_seekable_istream {
+   */
+   my_off_t length() override;
+ 
++  void set_eof(my_off_t offset) override {
++    m_istream->set_eof(offset);
++  }
++
+  protected:
+   /**
+      Open the system layer file. It is the entry of the stream pipeline.
+diff --git a/sql/binlog_ostream.h b/sql/binlog_ostream.h
+index 543a53365d8..ef2ca722c4d 100644
+--- a/sql/binlog_ostream.h
++++ b/sql/binlog_ostream.h
+@@ -137,6 +137,9 @@ class IO_CACHE_binlog_cache_storage : public Truncatable_ostream {
+   my_off_t length() const;
+   bool flush() override { return false; }
+   bool sync() override { return false; }
++  void preallocate_file(size_t file_size [[maybe_unused]]) override { return;}
++  void reclaim_preallocated_file() override { return;}
++  bool is_preallocated() override {return false;}
+ 
+  private:
+   IO_CACHE m_io_cache;
+@@ -296,6 +299,30 @@ class Binlog_encryption_ostream : public Truncatable_ostream {
+   */
+   int get_header_size();
+ 
++  /**
++     Pre-allocate the file for writing.
++     @param[in]  file_size  The expected pre-allocated file size.
++  */
++  void preallocate_file(size_t file_size) override {
++    m_down_ostream->preallocate_file(file_size);
++  }
++
++  /**
++     Reclain the file's space owing to file preallocated.
++  */
++  void reclaim_preallocated_file() override {
++    m_down_ostream->reclaim_preallocated_file();
++  }
++
++  /**
++     Whether or not current file is succeed preallocated.
++     @retval true   The file has been preallocated.
++     @retval false  The file hasn't been preallocated.
++  */
++  bool is_preallocated() override {
++    return m_down_ostream->is_preallocated();
++  }
++
+  private:
+   std::unique_ptr<Truncatable_ostream> m_down_ostream;
+   std::unique_ptr<Rpl_encryption_header> m_header;
+diff --git a/sql/binlog_reader.cc b/sql/binlog_reader.cc
+index 257e6aae200..9d7ba6ba9a1 100644
+--- a/sql/binlog_reader.cc
++++ b/sql/binlog_reader.cc
+@@ -189,6 +189,14 @@ bool Binlog_event_data_istream::check_event_header() {
+   if (m_event_length < LOG_EVENT_MINIMAL_HEADER_LEN) {
+     DBUG_LOG("info", DBUG_VAR(m_event_length)
+                          << " < " << DBUG_VAR(LOG_EVENT_MINIMAL_HEADER_LEN));
++    /** Recovery or mysqlbinlog client. */
++    if (unlikely(m_event_length == 0)) {
++      if (is_buf_zeros(m_header + EVENT_LEN_OFFSET,
++                       LOG_EVENT_MINIMAL_HEADER_LEN - EVENT_LEN_OFFSET) &&
++          is_preallocated_log_eof()) {
++        return m_error->set_type(Binlog_read_error::READ_EOF);
++      }
++    }
+     return m_error->set_type(Binlog_read_error::BOGUS);
+   }
+   if (m_event_length > m_max_event_size) {
+@@ -199,6 +207,12 @@ bool Binlog_event_data_istream::check_event_header() {
+   return false;
+ }
+ 
++bool Binlog_event_data_istream::is_preallocated_log_eof() {
++  unsigned char buf[IO_SIZE];
++  longlong read_length = m_istream->read(buf, IO_SIZE);
++  return is_buf_zeros(buf, read_length);
++}
++
+ Binlog_read_error::Error_type binlog_event_deserialize(
+     const unsigned char *buffer, unsigned int event_len,
+     const Format_description_event *fde, bool verify_checksum,
+@@ -430,4 +444,4 @@ Binlog_read_error::Error_type binlog_event_deserialize(
+                             buf[EVENT_TYPE_OFFSET], event_len));
+   *event = ev;
+   return Binlog_read_error::SUCCESS;
+-}
++}
+\ No newline at end of file
+diff --git a/sql/binlog_reader.h b/sql/binlog_reader.h
+index 74a2c77ec1f..9d346bfe1cf 100644
+--- a/sql/binlog_reader.h
++++ b/sql/binlog_reader.h
+@@ -190,6 +190,33 @@ class Binlog_event_data_istream {
+   */
+   bool fill_event_data(unsigned char *event_data, bool verify_checksum,
+                        enum_binlog_checksum_alg checksum_alg);
++
++  /**
++     Whether or not we reached the end of preallocated log.
++
++     @retval true  we reached the end of preallocated log
++     @retval false we haven't reached the end of preallocated log
++  */
++  bool is_preallocated_log_eof();
++
++  /**
++     Whether or not the buffer is all zeros.
++
++     @param[in] buf       The buf need to be checked.
++     @param[in] buf_len   The buf length.
++     @retval true   The buffer is filled by zeros.
++     @retval false  The buffer isn't filled by zeros.
++  */
++  bool is_buf_zeros(const unsigned char *buf, size_t buf_len) {
++    while (buf_len > 0) {
++      if(buf[buf_len - 1] != 0) {
++        return false;
++      }
++      buf_len--;
++    }
++    return true;
++  }
++
+ };
+ 
+ /**
+@@ -340,13 +367,15 @@ class Basic_binlog_file_reader : public IBasic_binlog_file_reader {
+      @param[in] file_name  name of the binlog file which will be opened.
+      @param[in] offset  The position where it starts to read.
+      @param[out] fdle   For returning an Format_description_log_event object.
++     @param[in] end_pos  The position of end of binlog file
+      @retval false Success
+      @retval true Error
+   */
+   bool open(const char *file_name, my_off_t offset = 0,
+-            Format_description_log_event **fdle = nullptr) {
++            Format_description_log_event **fdle = nullptr,
++            my_off_t end_pos = MY_FILEPOS_ERROR) {
+     DBUG_TRACE;
+-    if (m_ifile.open(file_name)) return true;
++    if (m_ifile.open(file_name, end_pos)) return true;
+ 
+     m_data_istream.reset_crypto();
+ 
+@@ -435,6 +464,14 @@ class Basic_binlog_file_reader : public IBasic_binlog_file_reader {
+     return m_data_istream.start_decryption(see);
+   }
+ 
++  /**
++     Set the end position of the reading file stream
++    @param[in] offset  The end position of the reading file stream.
++  */
++  void set_log_eof(my_off_t offset) {
++    m_ifile.set_eof(offset);
++  }
++
+  private:
+   Binlog_read_error m_error;
+ 
+diff --git a/sql/mysqld.cc b/sql/mysqld.cc
+index 8d3e69d9d7a..9625884f611 100644
+--- a/sql/mysqld.cc
++++ b/sql/mysqld.cc
+@@ -1362,6 +1362,7 @@ ulong what_to_log;
+ ulong slow_launch_time;
+ std::atomic<int32> atomic_replica_open_temp_tables{0};
+ ulong open_files_limit, max_binlog_size, max_relay_log_size;
++bool opt_binlog_preallocate = true;
+ ulong slave_trans_retries;
+ uint replica_net_timeout;
+ ulong replica_exec_mode_options;
+diff --git a/sql/mysqld.h b/sql/mysqld.h
+index c8018dc0d74..4821589ca65 100644
+--- a/sql/mysqld.h
++++ b/sql/mysqld.h
+@@ -357,6 +357,7 @@ extern int32 opt_binlog_max_flush_queue_time;
+ extern long opt_binlog_group_commit_sync_delay;
+ extern ulong opt_binlog_group_commit_sync_no_delay_count;
+ extern ulong max_binlog_size, max_relay_log_size;
++extern bool opt_binlog_preallocate;
+ extern ulong replica_max_allowed_packet;
+ extern ulong binlog_row_event_max_size;
+ extern ulong net_buffer_shrink_interval;
+diff --git a/sql/rpl_binlog_sender.cc b/sql/rpl_binlog_sender.cc
+index 346b08ec4e9..4e5e78483f6 100644
+--- a/sql/rpl_binlog_sender.cc
++++ b/sql/rpl_binlog_sender.cc
+@@ -403,7 +403,8 @@ void Binlog_sender::run() {
+     */
+     if (unlikely(fake_rotate_event(log_file, start_pos))) break;
+ 
+-    if (reader.open(log_file)) {
++    if (reader.open(log_file, 0, nullptr,
++                    mysql_bin_log.get_valid_log_file_size(log_file))) {
+       set_fatal_error(log_read_error_msg(reader.get_error_type()));
+       break;
+     }
+@@ -506,9 +507,21 @@ int Binlog_sender::send_binlog(File_reader &reader, my_off_t start_pos) {
+   if (reader.position() != start_pos && reader.seek(start_pos)) return 1;
+ 
+   while (!m_thd->killed) {
+-    auto [end_pos, code] = get_binlog_end_pos(reader);
++    int encrypted_log_header_size;
++    auto [end_pos, code] = get_binlog_end_pos(reader, encrypted_log_header_size);
+ 
+     if (code) return 1;
++
++#if defined(__aarch64__) && defined (__linux__)
++    if (opt_binlog_preallocate) {
++      if (end_pos == 0) {
++        reader.set_log_eof(MY_FILEPOS_ERROR);
++      } else {
++        reader.set_log_eof(end_pos + encrypted_log_header_size);
++      }
++    }
++#endif
++
+     if (send_events(reader, end_pos)) return 1;
+     /*
+       It is not active binlog, send_events should not return unless
+@@ -528,7 +541,7 @@ int Binlog_sender::send_binlog(File_reader &reader, my_off_t start_pos) {
+ }
+ 
+ std::pair<my_off_t, int> Binlog_sender::get_binlog_end_pos(
+-    File_reader &reader) {
++    File_reader &reader, int &encrypted_log_header_size) {
+   DBUG_TRACE;
+   my_off_t read_pos = reader.position();
+ 
+@@ -539,6 +552,7 @@ std::pair<my_off_t, int> Binlog_sender::get_binlog_end_pos(
+   }
+ 
+   result.first = mysql_bin_log.get_binlog_end_pos();
++  encrypted_log_header_size = mysql_bin_log.get_encrypted_log_header_size();
+ 
+   DBUG_PRINT("info", ("Reading file %s, seek pos %llu, end_pos is %llu",
+                       m_linfo.log_file_name, read_pos, result.first));
+@@ -992,7 +1006,8 @@ int Binlog_sender::check_start_file() {
+ 
+   Binlog_read_error binlog_read_error;
+   Binlog_ifile binlog_ifile(&binlog_read_error);
+-  if (binlog_ifile.open(m_linfo.log_file_name)) {
++  if (binlog_ifile.open(m_linfo.log_file_name,
++        mysql_bin_log.get_valid_log_file_size(m_linfo.log_file_name))) {
+     set_fatal_error(binlog_read_error.get_str());
+     return 1;
+   }
+diff --git a/sql/rpl_binlog_sender.h b/sql/rpl_binlog_sender.h
+index d146043a2d3..01dbfd23402 100644
+--- a/sql/rpl_binlog_sender.h
++++ b/sql/rpl_binlog_sender.h
+@@ -235,6 +235,7 @@ class Binlog_sender {
+     It gets the end position of the binlog file.
+ 
+     @param[in] reader   File_reader of binlog will be checked
++    @param[out] encrypted_log_header_size encrypted log header size.
+     @returns Pair :
+              - Binlog end position - will be set to the end position
+              of the reading binlog file. If this is an inactive file,
+@@ -244,7 +245,8 @@ class Binlog_sender {
+           waiting and before returning 1 which means end of the execution
+           (normal/error)
+   */
+-  std::pair<my_off_t, int> get_binlog_end_pos(File_reader &reader);
++  std::pair<my_off_t, int> get_binlog_end_pos(File_reader &reader,
++                                              int &encrypted_log_header_size);
+ 
+   /**
+      It checks if a binlog file has Previous_gtid_log_event
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 667a1eb737b..b78ff67fc12 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -3107,6 +3107,12 @@ static Sys_var_ulong Sys_max_binlog_size(
+     BLOCK_SIZE(IO_SIZE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(nullptr),
+     ON_UPDATE(fix_max_binlog_size));
+ 
++static Sys_var_bool Sys_enable_binlog_preallocate(
++    "enable_binlog_preallocate", "Whether or not enable allocate binlog "
++    "file using posix_fallocated",
++    READ_ONLY GLOBAL_VAR(opt_binlog_preallocate), CMD_LINE(OPT_ARG),
++    DEFAULT(true));
++
+ static Sys_var_ulong Sys_max_connections(
+     "max_connections", "The number of simultaneous clients allowed",
+     GLOBAL_VAR(max_connections), CMD_LINE(REQUIRED_ARG),
+-- 
+2.27.0
+

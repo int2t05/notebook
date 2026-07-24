@@ -1,0 +1,21 @@
+# Lily + LilyForTeddy 混合触发规则集 — 16条
+# 8条单字节规则 (触发 Lily) + 8条2-4字节规则 (触发 LilyForTeddy)
+# 用于同时验证两个 ARM NEON 优化引擎的正确性
+# -- Lily 规则 (单字节) --
+1:/a/
+2:/b/
+3:/c/
+4:/d/
+5:/e/
+6:/0/
+7:/1/
+8:/2/
+# -- LilyForTeddy 规则 (2-4字节) --
+9:/abcd/
+10:/efgh/
+11:/ijkl/
+12:/mnop/
+13:/qrs/
+14:/tuv/
+15:/wx/
+16:/yz/

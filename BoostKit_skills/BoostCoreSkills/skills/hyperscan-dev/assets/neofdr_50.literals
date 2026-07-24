@@ -1,0 +1,64 @@
+# NeoFDR 触发规则集 — 50条 8字节字面量
+#
+# 触发条件:
+#   1. config.txt: allowNeoFdr:1          → grey.allowNeoFdr = true
+#   2. Teddy 编译失败 (>48 条, ARM上限)    → fdr_compile.cpp:845-852
+#   3. chooseNeoFdrEngine 成功            → fdr_compile.cpp:856-875
+#   4. engineID=1 → KHSEL_NeoFdrEngineExec → fdr.c:825
+#
+# 零尾过滤: ng_violet.cpp:685/996/1469/2475 等处,
+#   当 literal.length()>=8 且末尾8字节全\0 时, 丢弃该字面量
+#   (防止零尾字面量造成 FDR confirm hash 洪水)
+#
+# 本文件: 50条 8字节规则, 超过 Teddy ARM 上限(48),
+#         全部非零尾, 全部通过 NeoFDR 编译和运行时验证
+1:/neofdr01/
+2:/neofdr02/
+3:/neofdr03/
+4:/neofdr04/
+5:/neofdr05/
+6:/neofdr06/
+7:/neofdr07/
+8:/neofdr08/
+9:/neofdr09/
+10:/neofdr10/
+11:/neofdr11/
+12:/neofdr12/
+13:/neofdr13/
+14:/neofdr14/
+15:/neofdr15/
+16:/neofdr16/
+17:/neofdr17/
+18:/neofdr18/
+19:/neofdr19/
+20:/neofdr20/
+21:/neofdr21/
+22:/neofdr22/
+23:/neofdr23/
+24:/neofdr24/
+25:/neofdr25/
+26:/neofdr26/
+27:/neofdr27/
+28:/neofdr28/
+29:/neofdr29/
+30:/neofdr30/
+31:/neofdr31/
+32:/neofdr32/
+33:/neofdr33/
+34:/neofdr34/
+35:/neofdr35/
+36:/neofdr36/
+37:/neofdr37/
+38:/neofdr38/
+39:/neofdr39/
+40:/neofdr40/
+41:/neofdr41/
+42:/neofdr42/
+43:/neofdr43/
+44:/neofdr44/
+45:/neofdr45/
+46:/neofdr46/
+47:/neofdr47/
+48:/neofdr48/
+49:/neofdr49/
+50:/neofdr50/

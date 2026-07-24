@@ -1,0 +1,9 @@
+# ROSE_RUNTIME_PURE_LITERAL 触发规则集 — 5条纯字面量
+# 条件: isPureFloating() → 全部是 floating literal, 无 NFA/anchored/EOD/state
+# 运行时走 pureLiteralBlockExec → hwlmExec (不启动 ROSE 解释器)
+# rose_build_bytecode.cpp:348 → pickRuntimeImpl
+1:/helloWorld/
+2:/testData/
+3:/fooBar123/
+4:/abcDefGhi/
+5:/simpleMatch/

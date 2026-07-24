@@ -1,0 +1,272 @@
+From 9369b9a1064d312b7bff8d948498a192d1ca10f6 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 9 Sep 2025 21:36:27 +0800
+Subject: [PATCH] rec_get_offsets optimize
+
+---
+ storage/innobase/include/rem0rec.h | 29 +++++++++++
+ storage/innobase/page/page0cur.cc  |  6 ++-
+ storage/innobase/rem/rem0rec.cc    | 80 ++++++++++++++++++++++++++++++
+ storage/innobase/row/row0sel.cc    | 41 ++++++++-------
+ 4 files changed, 137 insertions(+), 19 deletions(-)
+
+diff --git a/storage/innobase/include/rem0rec.h b/storage/innobase/include/rem0rec.h
+index a7151c0a..df8dec9f 100644
+--- a/storage/innobase/include/rem0rec.h
++++ b/storage/innobase/include/rem0rec.h
+@@ -466,12 +466,41 @@ rec_get_offsets_func(
+ 	mem_heap_t**		heap)	/*!< in/out: memory heap */
+ 	MY_ATTRIBUTE((warn_unused_result));
+ 
++/******************************************************//**
++The following function determines the offsets to each field
++in the record.	It can reuse a previously allocated array.
++@return the new offsets */
++ulint*
++rec_get_offsets_func_with_comp(
++/*=================*/
++	const rec_t*		rec,	/*!< in: physical record */
++	const dict_index_t*	index,	/*!< in: record descriptor */
++	const ibool		compact,/*!< in: compact page format  */
++	ulint*			offsets,/*!< in/out: array consisting of
++					offsets[0] allocated elements,
++					or an array from rec_get_offsets(),
++					or NULL */
++	ulint			n_fields,/*!< in: maximum number of
++					initialized fields
++					 (ULINT_UNDEFINED if all fields) */
++#ifdef UNIV_DEBUG
++	const char*		file,	/*!< in: file name where called */
++	ulint			line,	/*!< in: line number where called */
++#endif /* UNIV_DEBUG */
++	mem_heap_t**		heap)	/*!< in/out: memory heap */
++	MY_ATTRIBUTE((warn_unused_result));
++
+ #ifdef UNIV_DEBUG
+ # define rec_get_offsets(rec,index,offsets,n,heap)			\
+ 	rec_get_offsets_func(rec,index,offsets,n,__FILE__,__LINE__,heap)
++# define rec_get_offsets_with_comp(rec,index,compact,offsets,n,heap)	\
++	rec_get_offsets_func_with_comp(rec, index, compact, offsets, n,	\
++				       __FILE__, __LINE__, heap)
+ #else /* UNIV_DEBUG */
+ # define rec_get_offsets(rec, index, offsets, n, heap)	\
+ 	rec_get_offsets_func(rec, index, offsets, n, heap)
++# define rec_get_offsets_with_comp(rec, index, compact, offsets, n, heap)\
++	rec_get_offsets_func_with_comp(rec, index, compact, offsets, n, heap)
+ #endif /* UNIV_DEBUG */
+ 
+ /******************************************************//**
+diff --git a/storage/innobase/page/page0cur.cc b/storage/innobase/page/page0cur.cc
+index b228f7d4..115180a9 100644
+--- a/storage/innobase/page/page0cur.cc
++++ b/storage/innobase/page/page0cur.cc
+@@ -2378,6 +2378,7 @@ page_copy_rec_list_end_to_created_page(
+ 	ulint	rec_size;
+ 	byte*	log_ptr;
+ 	ulint	log_data_len;
++	const ibool compact = dict_table_is_comp(index->table);
+ 	mem_heap_t*	heap		= NULL;
+ 	ulint		offsets_[REC_OFFS_NORMAL_SIZE];
+ 	ulint*		offsets		= offsets_;
+@@ -2432,8 +2433,9 @@ page_copy_rec_list_end_to_created_page(
+ 	n_recs = 0;
+ 
+ 	do {
+-		offsets = rec_get_offsets(rec, index, offsets,
+-					  ULINT_UNDEFINED, &heap);
++		offsets = rec_get_offsets_with_comp(rec, index, compact,
++						    offsets,ULINT_UNDEFINED,
++						    &heap);
+ 		insert_rec = rec_copy(heap_top, rec, offsets);
+ 
+ 		if (page_is_comp(new_page)) {
+diff --git a/storage/innobase/rem/rem0rec.cc b/storage/innobase/rem/rem0rec.cc
+index e28ca104..e3adbaf3 100644
+--- a/storage/innobase/rem/rem0rec.cc
++++ b/storage/innobase/rem/rem0rec.cc
+@@ -615,6 +615,86 @@ rec_get_offsets_func(
+ 	return(offsets);
+ }
+ 
++/******************************************************//**
++The following function determines the offsets to each field
++in the record.	It can reuse a previously returned array.
++@return the new offsets */
++ulint*
++rec_get_offsets_func_with_comp(
++/*=================*/
++	const rec_t*		rec,	/*!< in: physical record */
++	const dict_index_t*	index,	/*!< in: record descriptor */
++	const ibool		compact,/*!< in: compact page format  */
++	ulint*			offsets,/*!< in/out: array consisting of
++					offsets[0] allocated elements,
++					or an array from rec_get_offsets(),
++					or NULL */
++	ulint			n_fields,/*!< in: maximum number of
++					initialized fields
++					 (ULINT_UNDEFINED if all fields) */
++#ifdef UNIV_DEBUG
++	const char*		file,	/*!< in: file name where called */
++	ulint			line,	/*!< in: line number where called */
++#endif /* UNIV_DEBUG */
++	mem_heap_t**		heap)	/*!< in/out: memory heap */
++{
++	ulint	n;
++	ulint	size;
++
++	ut_ad(rec);
++	ut_ad(index);
++	ut_ad(heap);
++
++	if (compact) {
++		switch (UNIV_EXPECT(rec_get_status(rec),
++				    REC_STATUS_ORDINARY)) {
++		case REC_STATUS_ORDINARY:
++			n = dict_index_get_n_fields(index);
++			break;
++		case REC_STATUS_NODE_PTR:
++			/* Node pointer records consist of the
++			uniquely identifying fields of the record
++			followed by a child page number field. */
++			n = dict_index_get_n_unique_in_tree_nonleaf(index) + 1;
++			break;
++		case REC_STATUS_INFIMUM:
++		case REC_STATUS_SUPREMUM:
++			/* infimum or supremum record */
++			n = 1;
++			break;
++		default:
++			ut_error;
++			return(NULL);
++		}
++	} else {
++		n = rec_get_n_fields_old(rec);
++	}
++
++	if (UNIV_UNLIKELY(n_fields < n)) {
++		n = n_fields;
++	}
++
++	/* The offsets header consists of the allocation size at
++	offsets[0] and the REC_OFFS_HEADER_SIZE bytes. */
++	size = n + (1 + REC_OFFS_HEADER_SIZE);
++
++	if (UNIV_UNLIKELY(!offsets)
++	    || UNIV_UNLIKELY(rec_offs_get_n_alloc(offsets) < size)) {
++		if (UNIV_UNLIKELY(!*heap)) {
++			*heap = mem_heap_create_at(size * sizeof(ulint),
++						   file, line);
++		}
++		offsets = static_cast<ulint*>(
++			mem_heap_alloc(*heap, size * sizeof(ulint)));
++
++		rec_offs_set_n_alloc(offsets, size);
++	}
++
++	rec_offs_set_n_fields(offsets, n);
++	rec_init_offsets(rec, index, offsets);
++	return(offsets);
++}
++
+ /******************************************************//**
+ The following function determines the offsets to each field
+ in the record.  It can reuse a previously allocated array. */
+diff --git a/storage/innobase/row/row0sel.cc b/storage/innobase/row/row0sel.cc
+index f077aa3c..a9e1fac0 100644
+--- a/storage/innobase/row/row0sel.cc
++++ b/storage/innobase/row/row0sel.cc
+@@ -5378,8 +5378,10 @@ wait_table_again:
+ 			to prevent phantoms in ORDER BY ... DESC queries */
+ 			const rec_t*	next_rec = page_rec_get_next_const(rec);
+ 
+-			offsets = rec_get_offsets(next_rec, index, offsets,
+-						  ULINT_UNDEFINED, &heap);
++			offsets = rec_get_offsets_with_comp(next_rec, index,
++							    comp, offsets,
++							    ULINT_UNDEFINED,
++							    &heap);
+ 			err = sel_set_rec_lock(pcur,
+ 					       next_rec, index, offsets,
+ 					       prebuilt->select_lock_type,
+@@ -5481,8 +5483,11 @@ rec_loop:
+ 			}
+ 
+ 			/** Create offsets based on prebuilt index. */
+-			offsets = rec_get_offsets(prev_rec, prebuilt->index,
+-					offsets, ULINT_UNDEFINED, &heap);
++			offsets = rec_get_offsets_with_comp(prev_rec,
++							    prebuilt->index,
++							    comp, offsets,
++							    ULINT_UNDEFINED,
++							    &heap);
+ 
+ 			if (row_sel_store_mysql_rec(
+ 				end_range_cache, prebuilt, prev_rec, prev_vrow,
+@@ -5520,8 +5525,10 @@ rec_loop:
+ 			level we do not lock gaps. Supremum record is really
+ 			a gap and therefore we do not set locks there. */
+ 
+-			offsets = rec_get_offsets(rec, index, offsets,
+-						  ULINT_UNDEFINED, &heap);
++			offsets = rec_get_offsets_with_comp(rec, index, comp,
++							    offsets,
++							    ULINT_UNDEFINED,
++							    &heap);
+ 			err = sel_set_rec_lock(pcur,
+ 					       rec, index, offsets,
+ 					       prebuilt->select_lock_type,
+@@ -5618,7 +5625,8 @@ wrong_offs:
+ 	ut_ad(fil_page_index_page_check(btr_pcur_get_page(pcur)));
+ 	ut_ad(btr_page_get_index_id(btr_pcur_get_page(pcur)) == index->id);
+ 
+-	offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED, &heap);
++	offsets = rec_get_offsets_with_comp(rec, index, comp, offsets,
++					    ULINT_UNDEFINED, &heap);
+ 
+ 	if (UNIV_UNLIKELY(srv_force_recovery > 0
+ 			  || (index->table->is_corrupt &&
+@@ -5862,9 +5870,9 @@ no_gap_lock:
+ 				searching for the last committed version.
+ 				Do a normal locking read. */
+ 
+-				offsets = rec_get_offsets(
+-					rec, index, offsets, ULINT_UNDEFINED,
+-					&heap);
++				offsets = rec_get_offsets_with_comp(
++					rec, index, comp, offsets,
++					ULINT_UNDEFINED, &heap);
+ 				goto locks_ok;
+ 			case DB_DEADLOCK:
+ 				goto lock_wait_or_error;
+@@ -6342,9 +6350,8 @@ requires_clust_rec:
+ 			    && !prebuilt->need_to_access_clustered) {
+ 				/* We used 'offsets' for the clust
+ 				rec, recalculate them for 'rec' */
+-				offsets = rec_get_offsets(rec, index, offsets,
+-							  ULINT_UNDEFINED,
+-							  &heap);
++				offsets = rec_get_offsets_with_comp(rec, index,
++					comp, offsets, ULINT_UNDEFINED, &heap);
+ 				result_rec = rec;
+ 			}
+ 
+@@ -6511,12 +6518,12 @@ next_rec:
+ 
+ 				mem_heap_t* heap_tmp = mem_heap_create(256);
+ 
+-				offsets1 = rec_get_offsets(
+-					prev_rec_debug, index, NULL,
++				offsets1 = rec_get_offsets_with_comp(
++					prev_rec_debug, index, comp, NULL,
+ 					prev_rec_debug_n_fields, &heap_tmp);
+ 
+-				offsets2 = rec_get_offsets(
+-					prev_rec, index, NULL,
++				offsets2 = rec_get_offsets_with_comp(
++					prev_rec, index, comp, NULL,
+ 					prev_rec_debug_n_fields, &heap_tmp);
+ 
+ 				ut_ad(!cmp_rec_rec(
+-- 
+2.31.1.windows.1
+

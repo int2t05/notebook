@@ -1,0 +1,1595 @@
+From 2adbb2d0c9b3dffc34a54049e640e71e264c7cc5 Mon Sep 17 00:00:00 2001
+From: Ramakrishnan Kamalakannan <ramakrishnan.kamalakannan@oracle.com>
+Date: Tue, 25 Feb 2025 15:10:32 +0100
+Subject: [PATCH 1/3] WL#16484  Make InnoDB container aware
+
+Description:
+  This worklog makes InnoDB aware of the limits set by the container
+when the server is run in a container. It changes the APIs used by
+server to read the number of logical CPUs and available physical memory.
+InnoDB uses these functions to determine the appropriate default values
+of some of the configurations.
+  The changes to the APIs will attempt to read the limits as if it were
+running in cgroup v2. If this read fails, then it will attempt to read
+it as if it were running in cgroup v1. If this fails too, then we assume
+that the server is not running in a container, and we fall back to our
+traditional methods of invoking different system APIs.
+  The APIs are exposed through component library_mysys.
+
+Changes:
+  The following configurations will be affected by this change; when the
+server is run either in a container, or it is run with restricted
+resources (for example, number of CPUs limited with taskset) depending
+on the changes in the number of logical CPUs or available physical
+memory:
+
+1. The InnoDB configurations whose default values are calculated based
+on the number of logical CPUs:
+  1.1. innodb_buffer_pool_instances (and innodb_page_cleaners)
+  1.2. innodb_purge_threads
+  1.3. innodb_read_io_threads
+  1.4. innodb_parallel_read_threads
+  1.5. innodb_redo_log_capacity only when innodb_dedicated_server is ON
+  1.6. innodb_log_writer_threads
+
+2. The configurations whose default values are calculated based
+on the available physical memory:
+  2.1. temptable_max_ram
+  2.2. innodb_buffer_pool_size only when innodb_dedicated_server is ON
+
+Remarks:
+  The case of no limits being set by the container and failure to read
+the limits set by the container, are treated as the same - fallback to
+existing APIs to read required parameters.
+
+Change-Id: Ibda3b72fa64203b4c5e9886c75a80c85d317dc08
+(cherry picked from commit 3e27908e5cb33b007f345da97a6d480719252881)
+---
+ components/library_mysys/CMakeLists.txt       |  24 +++
+ components/library_mysys/my_system.cc         | 100 +++++++++++
+ .../my_system_api/my_system_api.h             |  56 ++++++
+ .../my_system_api/my_system_api_apple.cc      |  45 +++++
+ .../my_system_api/my_system_api_cgroup.cc     | 162 ++++++++++++++++++
+ .../my_system_api/my_system_api_common.cc     |  41 +++++
+ .../my_system_api/my_system_api_freebsd.cc    |  57 ++++++
+ .../my_system_api/my_system_api_linux.cc      |  58 +++++++
+ .../my_system_api/my_system_api_solaris.cc    |  59 +++++++
+ .../my_system_api/my_system_api_win.cc        |  59 +++++++
+ .../components/library_mysys/my_system.h      |  58 +++++++
+ sql/CMakeLists.txt                            |   2 +-
+ .../platform/thread_attrs_api.h               |  18 --
+ .../platform/thread_attrs_api_apple.cc        |  11 --
+ .../platform/thread_attrs_api_common.cc       |  12 +-
+ .../platform/thread_attrs_api_freebsd.cc      |  25 +--
+ .../platform/thread_attrs_api_linux.cc        |  44 +----
+ .../platform/thread_attrs_api_solaris.cc      |  19 --
+ .../platform/thread_attrs_api_win.cc          |  23 ---
+ sql/resourcegroups/resource_group_mgr.cc      |   4 +-
+ sql/sql_thd_api.cc                            |   6 +-
+ sql/sys_vars.h                                |   1 -
+ storage/innobase/CMakeLists.txt               |   2 +-
+ storage/innobase/fil/fil0fil.cc               |  29 +++-
+ storage/innobase/handler/ha_innodb.cc         |  23 +--
+ storage/innobase/include/fil0fil.h            |   2 +
+ storage/innobase/include/os0numa.h            |   7 +-
+ storage/innobase/srv/srv0srv.cc               |  40 +----
+ storage/innobase/trx/trx0sys.cc               |   4 +-
+ 29 files changed, 772 insertions(+), 219 deletions(-)
+ create mode 100644 components/library_mysys/my_system.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api.h
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_apple.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_cgroup.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_common.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_freebsd.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_linux.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_solaris.cc
+ create mode 100644 components/library_mysys/my_system_api/my_system_api_win.cc
+ create mode 100644 include/mysql/components/library_mysys/my_system.h
+
+diff --git a/components/library_mysys/CMakeLists.txt b/components/library_mysys/CMakeLists.txt
+index 223dd643d..ee69025e6 100644
+--- a/components/library_mysys/CMakeLists.txt
++++ b/components/library_mysys/CMakeLists.txt
+@@ -23,7 +23,31 @@
+ 
+ DISABLE_MISSING_PROFILE_WARNING()
+ 
++SET(MY_SYSTEM_SOURCES
++  my_system.cc
++  my_system_api/my_system_api_cgroup.cc
++  my_system_api/my_system_api_common.cc
++)
++
++IF(LINUX)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_linux.cc)
++ELSEIF(APPLE)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_apple.cc)
++ELSEIF(FREEBSD)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_freebsd.cc)
++ELSEIF(SOLARIS)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_solaris.cc)
++ELSEIF(WIN32)
++  LIST(APPEND MY_SYSTEM_SOURCES
++    my_system_api/my_system_api_win.cc)
++ENDIF()
++
+ ADD_LIBRARY(library_mysys STATIC
+   my_memory.cc
+   my_hex_tools.cc
++  ${MY_SYSTEM_SOURCES}
+ )
+diff --git a/components/library_mysys/my_system.cc b/components/library_mysys/my_system.cc
+new file mode 100644
+index 000000000..a76f8dd2f
+--- /dev/null
++++ b/components/library_mysys/my_system.cc
+@@ -0,0 +1,100 @@
++/* Copyright (c) 2024, 2025, Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   Without limiting anything contained in the foregoing, this file,
++   which is part of C Driver for MySQL (Connector/C), is also subject to the
++   Universal FOSS Exception, version 1.0, a copy of which can be found at
++   http://oss.oracle.com/licenses/universal-foss-exception.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++/**
++  @file components/library_mysys/my_system.cc Functions to retrieve system
++  information like total physical memory and total number of logical CPUs
++  adhering to limits set by cgroups
++*/
++
++#include <cassert>
++#include <cstdint>
++#include <thread>
++
++#include "my_config.h"  // HAVE_UNISTD_H
++#include "my_system_api/my_system_api.h"
++#include "mysql/components/library_mysys/my_system.h"
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++#ifdef HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
++uint64_t my_physical_memory() noexcept {
++  try {
++    uint64_t mem = 0;
++#ifdef _WIN32
++    MEMORYSTATUSEX ms;
++    ms.dwLength = sizeof(ms);
++    GlobalMemoryStatusEx(&ms);
++    mem = ms.ullTotalPhys;
++#elif defined(HAVE_UNISTD_H) /* _WIN32 */
++    mem = my_cgroup_mem_limit();
++    if (mem != 0) {
++      return mem;
++    }
++
++    long pages = sysconf(_SC_PHYS_PAGES);
++    long pagesize = sysconf(_SC_PAGESIZE);
++    if (pages > 0 && pagesize > 0) {
++      mem = static_cast<uint64_t>(pages * pagesize);
++    }
++#else
++#error "Missing implementation of sysconf or GlobalMemoryStatusEx"
++#endif /* HAVE_UNISTD_H */
++    assert(mem != 0);
++    return mem;
++  } catch (...) {
++    return 0;
++  }
++}
++
++uint32_t my_num_vcpus() noexcept {
++  try {
++    uint32_t n_vcpus = 0;
++
++#ifndef _WIN32
++    n_vcpus = my_cgroup_vcpu_limit();
++    if (n_vcpus != 0) {
++      return n_vcpus;
++    }
++#endif
++
++    n_vcpus = my_system_num_vcpus();
++    if (n_vcpus != 0) {
++      return n_vcpus;
++    }
++
++    return std::thread::hardware_concurrency();
++  } catch (...) {
++    return 0;
++  }
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api.h b/components/library_mysys/my_system_api/my_system_api.h
+new file mode 100644
+index 000000000..c13531286
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api.h
+@@ -0,0 +1,56 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#pragma once
++
++/**
++  Read the memory limit set by the container. Try cgroup v2, and then cgroup v1
++  @return memory limit set by cgroup v2 or cgroup v1; or 0
++  @note Return value of 0 implies either no limits are set or server is not
++  running in a container
++*/
++uint64_t my_cgroup_mem_limit();
++
++/**
++  Read the CPU limit set by the container. Try cgroup v2, and then cgroup v1
++  @return CPU limit set by cgroup v2 or cgroup v1; or 0
++  @note Return value of 0 implies either no limits are set or server is not
++  running in a container
++*/
++uint32_t my_cgroup_vcpu_limit();
++
++/**
++  Find number of VCPUs as seen by the current process based on the
++  affinity between each process and VCPU.
++*/
++uint32_t num_vcpus_using_affinity();
++
++/**
++  Get the number of VCPUS based on system configuration.
++*/
++uint32_t num_vcpus_using_config();
++
++/**
++  Get the number of VCPU.
++*/
++uint32_t my_system_num_vcpus();
+diff --git a/components/library_mysys/my_system_api/my_system_api_apple.cc b/components/library_mysys/my_system_api/my_system_api_apple.cc
+new file mode 100644
+index 000000000..2dedd4c91
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_apple.cc
+@@ -0,0 +1,45 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <sys/sysctl.h>
++#include <cstdint>
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_apple.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t num_vcpus_using_affinity() { return 0; }
++
++uint32_t num_vcpus_using_config() {
++  int name[2] = {CTL_HW, HW_AVAILCPU};
++  int ncpu;
++
++  size_t size = sizeof(ncpu);
++  sysctl(name, 2, &ncpu, &size, nullptr, 0);
++  return ncpu;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_cgroup.cc b/components/library_mysys/my_system_api/my_system_api_cgroup.cc
+new file mode 100644
+index 000000000..d96ec25a6
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_cgroup.cc
+@@ -0,0 +1,162 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <cstdint>
++#include <fstream>
++#include <optional>
++#include <string_view>
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_cgroup.cc
++  Functions to retrieve total physical memory and total number of logical CPUs
++  available to the server by reading the limits set by cgroups
++*/
++
++namespace {
++/** cgroup v1 path to file containing CPU quota */
++constexpr std::string_view quota_path{"/sys/fs/cgroup/cpu/cpu.cfs_quota_us"};
++/** cgroup v1 path to file containing CPU period */
++constexpr std::string_view period_path{"/sys/fs/cgroup/cpu/cpu.cfs_period_us"};
++/** cgroup v1 path to file containing Memory limits */
++constexpr std::string_view mem_path_v1{
++    "/sys/fs/cgroup/memory/memory.limit_in_bytes"};
++
++/** cgroup v2 path to file containing CPU limts */
++constexpr std::string_view cpu_path_v2{"/sys/fs/cgroup/cpu.max"};
++/** cgroup v2 path to file containing Memory limits */
++constexpr std::string_view mem_path_v2{"/sys/fs/cgroup/memory.max"};
++
++/**
++  Utility: Read the first line from the file specified in path and copy its
++  contents into the arguments passed
++  @param[in]   path  Path to file
++  @param[out]  args  Pass the arguments that you expect to read from the file
++  in the order of their appearance in the file
++  @return true if able to read and parse the file, false otherwise
++*/
++template <typename... Args>
++bool read_line_from_file(const std::string_view &path, Args &...args) {
++  std::ifstream file(path.data());
++  if (!file.is_open()) {
++    return false;
++  }
++
++  (file >> ... >> args);
++
++  /* Unable to parse contents or hit error */
++  if (file.fail() || file.bad()) {
++    return false;
++  }
++  return true;
++}
++
++/**
++  Read CPU limits as if it were set by cgroup v1
++  @return CPU limits set by cgroup v1 or std::nullopt on failure
++  @note Return value of 0.0 implies no limits are set
++*/
++std::optional<uint32_t> cgroup_v1_cpu() {
++  int32_t quota;
++  uint32_t period;
++
++  /* When no limits are set, -1 is written to the file quota_path */
++  if (!read_line_from_file(quota_path, quota) || quota < 0) {
++    return std::nullopt;
++  }
++
++  if (!read_line_from_file(period_path, period) || period == 0) {
++    return std::nullopt;
++  }
++  return static_cast<uint32_t>(quota) / period;
++}
++
++/**
++  Read memory limits as if it were set by cgroup v1
++  @return Memory limits set by cgroup v1 or std::nullopt on failure
++  @note Return value of 0.0 implies no limits are set
++*/
++std::optional<uint64_t> cgroup_v1_memory() {
++  uint64_t memory;
++
++  if (!read_line_from_file(mem_path_v1, memory)) {
++    return std::nullopt;
++  }
++  return memory;
++}
++
++/**
++  Read CPU limits as if it were set by cgroup v2
++  @return CPU limits set by cgroup v2 or std::nullopt on failure
++  @note Return value of 0.0 implies no limits are set
++*/
++std::optional<uint32_t> cgroup_v2_cpu() {
++  uint32_t quota, period;
++
++  if (!read_line_from_file(cpu_path_v2.data(), quota, period)) {
++    return std::nullopt;
++  }
++
++  if (period == 0) {
++    return std::nullopt;
++  }
++  return quota / period;
++}
++
++/**
++  Read Memory limits as if it were set by cgroup v2
++  @return Memory limits set by cgroup v2 or std::nullopt on failure
++  @note Return value of 0.0 implies no limits are set
++*/
++std::optional<uint64_t> cgroup_v2_memory() {
++  uint64_t memory;
++
++  if (!read_line_from_file(mem_path_v2, memory)) {
++    return std::nullopt;
++  }
++  return memory;
++}
++} /* namespace */
++
++uint64_t my_cgroup_mem_limit() {
++  if (const auto v2_mem = cgroup_v2_memory(); v2_mem.has_value()) {
++    return v2_mem.value();
++  }
++
++  if (const auto v1_mem = cgroup_v1_memory(); v1_mem.has_value()) {
++    return v1_mem.value();
++  }
++  return 0;
++}
++
++uint32_t my_cgroup_vcpu_limit() {
++  if (const auto v2_cpu = cgroup_v2_cpu(); v2_cpu.has_value()) {
++    return v2_cpu.value();
++  }
++
++  if (const auto v1_cpu = cgroup_v1_cpu(); v1_cpu.has_value()) {
++    return v1_cpu.value();
++  }
++  return 0;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_common.cc b/components/library_mysys/my_system_api/my_system_api_common.cc
+new file mode 100644
+index 000000000..f7b5f4392
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_common.cc
+@@ -0,0 +1,41 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <cstdint>
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_common.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t my_system_num_vcpus() {
++  uint32_t nprocs = num_vcpus_using_affinity();
++  if (nprocs == 0) {
++    nprocs = num_vcpus_using_config();
++  }
++  return nprocs;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_freebsd.cc b/components/library_mysys/my_system_api/my_system_api_freebsd.cc
+new file mode 100644
+index 000000000..728f09ec4
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_freebsd.cc
+@@ -0,0 +1,57 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <cstdint>
++
++#include <unistd.h>  // getpid
++/* sys/cpuset.h requires sys/types.h which is included in unistd.h */
++#include <sys/cpuset.h>  // cpuset_t
++#include <sys/sysctl.h>  // sysctlbyname
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_apple.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t num_vcpus_using_affinity() {
++  cpuset_t cs;
++  CPU_ZERO(&cs);
++  if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, getpid(), sizeof(cs),
++                         &cs) != 0) {
++    return 0;
++  }
++  return CPU_COUNT(&cs);
++}
++
++uint32_t num_vcpus_using_config() {
++  uint32_t num_vcpus = 0;
++  size_t num_vcpus_size = sizeof(uint32_t);
++  if (sysctlbyname("hw.ncpu", &num_vcpus, &num_vcpus_size, nullptr, 0) != 0) {
++    num_vcpus = 0;
++  }
++  return num_vcpus;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_linux.cc b/components/library_mysys/my_system_api/my_system_api_linux.cc
+new file mode 100644
+index 000000000..d7a39bef8
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_linux.cc
+@@ -0,0 +1,58 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <sched.h>
++#include <unistd.h>
++#include <cstdint>
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_linux.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t num_vcpus_using_affinity() {
++  cpu_set_t cs;
++  CPU_ZERO(&cs);
++
++  if (sched_getaffinity(getpid(), sizeof(cs), &cs) != 0) {
++    return 0;
++  }
++
++  return CPU_COUNT(&cs);
++}
++
++uint32_t num_vcpus_using_config() {
++  uint32_t num_vcpus = 0;
++
++#ifdef _SC_NPROCESSORS_ONLN
++  num_vcpus = sysconf(_SC_NPROCESSORS_ONLN);
++#elif defined(_SC_NPROCESSORS_CONF)
++  num_vcpus = sysconf(_SC_NPROCESSORS_CONF);
++#endif
++
++  return num_vcpus;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_solaris.cc b/components/library_mysys/my_system_api/my_system_api_solaris.cc
+new file mode 100644
+index 000000000..e715e44ca
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_solaris.cc
+@@ -0,0 +1,59 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include "my_config.h"  // HAVE_UNISTD_H
++
++#include <sys/pset.h>
++#include <sys/types.h>
++#include <cstdint>
++
++#ifdef HAVE_UNISTD_H
++#include <unistd.h>
++#endif
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_solaris.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t num_vcpus_using_affinity() {
++  uint32_t num_vcpus = 0;
++  pid_t pid = getpid();
++  psetid_t pset = PS_NONE;
++
++  if (pset_bind(PS_QUERY, P_PID, pid, &pset) == 0 && pset != PS_NONE) {
++    pset_info(pset, nullptr, &num_vcpus, nullptr);
++  }
++  return num_vcpus;
++}
++
++uint32_t num_vcpus_using_config() {
++  uint32_t num_vcpus = 0;
++
++  pset_info(P_MYID, nullptr, &num_vcpus, nullptr);
++  return num_vcpus;
++}
+diff --git a/components/library_mysys/my_system_api/my_system_api_win.cc b/components/library_mysys/my_system_api/my_system_api_win.cc
+new file mode 100644
+index 000000000..b281a2e0d
+--- /dev/null
++++ b/components/library_mysys/my_system_api/my_system_api_win.cc
+@@ -0,0 +1,59 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#include <windows.h>
++// This comment ensure that <windows.h> is included before <processthreadsapi.h>
++#include <processthreadsapi.h>
++#include <cstdint>
++
++#include "my_system_api.h"
++
++/**
++  @file components/library_mysys/my_system_api/my_system_api_win.cc
++  Functions to fetch the number of VCPUs from the system. APIs retrieve this
++  information using the affinity between the process and the VCPU or by reading
++  the system configuration
++*/
++
++uint32_t num_vcpus_using_affinity() {
++  uint32_t num_vcpus = 0;
++
++  DWORD_PTR process_affinity_mask;
++  DWORD_PTR system_affinity_mask;
++
++  if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity_mask,
++                             &system_affinity_mask)) {
++    for (num_vcpus = 0; process_affinity_mask != 0; process_affinity_mask >>= 1)
++      if (process_affinity_mask & 1) num_vcpus++;
++  }
++  return num_vcpus;
++}
++
++uint32_t num_vcpus_using_config() {
++  uint32_t num_vcpus = 0;
++
++  SYSTEM_INFO si;
++  GetSystemInfo(&si);
++  num_vcpus = si.dwNumberOfProcessors;
++  return num_vcpus;
++}
+diff --git a/include/mysql/components/library_mysys/my_system.h b/include/mysql/components/library_mysys/my_system.h
+new file mode 100644
+index 000000000..4f73e02c9
+--- /dev/null
++++ b/include/mysql/components/library_mysys/my_system.h
+@@ -0,0 +1,58 @@
++/* Copyright (c) 2025 Oracle and/or its affiliates.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License, version 2.0,
++   as published by the Free Software Foundation.
++
++   This program is designed to work with certain software (including
++   but not limited to OpenSSL) that is licensed under separate terms,
++   as designated in a particular file or component or in included license
++   documentation.  The authors of MySQL hereby grant you an additional
++   permission to link the program and your derivative works with the
++   separately licensed software that they have either included with
++   the program or referenced in the documentation.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License, version 2.0, for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
++
++#pragma once
++
++#include <cstdint>
++
++/**
++  Determine the total physical memory available in bytes.
++
++  If process is running within a container, then memory available is the maximum
++  limit set for the container. If the process is not running in a container then
++  it uses the appropriate system APIs to determine the available memory.
++
++  If the API is unable to determine the available memory, then it returns 0.
++
++   @return physical memory in bytes or 0
++*/
++uint64_t my_physical_memory() noexcept;
++
++/**
++  Determine the total number of logical CPUs available.
++
++  If process is running within a container, the number of logical CPUs is the
++  maximum limit set for the container. If the process is not running in a
++  container then it uses the appropriate system APIs to determine the number of
++  logical CPUs.
++
++  If the API is unable to determine the number of logical CPUs, then it returns
++  0.
++
++  @note: The container set limits are calculated from the CFS quota and period
++  as quota/period and is round down. A limit of 0.5 will return the value 0 and
++  is treated as though no limits are set.
++
++  @return number of logical CPUs or 0
++*/
++uint32_t my_num_vcpus() noexcept;
+diff --git a/sql/CMakeLists.txt b/sql/CMakeLists.txt
+index 3d96616ab..f143fe905 100644
+--- a/sql/CMakeLists.txt
++++ b/sql/CMakeLists.txt
+@@ -946,7 +946,7 @@ TARGET_LINK_LIBRARIES(sql_main extra::unordered_dense)
+ TARGET_LINK_LIBRARIES(sql_main ${MYSQLD_STATIC_PLUGIN_LIBS}
+   mysql_server_component_services mysys strings vio
+   binlogevents_static ${LIBWRAP} ${LIBDL} ${SSL_LIBRARIES}
+-  extra::rapidjson)
++  extra::rapidjson library_mysys)
+ 
+ # sql/immutable_string.h uses
+ # google::protobuf::io::CodedOutputStream::WriteVarint64ToArray
+diff --git a/sql/resourcegroups/platform/thread_attrs_api.h b/sql/resourcegroups/platform/thread_attrs_api.h
+index 02548b504..ed16f9375 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api.h
++++ b/sql/resourcegroups/platform/thread_attrs_api.h
+@@ -132,24 +132,6 @@ bool set_thread_priority(int priority);
+ 
+ bool set_thread_priority(int priority, my_thread_os_id_t thread_id);
+ 
+-/**
+-  Find number of VCPUs as seen by the current process based on the
+-  affinity between each process and VCPU.
+-*/
+-uint32_t num_vcpus_using_affinity();
+-
+-/**
+-  Get the number of VCPUS based on system configuration.
+-*/
+-
+-uint32_t num_vcpus_using_config();
+-
+-/**
+-  Get the number of VCPU.
+-*/
+-
+-uint32_t num_vcpus();
+-
+ /**
+   Check if thread priority setting is allowed on the platform or not.
+ 
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_apple.cc b/sql/resourcegroups/platform/thread_attrs_api_apple.cc
+index 87f8cd42e..7d01f9abd 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_apple.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_apple.cc
+@@ -83,17 +83,6 @@ bool set_thread_priority(int, my_thread_os_id_t) {
+   return true;
+ }
+ 
+-uint32_t num_vcpus_using_affinity() { return 0; }
+-
+-uint32_t num_vcpus_using_config() {
+-  int name[2] = {CTL_HW, HW_AVAILCPU};
+-  int ncpu;
+-
+-  size_t size = sizeof(ncpu);
+-  sysctl(name, 2, &ncpu, &size, nullptr, 0);
+-  return ncpu;
+-}
+-
+ bool can_thread_priority_be_set() {
+   assert(0);
+   return false;
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_common.cc b/sql/resourcegroups/platform/thread_attrs_api_common.cc
+index c04255ed2..c90275939 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_common.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_common.cc
+@@ -25,8 +25,7 @@
+ 
+ #include "sql/resourcegroups/platform/thread_attrs_api.h"
+ 
+-namespace resourcegroups {
+-namespace platform {
++namespace resourcegroups::platform {
+ bool is_valid_thread_priority(int priority) {
+   return (priority >= -20 && priority <= 19);
+ }
+@@ -34,11 +33,4 @@ bool is_valid_thread_priority(int priority) {
+ int min_thread_priority_value() { return -20; }
+ 
+ int max_thread_priority_value() { return 19; }
+-
+-uint32_t num_vcpus() {
+-  uint32_t nprocs = num_vcpus_using_affinity();
+-  if (nprocs == 0) nprocs = num_vcpus_using_config();
+-  return nprocs;
+-}
+-}  // namespace platform
+-}  // namespace resourcegroups
++}  // namespace resourcegroups::platform
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_freebsd.cc b/sql/resourcegroups/platform/thread_attrs_api_freebsd.cc
+index 10cc7c4bb..2d38944d5 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_freebsd.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_freebsd.cc
+@@ -30,6 +30,7 @@
+ 
+ #include "my_dbug.h"
+ #include "my_sys.h"
++#include "mysql/components/library_mysys/my_system.h"
+ #include "mysql/components/services/log_builtins.h"
+ #include "mysqld_error.h"
+ 
+@@ -92,7 +93,7 @@ bool unbind_thread(my_thread_os_id_t thread_id) {
+   cpuset_t cpu_set;
+ 
+   CPU_ZERO(&cpu_set);
+-  uint32_t num_cpus = num_vcpus_using_config();
++  uint32_t num_cpus = my_num_vcpus();
+   if (num_cpus == 0) {
+     char errbuf[MYSQL_ERRMSG_SIZE];
+     LogErr(ERROR_LEVEL, ER_RES_GRP_THD_UNBIND_FROM_CPU_FAILED, thread_id,
+@@ -137,28 +138,6 @@ bool set_thread_priority(int, my_thread_os_id_t) {
+   return false;
+ }
+ 
+-uint32_t num_vcpus_using_affinity() {
+-  uint32_t num_vcpus = 0;
+-
+-#ifdef HAVE_PTHREAD_GETAFFINITY_NP
+-  cpuset_t set;
+-
+-  if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) == 0)
+-    num_vcpus = CPU_COUNT(&set);
+-#endif  // HAVE_PTHREAD_GETAFFINITY_NP
+-  return num_vcpus;
+-}
+-
+-uint32_t num_vcpus_using_config() {
+-  cpu_id_t num_vcpus = 0;
+-  size_t num_vcpus_size = sizeof(cpu_id_t);
+-  if (sysctlbyname("hw.ncpu", &num_vcpus, &num_vcpus_size, nullptr, 0) != 0) {
+-    LogErr(ERROR_LEVEL, ER_RES_GRP_FAILED_DETERMINE_CPU_COUNT);
+-    num_vcpus = 0;
+-  }
+-  return num_vcpus;
+-}
+-
+ bool can_thread_priority_be_set() { return false; }
+ }  // namespace platform
+ }  // namespace resourcegroups
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_linux.cc b/sql/resourcegroups/platform/thread_attrs_api_linux.cc
+index 517b3b095..c36df17d3 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_linux.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_linux.cc
+@@ -22,11 +22,11 @@
+    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
+ 
+ #include <sched.h>
+-#include <stdint.h>
+-#include <string.h>
+ #include <sys/resource.h>
+ #include <syscall.h>
+ #include <unistd.h>
++#include <cstdint>
++#include <cstring>
+ 
+ #include <linux/capability.h>
+ #include <vector>
+@@ -37,11 +37,11 @@
+ #include "thread_attrs_api.h"
+ 
+ #include "my_dbug.h"  // DBUG_*
++#include "mysql/components/library_mysys/my_system.h"
+ #include "mysql/components/services/log_builtins.h"
+ #include "mysqld_error.h"
+ 
+-namespace resourcegroups {
+-namespace platform {
++namespace resourcegroups::platform {
+ 
+ bool is_platform_supported() { return true; }
+ 
+@@ -56,7 +56,7 @@ bool bind_to_cpu(cpu_id_t cpu_id, my_thread_os_id_t thread_id) {
+ 
+   CPU_ZERO(&cpu_set);
+   CPU_SET(cpu_id, &cpu_set);
+-  int rc = ::sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
++  int const rc = ::sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
+   if (rc != 0) {
+     char errbuf[MYSQL_ERRMSG_SIZE];
+     LogErr(ERROR_LEVEL, ER_RES_GRP_SET_THR_AFFINITY_FAILED, thread_id, cpu_id,
+@@ -80,7 +80,7 @@ bool bind_to_cpus(const std::vector<cpu_id_t> &cpu_ids,
+ 
+   CPU_ZERO(&cpu_set);
+   for (const auto &cpu_id : cpu_ids) CPU_SET(cpu_id, &cpu_set);
+-  int rc = ::sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
++  int const rc = ::sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
+   if (rc != 0) {
+     char errbuf[MYSQL_ERRMSG_SIZE];
+     LogErr(ERROR_LEVEL, ER_RES_GRP_SET_THR_AFFINITY_FAILED, thread_id,
+@@ -98,7 +98,7 @@ bool unbind_thread(my_thread_os_id_t thread_id) {
+   cpu_set_t cpu_set;
+ 
+   CPU_ZERO(&cpu_set);
+-  uint32_t num_cpus = num_vcpus_using_config();
++  uint32_t num_cpus = my_num_vcpus();
+   if (num_cpus == 0) {
+     char errbuf[MYSQL_ERRMSG_SIZE];
+     LogErr(ERROR_LEVEL, ER_RES_GRP_THD_UNBIND_FROM_CPU_FAILED, thread_id,
+@@ -114,7 +114,7 @@ bool unbind_thread(my_thread_os_id_t thread_id) {
+                   assert(num_cpus > 1););
+   for (cpu_id_t cpu_id = 0; cpu_id < num_cpus; ++cpu_id)
+     CPU_SET(cpu_id, &cpu_set);
+-  int rc = sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
++  int const rc = sched_setaffinity(thread_id, sizeof(cpu_set), &cpu_set);
+   if (rc != 0) {
+     char errbuf[MYSQL_ERRMSG_SIZE];
+     LogErr(ERROR_LEVEL, ER_RES_GRP_THD_UNBIND_FROM_CPU_FAILED, thread_id,
+@@ -151,31 +151,6 @@ bool set_thread_priority(int priority, my_thread_os_id_t thread_id) {
+   return false;
+ }
+ 
+-uint32_t num_vcpus_using_affinity() {
+-  uint32_t num_vcpus = 0;
+-
+-#ifdef HAVE_PTHREAD_GETAFFINITY_NP
+-  cpu_set_t set;
+-
+-  if (pthread_getaffinity_np(pthread_self(), sizeof(set), &set) == 0)
+-    num_vcpus = CPU_COUNT(&set);
+-#endif  // HAVE_PTHREAD_GETAFFINITY_NP
+-
+-  return num_vcpus;
+-}
+-
+-uint32_t num_vcpus_using_config() {
+-  cpu_id_t num_vcpus = 0;
+-
+-#ifdef _SC_NPROCESSORS_ONLN
+-  num_vcpus = sysconf(_SC_NPROCESSORS_ONLN);
+-#elif defined(_SC_NPROCESSORS_CONF)
+-  num_vcpus = sysconf(_SC_NPROCESSORS_CONF);
+-#endif
+-
+-  return num_vcpus;
+-}
+-
+ bool can_thread_priority_be_set() {
+   if (geteuid() == 0) return true;
+ 
+@@ -193,5 +168,4 @@ bool can_thread_priority_be_set() {
+   LogErr(ERROR_LEVEL, ER_RES_GRP_FAILED_TO_DETERMINE_NICE_CAPABILITY);
+   return false;
+ }
+-}  // namespace platform
+-}  // namespace resourcegroups
++}  // namespace resourcegroups::platform
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_solaris.cc b/sql/resourcegroups/platform/thread_attrs_api_solaris.cc
+index 2e36a7c7f..db59b83dd 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_solaris.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_solaris.cc
+@@ -25,7 +25,6 @@
+ #include <sys/processor.h>
+ #include <sys/procset.h>
+ #include <sys/types.h>
+-#include "sys/pset.h"
+ 
+ #include "my_dbug.h"
+ #include "my_sys.h"
+@@ -148,24 +147,6 @@ bool set_thread_priority(int, my_thread_os_id_t) {
+   return false;
+ }
+ 
+-uint32_t num_vcpus_using_affinity() {
+-  uint32_t num_vcpus = 0;
+-  pid_t pid = getpid();
+-  psetid_t pset = PS_NONE;
+-
+-  if (pset_bind(PS_QUERY, P_PID, pid, &pset) == 0 && pset != PS_NONE) {
+-    pset_info(pset, nullptr, &num_vcpus, nullptr);
+-  }
+-  return num_vcpus;
+-}
+-
+-uint32_t num_vcpus_using_config() {
+-  uint32_t num_vcpus = 0;
+-
+-  pset_info(P_MYID, nullptr, &num_vcpus, nullptr);
+-  return num_vcpus;
+-}
+-
+ bool can_thread_priority_be_set() { return false; }
+ }  // namespace platform
+ }  // namespace resourcegroups
+diff --git a/sql/resourcegroups/platform/thread_attrs_api_win.cc b/sql/resourcegroups/platform/thread_attrs_api_win.cc
+index fa848c277..d3d72e8ae 100644
+--- a/sql/resourcegroups/platform/thread_attrs_api_win.cc
++++ b/sql/resourcegroups/platform/thread_attrs_api_win.cc
+@@ -173,29 +173,6 @@ bool set_thread_priority(int priority, my_thread_os_id_t thread_id) {
+   return res == FALSE;
+ }
+ 
+-uint32_t num_vcpus_using_affinity() {
+-  uint32_t num_vcpus = 0;
+-
+-  DWORD_PTR process_affinity_mask;
+-  DWORD_PTR system_affinity_mask;
+-
+-  if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity_mask,
+-                             &system_affinity_mask)) {
+-    for (num_vcpus = 0; process_affinity_mask != 0; process_affinity_mask >>= 1)
+-      if (process_affinity_mask & 1) num_vcpus++;
+-  }
+-  return num_vcpus;
+-}  // namespace platform
+-
+-uint32_t num_vcpus_using_config() {
+-  cpu_id_t num_vcpus = 0;
+-
+-  SYSTEM_INFO si;
+-  GetSystemInfo(&si);
+-  num_vcpus = si.dwNumberOfProcessors;
+-  return num_vcpus;
+-}
+-
+ bool can_thread_priority_be_set() { return true; }
+ }  // namespace platform
+ }  // namespace resourcegroups
+diff --git a/sql/resourcegroups/resource_group_mgr.cc b/sql/resourcegroups/resource_group_mgr.cc
+index cea987da2..12e34e3c8 100644
+--- a/sql/resourcegroups/resource_group_mgr.cc
++++ b/sql/resourcegroups/resource_group_mgr.cc
+@@ -37,6 +37,7 @@
+ #include "my_compiler.h"
+ #include "my_psi_config.h"
+ #include "my_sys.h"
++#include "mysql/components/library_mysys/my_system.h"  // my_num_vcpus
+ #include "mysql/components/services/bits/psi_bits.h"
+ #include "mysql/components/services/log_builtins.h"  // LogErr
+ #include "mysql/psi/mysql_rwlock.h"
+@@ -55,7 +56,6 @@
+ #include "sql/handler.h"
+ #include "sql/log.h"     // LogErr
+ #include "sql/mysqld.h"  // key_resource_group_mgr*
+-#include "sql/resourcegroups/platform/thread_attrs_api.h"
+ #include "sql/resourcegroups/resource_group.h"
+ #include "sql/resourcegroups/thread_resource_control.h"
+ #include "sql/sql_class.h"  // class THD
+@@ -414,7 +414,7 @@ bool Resource_group_mgr::init() {
+       std::unique_ptr<Resource_group>(m_sys_default_resource_group));
+ 
+   // Initialize number of VCPUs.
+-  m_num_vcpus = platform::num_vcpus();
++  m_num_vcpus = my_num_vcpus();
+   return false;
+ }
+ 
+diff --git a/sql/sql_thd_api.cc b/sql/sql_thd_api.cc
+index 47cb9a504..54a7d2743 100644
+--- a/sql/sql_thd_api.cc
++++ b/sql/sql_thd_api.cc
+@@ -35,6 +35,7 @@
+ #include "my_sqlcommand.h"
+ #include "my_thread.h"
+ #include "my_thread_local.h"
++#include "mysql/components/library_mysys/my_system.h"
+ #include "mysql/components/services/bits/psi_stage_bits.h"
+ #include "mysql/components/services/bits/psi_thread_bits.h"
+ #include "mysql/plugin.h"
+@@ -49,7 +50,6 @@
+ #include "sql/mysqld.h"  // key_thread_one_connection
+ #include "sql/protocol_classic.h"
+ #include "sql/query_options.h"
+-#include "sql/resourcegroups/platform/thread_attrs_api.h"  // num_vcpus
+ #include "sql/rpl_replica_commit_order_manager.h"  // check_and_report_deadlock
+ #include "sql/rpl_rli.h"                           // is_mts_worker
+ #include "sql/sql_alter.h"
+@@ -707,9 +707,7 @@ void remove_ssl_err_thread_state() {
+ #endif
+ }
+ 
+-unsigned int thd_get_num_vcpus() {
+-  return resourcegroups::platform::num_vcpus();
+-}
++unsigned int thd_get_num_vcpus() { return my_num_vcpus(); }
+ 
+ bool thd_check_connection_admin_privilege(MYSQL_THD thd) {
+   Security_context *sctx = thd->security_context();
+diff --git a/sql/sys_vars.h b/sql/sys_vars.h
+index be0f4633c..527b647b4 100644
+--- a/sql/sys_vars.h
++++ b/sql/sys_vars.h
+@@ -51,7 +51,6 @@
+ #include "my_dbug.h"
+ #include "my_getopt.h"
+ #include "my_inttypes.h"
+-#include "my_sys.h"
+ #include "mysql/plugin.h"
+ #include "mysql/service_mysql_alloc.h"
+ #include "mysql/status_var.h"
+diff --git a/storage/innobase/CMakeLists.txt b/storage/innobase/CMakeLists.txt
+index 67df9d1fa..29fb62566 100644
+--- a/storage/innobase/CMakeLists.txt
++++ b/storage/innobase/CMakeLists.txt
+@@ -344,7 +344,7 @@ MYSQL_ADD_PLUGIN(innobase
+   MANDATORY
+   MODULE_OUTPUT_NAME ha_innodb
+   LINK_LIBRARIES sql_dd sql_gis ext::zlib ext::lz4 ${NUMA_LIBRARY}
+-                 extra::rapidjson)
++                 extra::rapidjson library_mysys)
+ 
+ # On linux: /usr/include/stdio.h:#define BUFSIZ 8192
+ # On Solaris: /usr/include/iso/stdio_iso.h:#define    BUFSIZ  1024
+diff --git a/storage/innobase/fil/fil0fil.cc b/storage/innobase/fil/fil0fil.cc
+index 0d222611b..6b57ef8b3 100644
+--- a/storage/innobase/fil/fil0fil.cc
++++ b/storage/innobase/fil/fil0fil.cc
+@@ -71,6 +71,7 @@ The tablespace memory cache */
+ #ifndef UNIV_HOTBACKUP
+ #include "buf0lru.h"
+ #include "ibuf0ibuf.h"
++#include "mysql/components/library_mysys/my_system.h"  // my_num_vcpus
+ #include "os0event.h"
+ #include "row0mysql.h"
+ #include "sql_backup_lock.h"
+@@ -130,6 +131,7 @@ struct Moved {
+ using Tablespaces = std::vector<Moved>;
+ }  // namespace dd_fil
+ 
++#ifndef UNIV_HOTBACKUP
+ size_t fil_get_scan_threads(size_t num_files) {
+   /* Number of additional threads required to scan all the files.
+   n_threads == 0 means that the main thread itself will do all the
+@@ -142,8 +144,7 @@ size_t fil_get_scan_threads(size_t num_files) {
+   }
+ 
+   /* Number of concurrent threads supported by the host machine. */
+-  size_t max_threads =
+-      FIL_SCAN_THREADS_PER_CORE * std::thread::hardware_concurrency();
++  size_t max_threads = FIL_SCAN_THREADS_PER_CORE * my_num_vcpus();
+ 
+   /* If the number of concurrent threads supported by the host
+   machine could not be calculated, assume the supported threads
+@@ -162,6 +163,7 @@ size_t fil_get_scan_threads(size_t num_files) {
+ 
+   return n_threads;
+ }
++#endif /* !UNIV_HOTBACKUP */
+ 
+ /* uint16_t is the index into Tablespace_dirs::m_dirs */
+ using Scanned_files = std::vector<std::pair<uint16_t, std::string>>;
+@@ -498,9 +500,11 @@ class Tablespace_dirs {
+   @param[in]  directories  Directories to scan for ibd and ibu files */
+   void set_scan_dirs(const std::string &directories);
+ 
++#ifndef UNIV_HOTBACKUP
+   /** Discover tablespaces by reading the header from .ibd files.
+   @return DB_SUCCESS if all goes well */
+   [[nodiscard]] dberr_t scan();
++#endif /* !UNIV_HOTBACKUP */
+ 
+   /** Clear all the tablespace file data but leave the list of
+   scanned directories in place. */
+@@ -1629,9 +1633,11 @@ class Fil_system {
+     m_dirs.set_scan_dirs(directories);
+   }
+ 
++#ifndef UNIV_HOTBACKUP
+   /** Scan the directories to build the tablespace ID to file name
+   mapping table. */
+   dberr_t scan() { return m_dirs.scan(); }
++#endif /* !UNIV_HOTBACKUP */
+ 
+   /** Get the tablespace ID from an .ibd and/or an undo tablespace. If the
+   read failed or the ID is 0 on the first page or there is a mismatch of
+@@ -11372,9 +11378,12 @@ void Tablespace_dirs::print_duplicates(const Space_id_set &duplicates) {
+   }
+ }
+ 
+-static bool fil_get_partition_file(const std::string &old_path [[maybe_unused]],
+-                                   ib_file_suffix extn [[maybe_unused]],
+-                                   std::string &new_path [[maybe_unused]]) {
++[[maybe_unused]] static bool fil_get_partition_file(const std::string &old_path
++                                                    [[maybe_unused]],
++                                                    ib_file_suffix extn
++                                                    [[maybe_unused]],
++                                                    std::string &new_path
++                                                    [[maybe_unused]]) {
+   /* Safe check. Never needed on Windows. */
+ #ifdef _WIN32
+   return false;
+@@ -11507,6 +11516,7 @@ void Tablespace_dirs::set_scan_dirs(const std::string &in_directories) {
+   add_paths(directories, separators);
+ }
+ 
++#ifndef UNIV_HOTBACKUP
+ /** Discover tablespaces by reading the header from .ibd files.
+ @return DB_SUCCESS if all goes well */
+ dberr_t Tablespace_dirs::scan() {
+@@ -11636,6 +11646,11 @@ dberr_t Tablespace_dirs::scan() {
+   return err;
+ }
+ 
++/** Discover tablespaces by reading the header from .ibd files.
++@return DB_SUCCESS if all goes well */
++dberr_t fil_scan_for_tablespaces() { return fil_system->scan(); }
++#endif /* !UNIV_HOTBACKUP */
++
+ void fil_set_scan_dir(const std::string &directory, bool is_undo_dir) {
+   fil_system->set_scan_dir(directory, is_undo_dir);
+ }
+@@ -11644,10 +11659,6 @@ void fil_set_scan_dirs(const std::string &directories) {
+   fil_system->set_scan_dirs(directories);
+ }
+ 
+-/** Discover tablespaces by reading the header from .ibd files.
+-@return DB_SUCCESS if all goes well */
+-dberr_t fil_scan_for_tablespaces() { return fil_system->scan(); }
+-
+ /** Check if a path is known to InnoDB meaning that it is in or under
+ one of the four path settings scanned at startup for file discovery.
+ @param[in]  path    Path to check
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index 07fde1552..c350d172a 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -149,6 +149,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ #include "my_io.h"
+ #include "my_macros.h"
+ #include "my_psi_config.h"
++#include "mysql/components/library_mysys/my_system.h"  // my_num_vcpus
+ #include "mysql/components/services/log_builtins.h"
+ #include "mysql/plugin.h"
+ #include "mysql/psi/mysql_data_lock.h"
+@@ -364,22 +365,7 @@ enum default_row_format_enum {
+ 
+ #if defined(_WIN32) || defined(_WIN64)
+ #include <Windows.h>
+-static double get_mem_GlobalMemoryStatus() {
+-  MEMORYSTATUSEX ms;
+-  ms.dwLength = sizeof(ms);
+-  GlobalMemoryStatusEx(&ms);
+-  return (((double)ms.ullTotalPhys) / GB);
+-}
+-#undef get_sys_mem
+-#define get_sys_mem get_mem_GlobalMemoryStatus
+-#else
+-static double get_mem_sysconf() {
+-  return (((double)sysconf(_SC_PHYS_PAGES)) *
+-          ((double)sysconf(_SC_PAGESIZE) / GB));
+-}
+-#undef get_sys_mem
+-#define get_sys_mem get_mem_sysconf
+-#endif /* defined(_WIN32) || defined(_WIN64) */
++#endif
+ 
+ /** Release all acquired services from mysql server. */
+ static void release_plugin_services() {
+@@ -4935,7 +4921,7 @@ static void innodb_buffer_pool_size_init() {
+             variable_name, static_cast<unsigned int>(strlen(variable_name)),
+             &source)) {
+       if (source == COMPILED) {
+-        double server_mem = get_sys_mem();
++        double server_mem = my_physical_memory() / GB;
+ 
+         if (server_mem < 1.0) {
+           ;
+@@ -4988,7 +4974,6 @@ static void innodb_buffer_pool_size_init() {
+              " since innodb_buffer_pool_size is less than "
+           << BUF_POOL_SIZE_THRESHOLD / (1024 * 1024) << " MiB";
+     }
+-
+     srv_buf_pool_instances = 1;
+   }
+ 
+@@ -5094,7 +5079,7 @@ static void innodb_redo_log_capacity_init() {
+             static_cast<unsigned int>(strlen(var_name_buf_pool_size)),
+             &source)) {
+       if (source != COMPILED) {
+-        double server_mem = get_sys_mem();
++        double server_mem = my_physical_memory() / GB;
+ 
+ #ifdef UNIV_DEBUG_DEDICATED
+         server_mem = srv_debug_system_mem_size / GB;
+diff --git a/storage/innobase/include/fil0fil.h b/storage/innobase/include/fil0fil.h
+index 6d394bdc3..52f9b2dbc 100644
+--- a/storage/innobase/include/fil0fil.h
++++ b/storage/innobase/include/fil0fil.h
+@@ -72,12 +72,14 @@ constexpr size_t FIL_SCAN_MAX_THREADS = 16;
+ /** Number of threads per core. */
+ constexpr size_t FIL_SCAN_THREADS_PER_CORE = 2;
+ 
++#ifndef UNIV_HOTBACKUP
+ /** Calculate the number of threads that can be spawned to scan the given
+ number of files taking into the consideration, number of cores available
+ on the machine.
+ @param[in]      num_files       Number of files to be scanned
+ @return number of threads to be spawned for scanning the files */
+ size_t fil_get_scan_threads(size_t num_files);
++#endif /* !UNIV_HOTBACKUP */
+ 
+ /** This tablespace name is used internally during file discovery to open a
+ general tablespace before the data dictionary is recovered and available. */
+diff --git a/storage/innobase/include/os0numa.h b/storage/innobase/include/os0numa.h
+index 967069a03..31eb3ba73 100644
+--- a/storage/innobase/include/os0numa.h
++++ b/storage/innobase/include/os0numa.h
+@@ -42,6 +42,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ #ifndef os0numa_h
+ #define os0numa_h
+ 
++#include "mysql/components/library_mysys/my_system.h"  // my_num_vcpus
+ #include "univ.i"
+ 
+ #ifdef HAVE_LIBNUMA
+@@ -148,11 +149,7 @@ inline int os_numa_num_configured_cpus() {
+ 
+   return (n_cpus);
+ #else
+-  /* Consider
+-  boost::thread::hardware_concurrency() or
+-  std::thread::hardware_concurrency() (C++11) */
+-  ut_error;
+-  return (-1);
++  return my_num_vcpus();
+ #endif
+ }
+ 
+diff --git a/storage/innobase/srv/srv0srv.cc b/storage/innobase/srv/srv0srv.cc
+index e33aec17d..8f05c2b40 100644
+--- a/storage/innobase/srv/srv0srv.cc
++++ b/storage/innobase/srv/srv0srv.cc
+@@ -86,6 +86,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ 
+ #include "my_dbug.h"
+ #include "my_psi_config.h"
++#include "mysql/components/library_mysys/my_system.h" /* my_num_vcpus */
+ 
+ #endif /* !UNIV_HOTBACKUP */
+ #include "srv0srv.h"
+@@ -2372,15 +2373,7 @@ static void srv_update_cpu_usage() {
+   srv_cpu_usage.stime_abs = cpu_stime;
+ 
+   /* Calculate relative. */
+-
+-  cpu_set_t cs;
+-  CPU_ZERO(&cs);
+-  if (sched_getaffinity(0, sizeof(cs), &cs) != 0) {
+-    return;
+-  }
+-
+-  const int n_cpu = CPU_COUNT(&cs);
+-
++  const int n_cpu = my_num_vcpus();
+   srv_cpu_usage.n_cpu = n_cpu;
+   MONITOR_SET(MONITOR_CPU_N, int64_t(n_cpu));
+ 
+@@ -2468,32 +2461,7 @@ static void srv_update_cpu_usage() {
+   srv_cpu_usage.stime_abs = cpu_stime;
+ 
+   /* Calculate relative. */
+-
+-  DWORD_PTR process_affinity_mask;
+-  DWORD_PTR system_affinity_mask;
+-  if (!GetProcessAffinityMask(GetCurrentProcess(), &process_affinity_mask,
+-                              &system_affinity_mask)) {
+-    return;
+-  }
+-
+-  /* If the system has more than 64 processors and the current process
+-     contains threads in multiple groups, GetProcessAffinityMask returns
+-     zero for both affinity masks.
+-  */
+-  if ((process_affinity_mask == 0) && (system_affinity_mask == 0)) {
+-    return;
+-  }
+-
+-  int n_cpu = 0;
+-  constexpr int MAX_CPU_N = 64;
+-  uint64_t j = 1;
+-  for (int i = 0; i < MAX_CPU_N; ++i) {
+-    if (j & process_affinity_mask) {
+-      ++n_cpu;
+-    }
+-    j = j << 1;
+-  }
+-
++  const int n_cpu = my_num_vcpus();
+   srv_cpu_usage.n_cpu = n_cpu;
+   MONITOR_SET(MONITOR_CPU_N, int64_t(n_cpu));
+ 
+@@ -2515,7 +2483,7 @@ static void srv_update_cpu_usage() {
+   srv_cpu_usage.utime_abs = 0;
+   srv_cpu_usage.stime_pct = 0;
+   srv_cpu_usage.stime_abs = 0;
+-  srv_cpu_usage.n_cpu = 1;
++  srv_cpu_usage.n_cpu = my_num_vcpus();
+ }
+ #endif
+ 
+diff --git a/storage/innobase/trx/trx0sys.cc b/storage/innobase/trx/trx0sys.cc
+index 72dd12023..2e3265d15 100644
+--- a/storage/innobase/trx/trx0sys.cc
++++ b/storage/innobase/trx/trx0sys.cc
+@@ -45,6 +45,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ #include "fsp0sysspace.h"
+ #include "log0recv.h"
+ #include "mtr0log.h"
++#include "mysql/components/library_mysys/my_system.h"  // my_num_vcpus
+ #include "os0file.h"
+ #include "read0read.h"
+ #include "srv0srv.h"
+@@ -488,8 +489,7 @@ purge_pq_t *trx_sys_init_at_db_start(void) {
+     /* Create the memory objects for all the rollback segments
+     referred to in the TRX_SYS page or any undo tablespace
+     RSEG_ARRAY page. */
+-    srv_rseg_init_threads =
+-        std::min(std::thread::hardware_concurrency(), max_rseg_init_threads);
++    srv_rseg_init_threads = std::min(my_num_vcpus(), max_rseg_init_threads);
+ 
+     /* Test hook to initialize the rollback segments using a single
+     thread. */
+-- 
+2.34.1
+

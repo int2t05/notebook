@@ -1,0 +1,66 @@
+From 29b1d1dfd30839832c598bd40f6faff28883fbe9 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 30 Sep 2025 15:46:29 +0800
+Subject: [PATCH 3/9] non-aligned memory access optimize for aarch64
+
+---
+ storage/innobase/rem/rem0cmp.cc | 6 ++++--
+ strings/ctype.cc                | 3 ++-
+ unittest/gunit/alignment-t.cc   | 3 ++-
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/storage/innobase/rem/rem0cmp.cc b/storage/innobase/rem/rem0cmp.cc
+index 27179ef07..de8486799 100644
+--- a/storage/innobase/rem/rem0cmp.cc
++++ b/storage/innobase/rem/rem0cmp.cc
+@@ -464,7 +464,8 @@ inline int cmp_data(ulint mtype, ulint prtype, bool is_asc, const byte *data1,
+   int cmp;
+ 
+   if (len > 0) {
+-#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64
++#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || \
++    defined _M_X64 || defined __aarch64__
+     /* Compare the first bytes with a loop to avoid the call
+     overhead of memcmp(). On x86 and x86-64, the GCC built-in
+     (repz cmpsb) seems to be very slow, so we will be calling the
+@@ -504,7 +505,8 @@ inline int cmp_data(ulint mtype, ulint prtype, bool is_asc, const byte *data1,
+ 
+       data1 += len;
+       data2 += len;
+-#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64
++#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || \
++    defined _M_X64 || defined __aarch64__
+     }
+ #endif /* IA32 or AMD64 */
+   }
+diff --git a/strings/ctype.cc b/strings/ctype.cc
+index 3a9b51f7f..6d3523666 100644
+--- a/strings/ctype.cc
++++ b/strings/ctype.cc
+@@ -920,7 +920,8 @@ size_t my_convert(char *to, size_t to_length, const CHARSET_INFO *to_cs,
+ 
+   length = length2 = std::min(to_length, from_length);
+ 
+-#if defined(__i386__) || defined(_WIN32) || defined(__x86_64__)
++#if defined(__i386__) || defined(_WIN32) || defined(__x86_64__) || \
++    defined __aarch64__
+   /*
+     Special loop for i386, it allows to refer to a
+     non-aligned memory block as UINT32, which makes
+diff --git a/unittest/gunit/alignment-t.cc b/unittest/gunit/alignment-t.cc
+index 7ce87e79e..03f6e5f02 100644
+--- a/unittest/gunit/alignment-t.cc
++++ b/unittest/gunit/alignment-t.cc
+@@ -112,7 +112,8 @@ class Mem_compare_sint4_generic {
+   }
+ };
+ 
+-#if defined(__i386__) || defined(__x86_64__) || defined(_WIN32)
++#if defined(__i386__) || defined(__x86_64__) || defined(_WIN32) || \
++    defined(__aarch64__)
+ 
+ TEST_F(AlignmentTest, AlignedSort) {
+   for (int ix = 0; ix < num_iterations; ++ix) {
+-- 
+2.31.1.windows.1
+

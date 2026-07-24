@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Omni 文件索引 · SQL 执行链路</title>
+  </head>
+  <body>
+    <div id="root">
+      <div id="boot" style="padding:32px;font:14px/1.7 -apple-system,Segoe UI,Roboto,sans-serif;color:#444">
+        正在加载索引…
+      </div>
+    </div>
+    <script>
+      (function () {
+        function show(msg) {
+          var b = document.getElementById('boot');
+          if (b)
+            b.innerHTML =
+              '<pre style="padding:32px;font:13px/1.6 Consolas,Menlo,monospace;color:#b00;white-space:pre-wrap;word-break:break-all;margin:0">' +
+              msg +
+              '</pre>';
+        }
+        window.addEventListener('error', function (e) {
+          show(
+            '页面加载出错：\n\n' +
+              (e.message || e) +
+              '\n\n' +
+              (e.filename || '') +
+              ' : ' +
+              (e.lineno || '?') +
+              ':' +
+              (e.colno || '?') +
+              '\n\n请把以上信息截图发给开发者。',
+          );
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+          var r = e.reason;
+          show('未捕获异常：\n\n' + (r && (r.stack || r.message) ? r.stack || r.message : r));
+        });
+      })();
+    </script>
+    <noscript>需要启用 JavaScript 才能查看本页面。</noscript>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

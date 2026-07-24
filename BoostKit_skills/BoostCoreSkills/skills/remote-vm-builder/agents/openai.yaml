@@ -1,0 +1,7 @@
+interface:
+  display_name: "Remote VM Builder"
+  short_description: "Create libvirt/KVM VMs over SSH"
+  default_prompt: "Use $remote-vm-builder to create a Linux VM on my remote libvirt/KVM server."
+
+policy:
+  allow_implicit_invocation: true

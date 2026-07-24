@@ -1,0 +1,12 @@
+r01,hi,4,??
+r02,hello,2,??
+r03,hi,0,??
+r04,hi,-1,??
+r05,ab,5,xyz
+r06,ab,5,#
+r07,abc,3,?
+r08,你好,4,ab
+r09,,3,?
+r10,null,3,?
+r11,abc,null,?
+r12,abc,3,null

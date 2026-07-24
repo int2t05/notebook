@@ -1,0 +1,12 @@
+r01,a|b|c,0
+r02,a|b|c,1
+r03,a|b|c,2
+r04,a|b|c,3
+r05,a|b|c,-1
+r06,hello|world,1
+r07,single,0
+r08,single,1
+r09,null,0
+r10,x||z,1
+r11,x||z,0
+r12,2026-06-25|q22|nexmark,2

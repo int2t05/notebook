@@ -1,0 +1,143 @@
+# 论文检索归档：{{ direction_raw }}
+
+> **时间窗口**: {{ start_date }} ~ {{ end_date }}
+> **生成时间**: {{ created_at }}
+> **关键词**: {{ keywords|join(" / ") }}
+> **总论文数**: {{ total_papers }}（🟢 {{ green_count }} / 🟡 {{ yellow_count }} / 🔴 {{ red_count }}）
+
+{% if has_errors %}
+> ⚠️ **本次运行有 {{ error_count }} 个条目需人工 review**。详见 [`errors.json`](./errors.json)。
+{% endif %}
+
+---
+
+## 📖 Emoji 语义
+
+### 方向匹配度
+| Emoji | 含义 |
+|-------|------|
+| 🟢🟢🟢 | 核心相关（方向 100% 命中，如 ISMM）|
+| 🟢🟢 | 强相关（内存/系统/体系结构核心战场）|
+| 🟢 | 中等相关（部分论文相关）|
+| 🟡 | 弱相关（偶有相关论文）|
+
+### 年度状态
+| Emoji | 含义 |
+|-------|------|
+| ✅ | 已抓取，论文列表可读 |
+| 📚 | 已召开但本次未在窗口内抓取 |
+| 🔜 | 未召开 |
+| ⚫ | 不举办（双年制 off-year / 取消 / 跳过）|
+| 📉 | 永久停办（discontinued）|
+| ❓ | 日期未知（元数据待补充）|
+| — | 该年无信息 |
+
+---
+
+{# Render one cell: date · venue · status / paper-count link #}
+{% macro year_cell(yr_info) -%}
+{%- if yr_info is none -%}
+—
+{%- elif yr_info.status == "fetched" -%}
+{{ yr_info.dates or "—" }} · {{ yr_info.venue.split(",")[0] if yr_info.venue else "—" }} · ✅ [{{ yr_info.total }} 篇]({{ yr_info.md_link }})
+{%- elif yr_info.status == "happened_not_fetched" -%}
+{{ yr_info.dates or "—" }} · {{ yr_info.venue.split(",")[0] if yr_info.venue else "—" }} · 📚 已开未抓
+{%- elif yr_info.status == "future" -%}
+{{ yr_info.dates or "—" }} · {{ yr_info.venue.split(",")[0] if yr_info.venue else "—" }} · 🔜 未召开
+{%- elif yr_info.status == "skipped" -%}
+⚫ {{ yr_info.reason or "不办（双年制 off-year）" }}
+{%- elif yr_info.status == "stopped" -%}
+📉 {{ yr_info.reason or "已停办" }}
+{%- elif yr_info.status == "postponed" -%}
+⏸️ {{ yr_info.reason or "延期" }}
+{%- else -%}
+❓
+{%- endif -%}
+{%- endmacro %}
+
+{% macro conf_row(c) -%}
+| **{{ c.name }}** | {{ c.ccf or "未" }}/{{ c.core or "—" }}/{{ c.h5 or "—" }} |{% for y in year_columns %} {{ year_cell(c.years[y]) }} |{% endfor %} {{ c.direction_match or "—" }} |
+{%- endmacro %}
+
+{% macro year_header() -%}
+| 会议 | CCF/CORE/h5 |{% for y in year_columns %} {{ y }} |{% endfor %} 方向 |
+|------|-------------|{% for y in year_columns %}------|{% endfor %}------|
+{%- endmacro %}
+
+{% if tier_s -%}
+## 🥇 S 档 — 顶级会议（核心目标）
+
+{{ year_header() }}
+{% for c in tier_s -%}
+{{ conf_row(c) }}
+{% endfor %}
+{%- endif %}
+
+{% if tier_a -%}
+## 🥈 A 档 — 强相关高质量
+
+{{ year_header() }}
+{% for c in tier_a -%}
+{{ conf_row(c) }}
+{% endfor %}
+{%- endif %}
+
+{% if tier_b -%}
+## 🥉 B 档 — 专精方向
+
+{{ year_header() }}
+{% for c in tier_b -%}
+{{ conf_row(c) }}
+{% endfor %}
+{%- endif %}
+
+{% if tier_unranked -%}
+## ⚪ 未分档 — 元数据缺失（首次出现 / 待补充）
+
+| 会议 |{% for y in year_columns %} {{ y }} |{% endfor %}
+|------|{% for y in year_columns %}------|{% endfor %}
+{% for c in tier_unranked -%}
+| [{{ c.name }}](#) |{% for y in year_columns %} {% set yi = c.years[y] %}{% if yi and yi.status == "fetched" %}[{{ yi.total }} 篇 / {{ yi.green }} 🟢]({{ yi.md_link }}){% else %}—{% endif %} |{% endfor %}
+{% endfor %}
+
+> 💡 这些会议未在 `references/conferences-metadata.yaml` 中登记，建议人工补充 tier/CCF/CORE/h5 后重跑渲染。
+{%- endif %}
+
+---
+
+## ⚡ 优先阅读建议
+
+按 "方向匹配 × 强相关密度" 综合排序（仅含本次实际抓取的会议·年）：
+
+{% set fetched_year_entries = [] %}
+{% for c in tier_s + tier_a + tier_b %}
+{% for y in year_columns %}
+{% set yi = c.years[y] %}
+{% if yi and yi.status == "fetched" %}
+{% set _ = fetched_year_entries.append({"name": c.name, "year": y, "direction_match": c.direction_match,
+                                          "total": yi.total, "green": yi.green,
+                                          "composite_score": c.composite_score,
+                                          "md_link": yi.md_link}) %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% set ranked = fetched_year_entries|sort(attribute='composite_score', reverse=true)|list %}
+{% if ranked %}
+{% for c in ranked[:5] %}
+{{ loop.index }}. **{{ c.direction_match or "—" }} {{ c.name }} {{ c.year }}** — {{ c.green }} 🟢 / {{ c.total }} 总数（密度 {% if c.total %}{{ "%.0f"|format(c.green * 100 / c.total) }}%{% else %}—{% endif %}）→ [{{ c.name }}-{{ c.year }}.md]({{ c.md_link }})
+{% endfor %}
+{% else %}
+_本次未抓取任何会议（仅显示元数据），无法做密度排序。_
+{% endif %}
+
+---
+
+## 外部源摘要
+
+详见 [`external-sources.md`](./external-sources.md)。
+
+- arXiv: {{ external_counts.arxiv }} 篇
+- 🏛️ Lab: {{ external_counts.lab }} 篇{{ "（无 / curate LLM 失败）" if external_counts.lab == 0 else "" }}
+- 👤 Researcher: {{ external_counts.researcher }} 篇{{ "（无）" if external_counts.researcher == 0 else "" }}
+- 📡 RFC: {{ external_counts.rfc }} 篇{{ "（无）" if external_counts.rfc == 0 else "" }}
+- 📝 Blog: {{ external_counts.blog }} 篇{{ "（无）" if external_counts.blog == 0 else "" }}

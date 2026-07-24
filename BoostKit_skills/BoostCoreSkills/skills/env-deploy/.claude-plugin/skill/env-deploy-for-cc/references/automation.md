@@ -1,0 +1,87 @@
+# Automation Reference
+
+The bundled scripts automate the repeatable parts of environment deployment while preserving explicit user confirmation for risky decisions.
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/detect_project.py` | Inspect markers and print project detection JSON. |
+| `scripts/env_deploy.py` | Detect, plan, optionally execute commands, and generate artifacts. |
+
+## Execution Modes
+
+Default mode is dry-run:
+
+```bash
+python3 "$SKILL_DIR/scripts/env_deploy.py" --project /path/to/project
+```
+
+Dry-run mode:
+
+- Detects project type and build tool.
+- Plans build, dependency, and test commands.
+- Writes `deploy.log`, `setup.sh`, and `deploy-report.md`.
+- Does not execute project commands.
+
+Apply mode:
+
+```bash
+python3 "$SKILL_DIR/scripts/env_deploy.py" --project /path/to/project --apply
+```
+
+Apply mode executes planned project-level commands until the first failure. It records command output in `deploy.log`, includes successful repeatable commands in `setup.sh`, and writes a structured report.
+
+System package installation is opt-in:
+
+```bash
+python3 "$SKILL_DIR/scripts/env_deploy.py" --project /path/to/project --apply --install-system-packages
+```
+
+Use this only after reviewing planned package-manager commands.
+
+## Ambiguity Controls
+
+Use explicit flags when detection finds multiple plausible paths:
+
+```bash
+--component-type cpp|python|go|java|docker
+--java-tool maven|gradle
+```
+
+If these flags are omitted, the script follows the documented project-type priority for planning and records a warning. Java Maven/Gradle ambiguity blocks Java automation until `--java-tool` is supplied.
+
+## Generated Artifacts
+
+The script writes artifacts to the target project root:
+
+- `deploy.log`
+- `setup.sh`
+- `deploy-report.md`
+
+Generated `setup.sh` includes only planned or successful repeatable commands. Failed exploratory commands and secrets are excluded.
+
+## Safety Boundaries
+
+The automation does not perform automatic driver replacement, destructive package-manager cleanup, credential entry, or code fixes. When a required tool is missing or a command fails, it records the issue and stops or skips as appropriate so the agent can apply the Skill's interaction rules.
+
+## Claude Code Path Resolution
+
+Set `SKILL_DIR` before invoking scripts:
+
+```bash
+if [ -n "${CLAUDE_SKILL_ROOT:-}" ]; then
+  SKILL_DIR="$CLAUDE_SKILL_ROOT"
+elif [ -f "skills/env-deploy-for-cc/SKILL.md" ]; then
+  SKILL_DIR="$PWD/skills/env-deploy-for-cc"
+elif [ -f ".claude-plugin/skill/env-deploy-for-cc/SKILL.md" ]; then
+  SKILL_DIR="$PWD/.claude-plugin/skill/env-deploy-for-cc"
+elif [ -f "$HOME/.claude/skills/env-deploy-for-cc/SKILL.md" ]; then
+  SKILL_DIR="$HOME/.claude/skills/env-deploy-for-cc"
+elif [ -f "$HOME/.claude/skills/env_deploy_for_cc/SKILL.md" ]; then
+  SKILL_DIR="$HOME/.claude/skills/env_deploy_for_cc"
+else
+  echo "Cannot find env-deploy-for-cc skill directory" >&2
+  exit 1
+fi
+```

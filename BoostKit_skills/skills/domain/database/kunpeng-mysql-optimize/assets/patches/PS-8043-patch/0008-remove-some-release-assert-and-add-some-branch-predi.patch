@@ -1,0 +1,138 @@
+From 6da5dd72d65aea230950aa7f44897cb823d30592 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Wed, 16 Jul 2025 11:56:40 +0800
+Subject: [PATCH 8/9] remove some release assert and add some branch prediction
+
+---
+ sql/log.cc                            |  2 +-
+ sql/sp_head.cc                        |  2 +-
+ sql/sql_class.h                       |  2 +-
+ sql/sql_parse.cc                      |  6 +++---
+ storage/innobase/handler/ha_innodb.cc | 12 ++++++------
+ 5 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/sql/log.cc b/sql/log.cc
+index 962b6b497..b7ae6cd80 100644
+--- a/sql/log.cc
++++ b/sql/log.cc
+@@ -1919,7 +1919,7 @@ void log_slow_do(THD *thd) {
+   thd_proc_info(thd, "logging slow query");
+   THD_STAGE_INFO(thd, stage_logging_slow_query);
+ 
+-  if (thd->rewritten_query().length())
++  if (unlikely(thd->rewritten_query().length()))
+     query_logger.slow_log_write(thd, thd->rewritten_query().ptr(),
+                                 thd->rewritten_query().length(), false, 0, 0);
+   else
+diff --git a/sql/sp_head.cc b/sql/sp_head.cc
+index 65564aa05..08bbc4714 100644
+--- a/sql/sp_head.cc
++++ b/sql/sp_head.cc
+@@ -2225,7 +2225,7 @@ bool sp_head::execute(THD *thd, bool merge_da_on_success) {
+       likely to change in the future, so we'll do it right from the
+       start.
+     */
+-    if (thd->rewritten_query().length()) thd->reset_rewritten_query();
++    thd->reset_rewritten_query();
+ 
+     err_status = i->execute(thd, &ip);
+ 
+diff --git a/sql/sql_class.h b/sql/sql_class.h
+index 8a3dea27f..96d2f68c4 100644
+--- a/sql/sql_class.h
++++ b/sql/sql_class.h
+@@ -4561,7 +4561,7 @@ class THD : public MDL_context_owner,
+     Reset thd->m_rewritten_query. Protected with the LOCK_thd_query mutex.
+    */
+   void reset_rewritten_query() {
+-    if (rewritten_query().length()) {
++    if (unlikely(rewritten_query().length())) {
+       String empty;
+       swap_rewritten_query(empty);
+     }
+diff --git a/sql/sql_parse.cc b/sql/sql_parse.cc
+index e77db3de2..09d7ef813 100644
+--- a/sql/sql_parse.cc
++++ b/sql/sql_parse.cc
+@@ -5577,9 +5577,9 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state,
+       If rewriting does not happen here, thd->m_rewritten_query is still
+       empty from being reset in alloc_query().
+     */
+-    if (thd->rewritten_query().length() == 0) mysql_rewrite_query(thd);
++    if (likely(thd->rewritten_query().length() == 0)) mysql_rewrite_query(thd);
+ 
+-    if (thd->rewritten_query().length()) {
++    if (unlikely(thd->rewritten_query().length())) {
+       lex->safe_to_cache_query = false;  // see comments below
+ 
+       thd->set_query_for_display(thd->rewritten_query().ptr(),
+@@ -5596,7 +5596,7 @@ void dispatch_sql_command(THD *thd, Parser_state *parser_state,
+     }
+ 
+     if (!(opt_general_log_raw || thd->slave_thread)) {
+-      if (thd->rewritten_query().length())
++      if (unlikely(thd->rewritten_query().length()))
+         query_logger.general_log_write(thd, COM_QUERY,
+                                        thd->rewritten_query().ptr(),
+                                        thd->rewritten_query().length());
+diff --git a/storage/innobase/handler/ha_innodb.cc b/storage/innobase/handler/ha_innodb.cc
+index 2f9b06c56..33af9e179 100644
+--- a/storage/innobase/handler/ha_innodb.cc
++++ b/storage/innobase/handler/ha_innodb.cc
+@@ -10643,7 +10643,7 @@ bool ha_innobase::was_semi_consistent_read(void) {
+ /* See handler.h and row0mysql.h for docs on this function. */
+ 
+ void ha_innobase::try_semi_consistent_read(bool yes) {
+-  ut_a(m_prebuilt->trx == thd_to_trx(ha_thd()));
++  ut_ad(m_prebuilt->trx == thd_to_trx(ha_thd()));
+ 
+   if (yes && m_prebuilt->trx->allow_semi_consistent()) {
+     m_prebuilt->row_read_type = ROW_READ_TRY_SEMI_CONSISTENT;
+@@ -10814,7 +10814,7 @@ int ha_innobase::index_read(
+   DBUG_TRACE;
+   DEBUG_SYNC_C("ha_innobase_index_read_begin");
+ 
+-  ut_a(m_prebuilt->trx == thd_to_trx(m_user_thd));
++  ut_ad(m_prebuilt->trx == thd_to_trx(m_user_thd));
+   ut_ad(key_len != 0 || find_flag != HA_READ_KEY_EXACT);
+ 
+   ha_statistic_increment(&System_status_var::ha_read_key_count);
+@@ -11067,7 +11067,7 @@ int ha_innobase::change_active_index(
+     return HA_ERR_CRASHED;
+ 
+   ut_ad(m_user_thd == ha_thd());
+-  ut_a(m_prebuilt->trx == thd_to_trx(m_user_thd));
++  ut_ad(m_prebuilt->trx == thd_to_trx(m_user_thd));
+ 
+   TrxInInnoDB trx_in_innodb(m_prebuilt->trx);
+ 
+@@ -11508,7 +11508,7 @@ int ha_innobase::rnd_pos(
+ 
+   ha_statistic_increment(&System_status_var::ha_read_rnd_count);
+ 
+-  ut_a(m_prebuilt->trx == thd_to_trx(ha_thd()));
++  ut_ad(m_prebuilt->trx == thd_to_trx(ha_thd()));
+ 
+   /* Note that we assume the length of the row reference is fixed
+   for the table, and it is == ref_length */
+@@ -15835,7 +15835,7 @@ int ha_innobase::discard_or_import_tablespace(bool discard,
+ 
+   ut_a(m_prebuilt->trx != nullptr);
+   ut_a(m_prebuilt->trx->magic_n == TRX_MAGIC_N);
+-  ut_a(m_prebuilt->trx == thd_to_trx(ha_thd()));
++  ut_ad(m_prebuilt->trx == thd_to_trx(ha_thd()));
+ 
+   if (high_level_read_only) {
+     return HA_ERR_TABLE_READONLY;
+@@ -17409,7 +17409,7 @@ ha_rows ha_innobase::records_in_range(
+ 
+   DBUG_TRACE;
+ 
+-  ut_a(m_prebuilt->trx == thd_to_trx(ha_thd()));
++  ut_ad(m_prebuilt->trx == thd_to_trx(ha_thd()));
+ 
+   m_prebuilt->trx->op_info = "estimating records in index range";
+ 
+-- 
+2.31.1.windows.1
+

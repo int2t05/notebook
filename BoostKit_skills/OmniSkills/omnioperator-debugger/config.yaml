@@ -1,0 +1,5 @@
+mcp_tools:
+  sql_omni: run_e2e_sql
+  sql_native: run_e2e_sql_native
+  columnar_debug: debug_e2e_sql_columnar
+  compile: compile_gluten

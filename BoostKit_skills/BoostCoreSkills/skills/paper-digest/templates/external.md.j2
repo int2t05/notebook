@@ -1,0 +1,102 @@
+# 外部源 - {{ direction_raw }}
+
+> **时间窗口**: {{ start_date }} ~ {{ end_date }}
+> **生成时间**: {{ created_at }}
+> **来源**: arXiv（自动）+ 顶级实验室 / 关键人物 / 博客 / RFCs（references/external-sources.yaml 维护）
+> **总论文数**: {{ papers|length }}（不含已剔除的弱相关）
+
+---
+
+## 图例
+
+🟢 强相关 · 🟡 中相关 _（🔴 弱相关已剔除，不在本文件展示）_
+
+| 维度 | 标签 |
+|------|------|
+| **工业合作** | 🏭 工业主导 · 🤝 学+工合作 · 🏛️ 纯学术 |
+| **开源** | 📦 已开源 · 📋 部分开源 · 🔒 未开源 |
+| **可落地性** | 🚀 高 · 🔬 中 · 📐 低 |
+
+---
+
+{# Group by source_subtype and relevance #}
+{% set ns = namespace(by_source={}) %}
+{% for p in papers if p.relevance in ("green", "yellow") %}
+{%- set st = p.source_subtype or "arxiv" -%}
+{%- if st not in ns.by_source -%}
+  {%- set _ = ns.by_source.update({st: {"green": [], "yellow": []}}) -%}
+{%- endif -%}
+{%- set _ = ns.by_source[st][p.relevance].append(p) -%}
+{% endfor %}
+
+{% set source_title = {
+    "arxiv": "🌐 arXiv（自动检索 · cs.OS / cs.PL / cs.AR / cs.DC / cs.PF / cs.SE）",
+    "labs": "🏛️ 顶级实验室",
+    "researchers": "👤 关键人物（Scholar 主页 / 个人博客）",
+    "blogs": "📝 博客 / 厂商文章",
+    "rfcs": "📡 RFC / 提案"
+} %}
+
+{% set source_order = ["arxiv", "labs", "researchers", "rfcs", "blogs"] %}
+
+{% for st in source_order if st in ns.by_source %}
+{% set bucket = ns.by_source[st] %}
+{% if bucket.green or bucket.yellow %}
+## {{ source_title.get(st, st) }}
+
+{% if bucket.green %}
+### 🟢 强相关
+{% for p in bucket.green %}
+
+#### [ ] {{ p.id }}. {{ p.title }}
+🟢 · [Link]({{ p.pdf }}) · {{ p.date or "—" }} · {{ p.affiliation or "—" }}{% if p.abstract_source %} · 📄 {{ p.abstract_source }}{% endif %}
+
+{% if p.summary and p.summary.background != "[抽取失败]" -%}
+**背景**：{{ p.summary.background or "—" }}
+**核心**：{{ p.summary.core or "—" }}
+**效果**：{{ p.summary.effect or "—" }}
+**启发**：{{ p.summary.insight or "—" }}
+{% else -%}
+**一句话判断**：{{ p.relevance_reason or "—" }}
+{% endif %}
+
+{% if p.tags %}{{ tag_emoji.industry[p.tags.industry] }} · {{ tag_emoji.opensource[p.tags.opensource] }} · {{ tag_emoji.deployability[p.tags.deployability] }}{% endif %}
+
+📌 _<>_
+
+---
+{% endfor %}
+{% endif %}
+
+{% if bucket.yellow %}
+### 🟡 中相关
+{% for p in bucket.yellow %}
+
+#### [ ] {{ p.id }}. {{ p.title }}
+🟡 · [Link]({{ p.pdf }}) · {{ p.date or "—" }} · {{ p.affiliation or "—" }}{% if p.abstract_source %} · 📄 {{ p.abstract_source }}{% endif %}
+
+{% if p.summary and p.summary.core -%}
+{{ p.summary.core }}
+{%- elif p.relevance_reason -%}
+**一句话判断**：{{ p.relevance_reason }}
+{%- else -%}
+_一句话描述待补充_
+{%- endif %}
+
+{% if p.tags %}{{ tag_emoji.industry[p.tags.industry] }} · {{ tag_emoji.opensource[p.tags.opensource] }} · {{ tag_emoji.deployability[p.tags.deployability] }}{% endif %}
+
+📌 _<>_
+{% endfor %}
+{% endif %}
+{% endif %}
+{% endfor %}
+
+---
+
+## 📊 统计
+
+{% for st in source_order if st in ns.by_source %}
+- {{ source_title.get(st, st) }}：🟢 {{ ns.by_source[st].green|length }} · 🟡 {{ ns.by_source[st].yellow|length }}
+{% endfor %}
+
+> 弱相关明细见 `intermediate/phase1b-external.json`，不在本文件展示。

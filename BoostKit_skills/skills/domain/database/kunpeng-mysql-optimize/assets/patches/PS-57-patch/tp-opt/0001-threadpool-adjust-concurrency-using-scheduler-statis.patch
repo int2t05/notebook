@@ -1,0 +1,1277 @@
+From 9da575021b56af141818ccc856f44fdcb801b884 Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Wed, 8 Apr 2026 16:37:39 +0800
+Subject: [PATCH] threadpool: adjust concurrency using scheduler statistics
+
+- backport adaptive threadpool concurrency control from 8.0
+- add sysvars for extra threads and scheduler thresholds
+- instrument group commit pending waits for threadpool scheduling
+- move vcpu detection helper into mysys
+- add MTR coverage for the new threadpool sysvars
+
+Tested:
+./build/mysql-test/mysql-test-run.pl --suite=sys_vars \
+    thread_pool_enable_extra_threads_basic \
+    thread_pool_cpu_usage_threshold_basic \
+    thread_pool_nvcsw_freq_threshold_basic \
+    thread_pool_nivcsw_freq_threshold_basic
+
+./build/mysql-test/mysql-test-run.pl pool_of_threads
+---
+ include/my_num_vcpus.h                        |  28 ++
+ include/mysql/service_thd_wait.h              |   4 +-
+ include/mysql/services.h.pp                   |   3 +-
+ ...read_pool_cpu_usage_threshold_basic.result |  51 +++
+ ...ead_pool_enable_extra_threads_basic.result |  39 ++
+ ...ad_pool_nivcsw_freq_threshold_basic.result |  51 +++
+ ...ead_pool_nvcsw_freq_threshold_basic.result |  51 +++
+ ...thread_pool_cpu_usage_threshold_basic.test |  42 ++
+ ...hread_pool_enable_extra_threads_basic.test |  37 ++
+ ...read_pool_nivcsw_freq_threshold_basic.test |  42 ++
+ ...hread_pool_nvcsw_freq_threshold_basic.test |  42 ++
+ mysys/CMakeLists.txt                          |   2 +-
+ mysys/my_num_vcpus.c                          | 142 +++++++
+ sql/binlog.cc                                 |  10 +
+ sql/sys_vars.cc                               |  32 ++
+ sql/threadpool.h                              |   4 +
+ sql/threadpool_common.cc                      |   4 +
+ sql/threadpool_unix.cc                        | 358 +++++++++++++++++-
+ 18 files changed, 934 insertions(+), 8 deletions(-)
+ create mode 100644 include/my_num_vcpus.h
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_enable_extra_threads_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_enable_extra_threads_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+ create mode 100644 mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+ create mode 100644 mysys/my_num_vcpus.c
+
+diff --git a/include/my_num_vcpus.h b/include/my_num_vcpus.h
+new file mode 100644
+index 00000000000..3bc8a056c92
+--- /dev/null
++++ b/include/my_num_vcpus.h
+@@ -0,0 +1,28 @@
++/* Copyright (C) 2026 Percona LLC and/or its affiliates
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 of the License.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
++   USA */
++
++#ifndef MY_NUM_VCPUS_INCLUDED
++#define MY_NUM_VCPUS_INCLUDED
++
++#include <my_global.h>
++
++C_MODE_START
++
++uint32 my_num_vcpus(void);
++
++C_MODE_END
++
++#endif /* MY_NUM_VCPUS_INCLUDED */
+diff --git a/include/mysql/service_thd_wait.h b/include/mysql/service_thd_wait.h
+index 48f317672f9..0f650b08ca1 100644
+--- a/include/mysql/service_thd_wait.h
++++ b/include/mysql/service_thd_wait.h
+@@ -93,7 +93,8 @@ typedef enum _thd_wait_type_e {
+   THD_WAIT_GROUP_COMMIT= 9,
+   THD_WAIT_SYNC= 10,
+   THD_WAIT_NET= 11,
+-  THD_WAIT_LAST= 12
++  THD_WAIT_GROUP_COMMIT_PENDING= 12,
++  THD_WAIT_LAST= 13
+ } thd_wait_type;
+ 
+ extern struct thd_wait_service_st {
+@@ -119,4 +120,3 @@ void thd_wait_end(MYSQL_THD thd);
+ #endif
+ 
+ #endif
+-
+diff --git a/include/mysql/services.h.pp b/include/mysql/services.h.pp
+index 4ba6f25e312..547638ee810 100644
+--- a/include/mysql/services.h.pp
++++ b/include/mysql/services.h.pp
+@@ -264,7 +264,8 @@ typedef enum _thd_wait_type_e {
+   THD_WAIT_GROUP_COMMIT= 9,
+   THD_WAIT_SYNC= 10,
+   THD_WAIT_NET= 11,
+-  THD_WAIT_LAST= 12
++  THD_WAIT_GROUP_COMMIT_PENDING= 12,
++  THD_WAIT_LAST= 13
+ } thd_wait_type;
+ extern struct thd_wait_service_st {
+   void (*thd_wait_begin_func)(void*, int);
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+new file mode 100644
+index 00000000000..0242c185643
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_cpu_usage_threshold_basic.result
+@@ -0,0 +1,51 @@
++SET @start_global_value = @@global.thread_pool_cpu_usage_threshold;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++90
++select @@session.thread_pool_cpu_usage_threshold;
++ERROR HY000: Variable 'thread_pool_cpu_usage_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_cpu_usage_threshold';
++Variable_name	Value
++thread_pool_cpu_usage_threshold	90
++show session variables like 'thread_pool_cpu_usage_threshold';
++Variable_name	Value
++thread_pool_cpu_usage_threshold	90
++select * from information_schema.global_variables where variable_name='thread_pool_cpu_usage_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_CPU_USAGE_THRESHOLD	90
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.GLOBAL_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.global_variables instead
++select * from information_schema.session_variables where variable_name='thread_pool_cpu_usage_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_CPU_USAGE_THRESHOLD	90
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.SESSION_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.session_variables instead
++set global thread_pool_cpu_usage_threshold=0;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++0
++set global thread_pool_cpu_usage_threshold=100;
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++100
++set session thread_pool_cpu_usage_threshold=1;
++ERROR HY000: Variable 'thread_pool_cpu_usage_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_cpu_usage_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_cpu_usage_threshold'
++set global thread_pool_cpu_usage_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_cpu_usage_threshold value: '-1'
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++0
++set global thread_pool_cpu_usage_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_cpu_usage_threshold value: '10000000000'
++select @@global.thread_pool_cpu_usage_threshold;
++@@global.thread_pool_cpu_usage_threshold
++100
++set @@global.thread_pool_cpu_usage_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_enable_extra_threads_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_enable_extra_threads_basic.result
+new file mode 100644
+index 00000000000..ff303d15d6e
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_enable_extra_threads_basic.result
+@@ -0,0 +1,39 @@
++SET @start_global_value = @@global.thread_pool_enable_extra_threads;
++select @@global.thread_pool_enable_extra_threads in (0,1);
++@@global.thread_pool_enable_extra_threads in (0,1)
++1
++select @@session.thread_pool_enable_extra_threads;
++ERROR HY000: Variable 'thread_pool_enable_extra_threads' is a GLOBAL variable
++show global variables like 'thread_pool_enable_extra_threads';
++Variable_name	Value
++thread_pool_enable_extra_threads	ON
++show session variables like 'thread_pool_enable_extra_threads';
++Variable_name	Value
++thread_pool_enable_extra_threads	ON
++select * from information_schema.global_variables where variable_name='thread_pool_enable_extra_threads';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_ENABLE_EXTRA_THREADS	ON
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.GLOBAL_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.global_variables instead
++select * from information_schema.session_variables where variable_name='thread_pool_enable_extra_threads';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_ENABLE_EXTRA_THREADS	ON
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.SESSION_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.session_variables instead
++set global thread_pool_enable_extra_threads=0;
++select @@global.thread_pool_enable_extra_threads;
++@@global.thread_pool_enable_extra_threads
++0
++set global thread_pool_enable_extra_threads=1;
++select @@global.thread_pool_enable_extra_threads;
++@@global.thread_pool_enable_extra_threads
++1
++set session thread_pool_enable_extra_threads=1;
++ERROR HY000: Variable 'thread_pool_enable_extra_threads' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_enable_extra_threads=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_enable_extra_threads'
++set global thread_pool_enable_extra_threads=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_enable_extra_threads'
++set global thread_pool_enable_extra_threads="foo";
++ERROR 42000: Variable 'thread_pool_enable_extra_threads' can't be set to the value of 'foo'
++SET @@global.thread_pool_enable_extra_threads = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+new file mode 100644
+index 00000000000..ded874c558a
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_nivcsw_freq_threshold_basic.result
+@@ -0,0 +1,51 @@
++SET @start_global_value = @@global.thread_pool_nivcsw_freq_threshold;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++4294967295
++select @@session.thread_pool_nivcsw_freq_threshold;
++ERROR HY000: Variable 'thread_pool_nivcsw_freq_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_nivcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nivcsw_freq_threshold	4294967295
++show session variables like 'thread_pool_nivcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nivcsw_freq_threshold	4294967295
++select * from information_schema.global_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_NIVCSW_FREQ_THRESHOLD	4294967295
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.GLOBAL_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.global_variables instead
++select * from information_schema.session_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_NIVCSW_FREQ_THRESHOLD	4294967295
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.SESSION_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.session_variables instead
++set global thread_pool_nivcsw_freq_threshold=0;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++0
++set global thread_pool_nivcsw_freq_threshold=1000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++1000
++set session thread_pool_nivcsw_freq_threshold=1;
++ERROR HY000: Variable 'thread_pool_nivcsw_freq_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_nivcsw_freq_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nivcsw_freq_threshold'
++set global thread_pool_nivcsw_freq_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nivcsw_freq_threshol value: '-1'
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++0
++set global thread_pool_nivcsw_freq_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nivcsw_freq_threshol value: '10000000000'
++select @@global.thread_pool_nivcsw_freq_threshold;
++@@global.thread_pool_nivcsw_freq_threshold
++4294967295
++set @@global.thread_pool_nivcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result b/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+new file mode 100644
+index 00000000000..0435e0a2f3c
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/r/thread_pool_nvcsw_freq_threshold_basic.result
+@@ -0,0 +1,51 @@
++SET @start_global_value = @@global.thread_pool_nvcsw_freq_threshold;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++10000
++select @@session.thread_pool_nvcsw_freq_threshold;
++ERROR HY000: Variable 'thread_pool_nvcsw_freq_threshold' is a GLOBAL variable
++show global variables like 'thread_pool_nvcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nvcsw_freq_threshold	10000
++show session variables like 'thread_pool_nvcsw_freq_threshold';
++Variable_name	Value
++thread_pool_nvcsw_freq_threshold	10000
++select * from information_schema.global_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_NVCSW_FREQ_THRESHOLD	10000
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.GLOBAL_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.global_variables instead
++select * from information_schema.session_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++VARIABLE_NAME	VARIABLE_VALUE
++THREAD_POOL_NVCSW_FREQ_THRESHOLD	10000
++Warnings:
++Warning	1287	'INFORMATION_SCHEMA.SESSION_VARIABLES' is deprecated and will be removed in a future release. Please use performance_schema.session_variables instead
++set global thread_pool_nvcsw_freq_threshold=0;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++0
++set global thread_pool_nvcsw_freq_threshold=1000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++1000
++set session thread_pool_nvcsw_freq_threshold=1;
++ERROR HY000: Variable 'thread_pool_nvcsw_freq_threshold' is a GLOBAL variable and should be set with SET GLOBAL
++set global thread_pool_nvcsw_freq_threshold=1.1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold=1e1;
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold="foo";
++ERROR 42000: Incorrect argument type to variable 'thread_pool_nvcsw_freq_threshold'
++set global thread_pool_nvcsw_freq_threshold=-1;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nvcsw_freq_threshold value: '-1'
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++0
++set global thread_pool_nvcsw_freq_threshold=10000000000;
++Warnings:
++Warning	1292	Truncated incorrect thread_pool_nvcsw_freq_threshold value: '10000000000'
++select @@global.thread_pool_nvcsw_freq_threshold;
++@@global.thread_pool_nvcsw_freq_threshold
++4294967295
++set @@global.thread_pool_nvcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+new file mode 100644
+index 00000000000..3511581ff96
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_cpu_usage_threshold_basic.test
+@@ -0,0 +1,42 @@
++# uint global
++--source include/not_windows.inc
++--source include/not_embedded.inc
++SET @start_global_value = @@global.thread_pool_cpu_usage_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_cpu_usage_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_cpu_usage_threshold;
++show global variables like 'thread_pool_cpu_usage_threshold';
++show session variables like 'thread_pool_cpu_usage_threshold';
++select * from information_schema.global_variables where variable_name='thread_pool_cpu_usage_threshold';
++select * from information_schema.session_variables where variable_name='thread_pool_cpu_usage_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_cpu_usage_threshold=0;
++select @@global.thread_pool_cpu_usage_threshold;
++set global thread_pool_cpu_usage_threshold=100;
++select @@global.thread_pool_cpu_usage_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_cpu_usage_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_cpu_usage_threshold="foo";
++
++set global thread_pool_cpu_usage_threshold=-1;
++select @@global.thread_pool_cpu_usage_threshold;
++set global thread_pool_cpu_usage_threshold=10000000000;
++select @@global.thread_pool_cpu_usage_threshold;
++
++set @@global.thread_pool_cpu_usage_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_enable_extra_threads_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_enable_extra_threads_basic.test
+new file mode 100644
+index 00000000000..5ae7f7402b0
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_enable_extra_threads_basic.test
+@@ -0,0 +1,37 @@
++# bool global
++--source include/not_windows.inc
++--source include/not_embedded.inc
++SET @start_global_value = @@global.thread_pool_enable_extra_threads;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_enable_extra_threads in (0,1);
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_enable_extra_threads;
++show global variables like 'thread_pool_enable_extra_threads';
++show session variables like 'thread_pool_enable_extra_threads';
++select * from information_schema.global_variables where variable_name='thread_pool_enable_extra_threads';
++select * from information_schema.session_variables where variable_name='thread_pool_enable_extra_threads';
++
++#
++# show that it's writable
++#
++set global thread_pool_enable_extra_threads=0;
++select @@global.thread_pool_enable_extra_threads;
++set global thread_pool_enable_extra_threads=1;
++select @@global.thread_pool_enable_extra_threads;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_enable_extra_threads=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_enable_extra_threads=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_enable_extra_threads=1e1;
++--error ER_WRONG_VALUE_FOR_VAR
++set global thread_pool_enable_extra_threads="foo";
++
++SET @@global.thread_pool_enable_extra_threads = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+new file mode 100644
+index 00000000000..6351c34fa02
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_nivcsw_freq_threshold_basic.test
+@@ -0,0 +1,42 @@
++# uint global
++--source include/not_windows.inc
++--source include/not_embedded.inc
++SET @start_global_value = @@global.thread_pool_nivcsw_freq_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_nivcsw_freq_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_nivcsw_freq_threshold;
++show global variables like 'thread_pool_nivcsw_freq_threshold';
++show session variables like 'thread_pool_nivcsw_freq_threshold';
++select * from information_schema.global_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++select * from information_schema.session_variables where variable_name='thread_pool_nivcsw_freq_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_nivcsw_freq_threshold=0;
++select @@global.thread_pool_nivcsw_freq_threshold;
++set global thread_pool_nivcsw_freq_threshold=1000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_nivcsw_freq_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nivcsw_freq_threshold="foo";
++
++set global thread_pool_nivcsw_freq_threshold=-1;
++select @@global.thread_pool_nivcsw_freq_threshold;
++set global thread_pool_nivcsw_freq_threshold=10000000000;
++select @@global.thread_pool_nivcsw_freq_threshold;
++
++set @@global.thread_pool_nivcsw_freq_threshold = @start_global_value;
+diff --git a/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test b/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+new file mode 100644
+index 00000000000..669a35f208c
+--- /dev/null
++++ b/mysql-test/suite/sys_vars/t/thread_pool_nvcsw_freq_threshold_basic.test
+@@ -0,0 +1,42 @@
++# uint global
++--source include/not_windows.inc
++--source include/not_embedded.inc
++SET @start_global_value = @@global.thread_pool_nvcsw_freq_threshold;
++
++#
++# exists as global only
++#
++select @@global.thread_pool_nvcsw_freq_threshold;
++--error ER_INCORRECT_GLOBAL_LOCAL_VAR
++select @@session.thread_pool_nvcsw_freq_threshold;
++show global variables like 'thread_pool_nvcsw_freq_threshold';
++show session variables like 'thread_pool_nvcsw_freq_threshold';
++select * from information_schema.global_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++select * from information_schema.session_variables where variable_name='thread_pool_nvcsw_freq_threshold';
++
++#
++# show that it's writable
++#
++set global thread_pool_nvcsw_freq_threshold=0;
++select @@global.thread_pool_nvcsw_freq_threshold;
++set global thread_pool_nvcsw_freq_threshold=1000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++--error ER_GLOBAL_VARIABLE
++set session thread_pool_nvcsw_freq_threshold=1;
++
++#
++# incorrect types
++#
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold=1.1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold=1e1;
++--error ER_WRONG_TYPE_FOR_VAR
++set global thread_pool_nvcsw_freq_threshold="foo";
++
++set global thread_pool_nvcsw_freq_threshold=-1;
++select @@global.thread_pool_nvcsw_freq_threshold;
++set global thread_pool_nvcsw_freq_threshold=10000000000;
++select @@global.thread_pool_nvcsw_freq_threshold;
++
++set @@global.thread_pool_nvcsw_freq_threshold = @start_global_value;
+diff --git a/mysys/CMakeLists.txt b/mysys/CMakeLists.txt
+index f682449b43d..1025952b69a 100644
+--- a/mysys/CMakeLists.txt
++++ b/mysys/CMakeLists.txt
+@@ -34,7 +34,7 @@ SET(MYSYS_SOURCES  array.c charset-def.c charset.c checksum.c
+ 				my_gethwaddr.c my_getsystime.c my_getwd.c my_compare.c my_init.c
+ 				my_lib.c my_lock.c my_malloc.c my_mess.c
+ 				my_mkdir.c my_mmap.c my_once.c my_open.c my_pread.c
+-				my_read.c my_redel.c my_rename.c my_seek.c
++				my_num_vcpus.c my_read.c my_redel.c my_rename.c my_seek.c
+ 				my_static.c my_symlink.c my_symlink2.c my_sync.c my_thr_init.c 
+ 				my_write.c ptr_cmp.c queues.c sql_chars.c stacktrace.c
+ 				string.c thr_cond.c thr_lock.c thr_mutex.c
+diff --git a/mysys/my_num_vcpus.c b/mysys/my_num_vcpus.c
+new file mode 100644
+index 00000000000..450ca5f0a64
+--- /dev/null
++++ b/mysys/my_num_vcpus.c
+@@ -0,0 +1,142 @@
++/* Copyright (C) 2026 Percona LLC and/or its affiliates
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; version 2 of the License.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program; if not, write to the Free Software
++   Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
++   USA */
++
++#include "mysys_priv.h"
++#include "my_num_vcpus.h"
++
++#include <stdlib.h>
++
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include <unistd.h>
++#endif
++
++#ifdef __linux__
++#include <sched.h>
++#endif
++
++static uint32 num_vcpus_using_config(void)
++{
++#if defined(_SC_NPROCESSORS_ONLN)
++  long num_vcpus= sysconf(_SC_NPROCESSORS_ONLN);
++#elif defined(_SC_NPROCESSORS_CONF)
++  long num_vcpus= sysconf(_SC_NPROCESSORS_CONF);
++#else
++  long num_vcpus= 0;
++#endif
++
++  return num_vcpus > 0 ? (uint32)num_vcpus : 0;
++}
++
++#ifdef __linux__
++static uint32 num_vcpus_using_affinity(void)
++{
++  cpu_set_t cpus;
++  CPU_ZERO(&cpus);
++
++  if (sched_getaffinity(getpid(), sizeof(cpus), &cpus) != 0)
++    return 0;
++
++  return (uint32)CPU_COUNT(&cpus);
++}
++
++static uint32 read_cgroup_v1_vcpu_limit(void)
++{
++  FILE *quota_file= fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
++  FILE *period_file= fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
++  long long quota;
++  unsigned long long period;
++  uint32 limit= 0;
++
++  if (!quota_file || !period_file)
++    goto end;
++
++  if (fscanf(quota_file, "%lld", &quota) != 1 || quota < 0)
++    goto end;
++
++  if (fscanf(period_file, "%llu", &period) != 1 || period == 0)
++    goto end;
++
++  limit= (uint32)(quota / (long long)period);
++
++end:
++  if (quota_file)
++    fclose(quota_file);
++  if (period_file)
++    fclose(period_file);
++  return limit;
++}
++
++static uint32 read_cgroup_v2_vcpu_limit(void)
++{
++  FILE *cpu_file= fopen("/sys/fs/cgroup/cpu.max", "r");
++  char quota[64];
++  unsigned long long period;
++  uint32 limit= 0;
++
++  if (!cpu_file)
++    return 0;
++
++  if (fscanf(cpu_file, "%63s %llu", quota, &period) == 2 &&
++      !(quota[0] == 'm' && quota[1] == 'a' && quota[2] == 'x' &&
++        quota[3] == '\0') &&
++      period != 0)
++  {
++    limit= (uint32)(strtoull(quota, 0, 10) / period);
++  }
++
++  fclose(cpu_file);
++  return limit;
++}
++
++static uint32 my_cgroup_vcpu_limit(void)
++{
++  uint32 limit= read_cgroup_v2_vcpu_limit();
++  if (limit != 0)
++    return limit;
++
++  return read_cgroup_v1_vcpu_limit();
++}
++#else
++static uint32 num_vcpus_using_affinity(void)
++{
++  return 0;
++}
++
++static uint32 my_cgroup_vcpu_limit(void)
++{
++  return 0;
++}
++#endif
++
++static uint32 my_system_num_vcpus(void)
++{
++  uint32 num_vcpus= num_vcpus_using_affinity();
++  if (num_vcpus == 0)
++    num_vcpus= num_vcpus_using_config();
++
++  return num_vcpus;
++}
++
++uint32 my_num_vcpus(void)
++{
++  uint32 num_vcpus= my_cgroup_vcpu_limit();
++  if (num_vcpus == 0)
++    num_vcpus= my_system_num_vcpus();
++
++  return num_vcpus;
++}
+diff --git a/sql/binlog.cc b/sql/binlog.cc
+index a3847839ba7..4f3d1cab0d5 100644
+--- a/sql/binlog.cc
++++ b/sql/binlog.cc
+@@ -34,6 +34,7 @@
+ #include "rpl_slave_commit_order_manager.h" // Commit_order_manager
+ #include "rpl_trx_boundary_parser.h"        // Transaction_boundary_parser
+ #include "rpl_context.h"
++#include "mysql/service_thd_wait.h"
+ #include "sql_class.h"                      // THD
+ #include "sql_parse.h"                      // sqlcom_can_generate_row_events
+ #include "sql_show.h"                       // append_identifier
+@@ -2387,9 +2388,18 @@ Stage_manager::enroll_for(StageID stage, THD *thd, mysql_mutex_t *stage_mutex)
+     mysql_mutex_unlock(&m_lock_done);
+ #endif
+ #endif
++    const bool wait_group_commit_pending=
++      (stage <= Stage_manager::SYNC_STAGE) &&
++      thd->get_transaction()->m_flags.pending;
++
++    if (wait_group_commit_pending)
++      thd_wait_begin(thd, THD_WAIT_GROUP_COMMIT_PENDING);
+ 
+     while (thd->get_transaction()->m_flags.pending)
+       mysql_cond_wait(pending_cond, pending_lock);
++
++    if (wait_group_commit_pending)
++      thd_wait_end(thd);
+     mysql_mutex_unlock(pending_lock);
+ 
+ #if defined(__aarch64__) && defined(__linux__)
+diff --git a/sql/sys_vars.cc b/sql/sys_vars.cc
+index 2310ffa9190..0c714fc3699 100644
+--- a/sql/sys_vars.cc
++++ b/sql/sys_vars.cc
+@@ -4399,6 +4399,38 @@ static Sys_var_uint Sys_threadpool_stall_limit(
+   NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), 
+   ON_UPDATE(fix_threadpool_stall_limit)
+ );
++static Sys_var_mybool Sys_threadpool_enable_extra_threads(
++  "thread_pool_enable_extra_threads",
++  "Enable thread pool extra worker creation and wakeup on order commit waits.",
++  GLOBAL_VAR(threadpool_enable_extra_threads), CMD_LINE(OPT_ARG),
++  DEFAULT(TRUE), NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0)
++);
++static Sys_var_uint Sys_threadpool_cpu_usage_threshold(
++  "thread_pool_cpu_usage_threshold",
++  "Maximum process CPU busy percentage threshold before thread pool "
++  "scheduling should stop increasing concurrency.",
++  GLOBAL_VAR(threadpool_cpu_usage_threshold), CMD_LINE(REQUIRED_ARG),
++  VALID_RANGE(0, 100), DEFAULT(90), BLOCK_SIZE(1),
++  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0)
++);
++static Sys_var_uint Sys_threadpool_nvcsw_freq_threshold(
++  "thread_pool_nvcsw_freq_threshold",
++  "Maximum voluntary context-switch frequency threshold in counts per "
++  "second per CPU core before thread pool scheduling should stop "
++  "increasing concurrency.",
++  GLOBAL_VAR(threadpool_nvcsw_freq_threshold), CMD_LINE(REQUIRED_ARG),
++  VALID_RANGE(0, UINT_MAX), DEFAULT(10000), BLOCK_SIZE(1),
++  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0)
++);
++static Sys_var_uint Sys_threadpool_nivcsw_freq_threshold(
++  "thread_pool_nivcsw_freq_threshold",
++  "Maximum involuntary context-switch frequency threshold in counts per "
++  "second per CPU core before thread pool scheduling should stop "
++  "increasing concurrency.",
++  GLOBAL_VAR(threadpool_nivcsw_freq_threshold), CMD_LINE(REQUIRED_ARG),
++  VALID_RANGE(0, UINT_MAX), DEFAULT(UINT_MAX), BLOCK_SIZE(1),
++  NO_MUTEX_GUARD, NOT_IN_BINLOG, ON_CHECK(0), ON_UPDATE(0)
++);
+ static Sys_var_uint Sys_threadpool_high_prio_tickets(
+   "thread_pool_high_prio_tickets",
+   "Number of tickets to enter the high priority event queue for each "
+diff --git a/sql/threadpool.h b/sql/threadpool.h
+index 54c63ed6e9f..ff417b0cd8f 100644
+--- a/sql/threadpool.h
++++ b/sql/threadpool.h
+@@ -34,6 +34,10 @@ extern uint threadpool_size; /* Number of parallel executing threads */
+ extern uint threadpool_stall_limit;  /* time interval in 10 ms units for stall checks*/
+ extern uint threadpool_max_threads;  /* Maximum threads in pool */
+ extern uint threadpool_oversubscribe;  /* Maximum active threads in group */
++extern my_bool threadpool_enable_extra_threads;
++extern uint threadpool_cpu_usage_threshold;
++extern uint threadpool_nvcsw_freq_threshold;
++extern uint threadpool_nivcsw_freq_threshold;
+ 
+ /* Possible values for thread_pool_high_prio_mode */
+ extern const char *threadpool_high_prio_mode_names[];
+diff --git a/sql/threadpool_common.cc b/sql/threadpool_common.cc
+index 9eef2d2f501..61398b43dab 100644
+--- a/sql/threadpool_common.cc
++++ b/sql/threadpool_common.cc
+@@ -36,6 +36,10 @@ uint threadpool_size;
+ uint threadpool_stall_limit;
+ uint threadpool_max_threads;
+ uint threadpool_oversubscribe;
++my_bool threadpool_enable_extra_threads;
++uint threadpool_cpu_usage_threshold;
++uint threadpool_nvcsw_freq_threshold;
++uint threadpool_nivcsw_freq_threshold;
+ 
+ /* Stats */
+ TP_STATISTICS tp_stats;
+diff --git a/sql/threadpool_unix.cc b/sql/threadpool_unix.cc
+index 5f1fdc68840..eec19671a61 100644
+--- a/sql/threadpool_unix.cc
++++ b/sql/threadpool_unix.cc
+@@ -14,14 +14,20 @@
+    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA */
+ 
+ #include <my_global.h>
++#include <sys/resource.h>
+ #include <violite.h>
++#include <algorithm>
++#include <climits>
+ #include <sql_class.h>
+ #include <sql_connect.h>
+ #include <mysqld.h>
+ #include <debug_sync.h>
++#include <sql_show.h>
+ #include <time.h>
+ #include <sql_plist.h>
+ #include <threadpool.h>
++#include <my_num_vcpus.h>
++#include <mysql/service_thd_wait.h>
+ #include <mysql/thread_pool_priv.h>             // thd_is_transaction_active()
+ #include <time.h>
+ #include <mysqld_thd_manager.h>
+@@ -159,6 +165,32 @@ struct thread_group_t
+ static thread_group_t all_groups[MAX_THREAD_GROUPS];
+ static uint group_count;
+ 
++class Atomic_counter
++{
++public:
++Atomic_counter() : m_counter(0) { }
++
++  void inc(uint32 count)
++  {
++    my_atomic_add32(&m_counter, (int32)count);
++  }
++
++  void dec(uint32 count)
++  {
++    my_atomic_add32(&m_counter, -(int32)count);
++  }
++
++  int load() const
++  {
++    return (int)my_atomic_load32(const_cast<volatile int32 *>(&m_counter));
++  }
++
++private:
++  volatile int32 m_counter;
++};
++
++static Atomic_counter tp_global_active_threads_counter;
++
+ /**
+  Used for printing "pool blocked" message, see
+  print_pool_blocked_message();
+@@ -397,6 +429,211 @@ static void* native_event_get_userdata(native_event *event)
+ #error not ported yet to this OS
+ #endif
+ 
++class Tp_statistics
++{
++public:
++  Tp_statistics()
++    : m_n_cpu(-1),
++      m_active_threads_quota(INT_MAX),
++      m_time_pct(-1),
++      m_nivcsw_freq(0),
++      m_nvcsw_freq(0)
++  {
++  }
++
++  int time_pct() const
++  {
++    return (int)m_time_pct;
++  }
++
++  ulonglong nivcsw_freq() const
++  {
++    return (ulonglong)m_nivcsw_freq;
++  }
++
++  ulonglong nvcsw_freq() const
++  {
++    return (ulonglong)m_nvcsw_freq;
++  }
++
++  int active_threads_quota() const
++  {
++    return (int)m_active_threads_quota;
++  }
++
++  void to_cstring(char *buff, size_t buff_size) const
++  {
++    snprintf(buff, buff_size,
++             "n_cpu: %d, cpu_pct: %d, nivcsw_freq: %llu, nvcsw_freq: %llu, "
++             "active_threads_quota: %d",
++             (int)m_n_cpu, time_pct(),
++             (unsigned long long)nivcsw_freq(),
++             (unsigned long long)nvcsw_freq(),
++             active_threads_quota());
++  }
++
++  void reset()
++  {
++    m_n_cpu= -1;
++    m_active_threads_quota= tp_max_threads_quota();
++    m_time_pct= -1;
++    m_nivcsw_freq= 0;
++    m_nvcsw_freq= 0;
++  }
++
++  void update();
++
++private:
++  static longlong timeval_diff_us(const timeval &a, const timeval &b)
++  {
++    return ((longlong)a.tv_sec - (longlong)b.tv_sec) * 1000000LL +
++           (longlong)a.tv_usec - (longlong)b.tv_usec;
++  }
++
++  static int tp_max_threads_quota()
++  {
++    return (int)threadpool_oversubscribe * (int)threadpool_size;
++  }
++
++  static int tp_min_threads_quota()
++  {
++    return (int)threadpool_size * 2;
++  }
++
++  static int tp_get_num_cpus()
++  {
++    uint32 cpus= my_num_vcpus();
++    return cpus > 0 ? (int)cpus : 1;
++  }
++
++  static double thread_quota_scale_factor()
++  {
++    return 0.25;
++  }
++
++  void evaluate_active_threads_quota();
++
++private:
++  volatile int32 m_n_cpu;
++  volatile int32 m_active_threads_quota;
++  volatile int32 m_time_pct;
++  volatile int64 m_nivcsw_freq;
++  volatile int64 m_nvcsw_freq;
++};
++
++void Tp_statistics::update()
++{
++  static ulonglong last_time= 0;
++  static struct rusage last_cpu_usage;
++  const ulonglong current_time= my_microsecond_getsystime();
++  const ulonglong elapsed_us= current_time - last_time;
++  struct rusage usage;
++
++  if (getrusage(RUSAGE_SELF, &usage) != 0)
++    return;
++
++  if (m_n_cpu == -1)
++  {
++    last_time= current_time;
++    last_cpu_usage= usage;
++    m_time_pct= -1;
++    m_nivcsw_freq= 0;
++    m_nvcsw_freq= 0;
++    m_n_cpu= tp_get_num_cpus();
++    m_active_threads_quota= tp_min_threads_quota();
++    return;
++  }
++
++  if (elapsed_us == 0)
++    return;
++
++  const int n_cpu= std::max(1, (int)m_n_cpu);
++  const longlong utime_diff=
++    timeval_diff_us(usage.ru_utime, last_cpu_usage.ru_utime);
++  const longlong stime_diff=
++    timeval_diff_us(usage.ru_stime, last_cpu_usage.ru_stime);
++  const longlong nvcsw_diff=
++    std::max<longlong>(0LL, (longlong)usage.ru_nvcsw -
++                             (longlong)last_cpu_usage.ru_nvcsw);
++  const longlong nivcsw_diff=
++    std::max<longlong>(0LL, (longlong)usage.ru_nivcsw -
++                             (longlong)last_cpu_usage.ru_nivcsw);
++
++  last_time= current_time;
++  last_cpu_usage= usage;
++
++  const int cpu_time_pct=
++    (int)std::max(0.0, ((utime_diff + stime_diff) * 100.0 / elapsed_us) / n_cpu);
++  const ulonglong nivcsw_freq=
++    (ulonglong)std::max(0.0, (nivcsw_diff * 1000000.0 / elapsed_us) / n_cpu);
++  const ulonglong nvcsw_freq=
++    (ulonglong)std::max(0.0, (nvcsw_diff * 1000000.0 / elapsed_us) / n_cpu);
++
++  m_time_pct= cpu_time_pct;
++  m_nivcsw_freq= (int64)nivcsw_freq;
++  m_nvcsw_freq= (int64)nvcsw_freq;
++  evaluate_active_threads_quota();
++}
++
++void Tp_statistics::evaluate_active_threads_quota()
++{
++  const int cpu_time_pct= (int)m_time_pct;
++  const int cpu_usage_threshold= (int)threadpool_cpu_usage_threshold;
++  const ulonglong nvcsw_freq= (ulonglong)m_nvcsw_freq;
++  const ulonglong nivcsw_freq= (ulonglong)m_nivcsw_freq;
++  int active_threads_quota= (int)m_active_threads_quota;
++
++  if (cpu_time_pct <= 0)
++  {
++    m_active_threads_quota= tp_max_threads_quota();
++    return;
++  }
++
++  if (cpu_time_pct > cpu_usage_threshold ||
++      nvcsw_freq > threadpool_nvcsw_freq_threshold ||
++      nivcsw_freq > threadpool_nivcsw_freq_threshold)
++  {
++    const int min_active_threads_quota= tp_min_threads_quota();
++    const int max_active_threads_quota=
++      (int)(threadpool_size * threadpool_oversubscribe);
++    const int quota_delta=
++      std::max(1, (int)(threadpool_size * thread_quota_scale_factor()));
++
++    if (active_threads_quota >= (max_active_threads_quota / 2))
++    {
++      active_threads_quota= tp_min_threads_quota() + quota_delta;
++      if (active_threads_quota > tp_max_threads_quota())
++        active_threads_quota= tp_max_threads_quota();
++    }
++    else
++    {
++      active_threads_quota-= quota_delta;
++      if (active_threads_quota < min_active_threads_quota)
++        active_threads_quota= min_active_threads_quota;
++    }
++
++    m_active_threads_quota= active_threads_quota;
++  }
++  else
++  {
++    int evaluate_quota=
++      tp_global_active_threads_counter.load() * 100 / cpu_time_pct;
++
++    if (active_threads_quota < evaluate_quota)
++      active_threads_quota= evaluate_quota;
++    else
++      active_threads_quota+=
++        (int)(threadpool_size * thread_quota_scale_factor());
++
++    if (active_threads_quota > tp_max_threads_quota())
++      active_threads_quota= tp_max_threads_quota();
++
++    m_active_threads_quota= active_threads_quota;
++  }
++}
++
++static Tp_statistics tp_statistics;
++
+ namespace {
+ 
+ /*
+@@ -411,6 +648,15 @@ inline bool too_many_active_threads(thread_group_t *thread_group)
+           && !thread_group->stalled);
+ }
+ 
++inline bool has_threads_quota()
++{
++  const int active_threads_quota= tp_statistics.active_threads_quota();
++  const int active_threads= tp_global_active_threads_counter.load();
++  const int threads_threshold= (int)threadpool_size;
++  return active_threads > threads_threshold &&
++         (active_threads_quota - active_threads) > threads_threshold;
++}
++
+ /*
+   Limit the number of 'busy' threads by 1 + thread_pool_oversubscribe. A thread
+   is busy if it is in either the active state or the waiting state (i.e. between
+@@ -472,6 +718,55 @@ static connection_t *queue_get(thread_group_t *thread_group)
+   DBUG_RETURN(c);  
+ }
+ 
++static int show_statistics_detail(THD *, SHOW_VAR *var, char *buff)
++{
++  var->type= SHOW_CHAR;
++  var->value= buff;
++  tp_statistics.to_cstring(buff, SHOW_VAR_FUNC_BUFF_SIZE);
++  return 0;
++}
++
++static int show_threadpool_active_threads(THD *, SHOW_VAR *var, char *buff)
++{
++  var->type= SHOW_LONGLONG;
++  var->value= buff;
++  *((longlong *)buff)= (longlong)tp_global_active_threads_counter.load();
++  return 0;
++}
++
++static longlong threadpool_waiting_threads()
++{
++  longlong sum= 0;
++
++  for (uint i= 0;
++       i < array_elements(all_groups) && (all_groups[i].pollfd >= 0);
++       i++)
++  {
++    sum+= all_groups[i].waiting_thread_count;
++  }
++
++  return sum;
++}
++
++static int show_threadpool_waiting_threads(THD *, SHOW_VAR *var, char *buff)
++{
++  var->type= SHOW_LONGLONG;
++  var->value= buff;
++  *((longlong *)buff)= threadpool_waiting_threads();
++  return 0;
++}
++
++static SHOW_VAR threadpool_status_variables[]=
++{
++  {"Threadpool_statistics_detail", (char *)&show_statistics_detail, SHOW_FUNC,
++   SHOW_SCOPE_GLOBAL},
++  {"Threadpool_active_threads", (char *)&show_threadpool_active_threads,
++   SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++  {"Threadpool_waiting_threads", (char *)&show_threadpool_waiting_threads,
++   SHOW_FUNC, SHOW_SCOPE_GLOBAL},
++  {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}
++};
++
+ 
+ class Thd_timeout_checker : public Do_THD_Impl
+ {
+@@ -578,6 +873,7 @@ static void* timer_thread(void *param)
+     if (err == ETIMEDOUT)
+     {
+       timer->current_microtime= my_microsecond_getsystime();
++      tp_statistics.update();
+       
+       /* Check stalls in thread groups */
+       for(i=0; i< array_elements(all_groups);i++)
+@@ -854,6 +1150,10 @@ static void add_thread_count(thread_group_t *thread_group, int32 count)
+   thread_group->thread_count += count;
+   /* worker starts out and end in "active" state */
+   thread_group->active_thread_count += count;
++  if (count > 0)
++    tp_global_active_threads_counter.inc((uint32)count);
++  else if (count < 0)
++    tp_global_active_threads_counter.dec((uint32)(-count));
+   my_atomic_add32(&tp_stats.num_worker_threads, count);
+ }
+ 
+@@ -1155,12 +1455,14 @@ static connection_t *get_event(worker_thread_t *current_thread,
+     {
+       thread_group->listener= current_thread;
+       thread_group->active_thread_count--;
++      tp_global_active_threads_counter.dec(1);
+       mysql_mutex_unlock(&thread_group->mutex);
+ 
+       connection = listener(current_thread, thread_group);
+ 
+       mysql_mutex_lock(&thread_group->mutex);
+       thread_group->active_thread_count++;
++      tp_global_active_threads_counter.inc(1);
+       /* There is no listener anymore, it just returned. */
+       thread_group->listener= NULL;
+       break;
+@@ -1219,6 +1521,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
+     thread_group->waiting_threads.push_front(current_thread);
+     
+     thread_group->active_thread_count--;
++    tp_global_active_threads_counter.dec(1);
+     if (abstime)
+     {
+       err = mysql_cond_timedwait(&current_thread->cond, &thread_group->mutex, 
+@@ -1229,6 +1532,7 @@ static connection_t *get_event(worker_thread_t *current_thread,
+       err = mysql_cond_wait(&current_thread->cond, &thread_group->mutex);
+     }
+     thread_group->active_thread_count++;
++    tp_global_active_threads_counter.inc(1);
+     
+     if (!current_thread->woken)
+     {
+@@ -1251,6 +1555,38 @@ static connection_t *get_event(worker_thread_t *current_thread,
+ }
+ 
+ 
++static void group_commit_pending_wait_begin(thread_group_t *thread_group)
++{
++  DBUG_ENTER("group_commit_pending_wait_begin");
++
++  /*
++    Dirty reads are sufficient for a fast path filter. The checks are repeated
++    under the group mutex before any worker is woken or created.
++  */
++  if (!threadpool_enable_extra_threads || !has_threads_quota() ||
++      too_many_active_threads(thread_group) ||
++      too_many_busy_threads(thread_group) ||
++      queues_are_empty(thread_group))
++  {
++    DBUG_VOID_RETURN;
++  }
++
++  if (mysql_mutex_trylock(&thread_group->mutex) != 0)
++    DBUG_VOID_RETURN;
++
++#ifdef THREADPOOL_CREATE_THREADS_ON_WAIT
++  if (!queues_are_empty(thread_group) && has_threads_quota() &&
++      !too_many_busy_threads(thread_group) &&
++      !too_many_active_threads(thread_group))
++  {
++    wake_or_create_thread(thread_group);
++  }
++#endif
++
++  mysql_mutex_unlock(&thread_group->mutex);
++  DBUG_VOID_RETURN;
++}
++
+ 
+ /**
+   Tells the pool that worker starts waiting  on IO, lock, condition, 
+@@ -1262,6 +1598,7 @@ static void wait_begin(thread_group_t *thread_group)
+   DBUG_ENTER("wait_begin");
+   mysql_mutex_lock(&thread_group->mutex);
+   thread_group->active_thread_count--;
++  tp_global_active_threads_counter.dec(1);
+   thread_group->waiting_thread_count++;
+ 
+   assert(thread_group->active_thread_count >=0);
+@@ -1292,6 +1629,7 @@ static void wait_end(thread_group_t *thread_group)
+   DBUG_ENTER("wait_end");
+   mysql_mutex_lock(&thread_group->mutex);
+   thread_group->active_thread_count++;
++  tp_global_active_threads_counter.inc(1);
+   thread_group->waiting_thread_count--;
+   mysql_mutex_unlock(&thread_group->mutex);
+   DBUG_VOID_RETURN;
+@@ -1428,8 +1766,13 @@ void tp_wait_begin(THD *thd, int type)
+   if (connection)
+   {
+     assert(!connection->waiting);
+-    connection->waiting= true;
+-    wait_begin(connection->thread_group);
++    if (type == THD_WAIT_GROUP_COMMIT_PENDING)
++      group_commit_pending_wait_begin(connection->thread_group);
++    else
++    {
++      connection->waiting= true;
++      wait_begin(connection->thread_group);
++    }
+   }
+   DBUG_VOID_RETURN;
+ }
+@@ -1445,9 +1788,8 @@ void tp_wait_end(THD *thd)
+   assert(thd);
+ 
+   connection_t *connection = (connection_t *)thd->event_scheduler.data;
+-  if (connection)
++  if (connection && connection->waiting)
+   {
+-    assert(connection->waiting);
+     connection->waiting = false;
+     wait_end(connection->thread_group);
+   }
+@@ -1674,6 +2016,14 @@ bool tp_init()
+   PSI_register(cond);
+   PSI_register(thread);
+ #endif
++  if (add_status_vars(threadpool_status_variables))
++  {
++    threadpool_started= false;
++    DBUG_RETURN(1);
++  }
++
++  tp_statistics.reset();
++  tp_statistics.update();
+   
+   pool_timer.tick_interval= threadpool_stall_limit;
+   start_timer(&pool_timer);
+-- 
+2.34.1
+

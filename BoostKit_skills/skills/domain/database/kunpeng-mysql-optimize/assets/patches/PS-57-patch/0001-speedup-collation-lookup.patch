@@ -1,0 +1,98 @@
+From 81525cea339fbb4e0bdaed5e5fdf26bf25405d6f Mon Sep 17 00:00:00 2001
+From: libiao <1102510224@qq.com>
+Date: Fri, 25 Jul 2025 15:15:45 +0800
+Subject: [PATCH]   speedup collation lookup
+
+---
+ mysys/charset.c | 37 +++++++++++++++++++++++++++----------
+ 1 file changed, 27 insertions(+), 10 deletions(-)
+
+diff --git a/mysys/charset.c b/mysys/charset.c
+index 1badb9dba11..e9ff9c5a25e 100644
+--- a/mysys/charset.c
++++ b/mysys/charset.c
+@@ -34,6 +34,7 @@
+ #include <my_xml.h>
+ #include "mysql/psi/mysql_file.h"
+ #include "sql_chars.h"
++#include "hash.h"
+ 
+ /*
+   The code below implements this functionality:
+@@ -45,6 +46,8 @@
+     - Setting server default character set
+ */
+ 
++static HASH collation_name_hash;
++
+ my_bool my_charset_same(const CHARSET_INFO *cs1, const CHARSET_INFO *cs2)
+ {
+   return ((cs1 == cs2) || !strcmp(cs1->csname,cs2->csname));
+@@ -54,16 +57,10 @@ my_bool my_charset_same(const CHARSET_INFO *cs1, const CHARSET_INFO *cs2)
+ static uint
+ get_collation_number_internal(const char *name)
+ {
+-  CHARSET_INFO **cs;
+-  for (cs= all_charsets;
+-       cs < all_charsets + array_elements(all_charsets);
+-       cs++)
+-  {
+-    if ( cs[0] && cs[0]->name && 
+-         !my_strcasecmp(&my_charset_latin1, cs[0]->name, name))
+-      return cs[0]->number;
+-  }  
+-  return 0;
++  CHARSET_INFO *cs= (CHARSET_INFO *)my_hash_search(&collation_name_hash,
++                                                   (uchar *)name,
++                                                   strlen(name));
++  return cs ? cs->number : 0;
+ }
+ 
+ 
+@@ -449,10 +446,19 @@ void add_compiled_collation(CHARSET_INFO *cs)
+ static my_thread_once_t charsets_initialized= MY_THREAD_ONCE_INIT;
+ static my_thread_once_t charsets_template= MY_THREAD_ONCE_INIT;
+ 
++static uchar *get_collatio_key(const uchar *o, size_t *l,
++                               my_bool n MY_ATTRIBUTE((unused)))
++{
++  CHARSET_INFO *cs= (CHARSET_INFO *)o;
++  *l= strlen(cs->name);
++  return (uchar*)cs->name;
++}
++
+ static void init_available_charsets(void)
+ {
+   char fname[FN_REFLEN + sizeof(MY_CHARSET_INDEX)];
+   MY_CHARSET_LOADER loader;
++  CHARSET_INFO **cs;
+ 
+   memset(&all_charsets, 0, sizeof(all_charsets));
+   init_compiled_charsets(MYF(0));
+@@ -468,12 +474,23 @@ static void init_available_charsets(void)
+                        MYF(0)
+ #endif
+                        );
++
++  my_hash_init2(&collation_name_hash, 16, &my_charset_latin1,
++                64, 0, 0, get_collatio_key, NULL, HASH_UNIQUE,
++                key_memory_charset_loader);
++  for (cs= all_charsets; cs< all_charsets + array_elements(all_charsets);
++       cs++) {
++    if ((*cs) != NULL && (*cs)->name != NULL) {
++      my_hash_insert(&collation_name_hash, (uchar *)(*cs));
++    }
++  }
+ }
+ 
+ 
+ void free_charsets(void)
+ {
+   charsets_initialized= charsets_template;
++  my_hash_free(&collation_name_hash);
+ }
+ 
+ 
+-- 
+2.27.0
+

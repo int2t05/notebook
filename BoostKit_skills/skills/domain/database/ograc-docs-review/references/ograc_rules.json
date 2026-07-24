@@ -1,0 +1,599 @@
+{
+  "version": "1.0",
+  "priority_rules": [
+    {
+      "level": "P0",
+      "type": "错别字/拼写导致误导",
+      "example": "`NOLOGING`→`NOLOGGING`，`不适用`→`不使用`"
+    },
+    {
+      "level": "P0",
+      "type": "文件名/TOC 错误",
+      "example": "`artitioned_`→`partitioned_`"
+    },
+    {
+      "level": "P0",
+      "type": "英文专有名词未用行内代码",
+      "example": "`JDBC`、`DBStor`、`ODBC`、`SQL`、命令/路径等应包在 `` ` `` 中"
+    },
+    {
+      "level": "P0",
+      "type": "弯引号/Unicode 引号",
+      "example": "JDBC URL、参数、代码中的弯引号应改为 ASCII 直引号"
+    },
+    {
+      "level": "P0",
+      "type": "中英文混排缺空格",
+      "example": "`oGRAC提供了`→`oGRAC 提供了`"
+    },
+    {
+      "level": "P1",
+      "type": "命名 copy-paste 残留",
+      "example": "`openGaussSpace`→`ogracSpace`，`ograc提供`→`oGRAC 提供`"
+    },
+    {
+      "level": "P1",
+      "type": "语义/技术描述错误",
+      "example": "`书签页`→`书签列`，`共享内存服务`→`分布式内存服务（DMS）`"
+    },
+    {
+      "level": "P1",
+      "type": "上下文矛盾",
+      "example": "删除 DBStor 后，其他文档中相关描述应同步删除"
+    },
+    {
+      "level": "P2",
+      "type": "语法与口语化",
+      "example": "「当你不需要」→「适用于无需…的场景」，「也就是说」→「即/因此」"
+    },
+    {
+      "level": "P2",
+      "type": "Markdown 规范",
+      "example": "` ```SQL `→` ```sql `，补全断裂链接"
+    },
+    {
+      "level": "P2",
+      "type": "标点一致性",
+      "example": "同一段落中英文分号 `;` 与中文句号 `。` 不混用"
+    },
+    {
+      "level": "P2",
+      "type": "Shell 代码块可一键复制",
+      "example": "删除行首 `$` / `#` 提示符，用注释说明命令用途"
+    },
+    {
+      "level": "P3",
+      "type": "HTML 残留清理",
+      "example": "`zh-cn_topic_*` 锚点、`<table>` 转 Markdown"
+    },
+    {
+      "level": "P3",
+      "type": "缺失图片",
+      "example": "补充资源或修正路径"
+    }
+  ],
+  "naming_conventions": [
+    {
+      "scenario": "产品名（正文）",
+      "rule": "`oGRAC`（首字母小写 o，其余大写）"
+    },
+    {
+      "scenario": "示例表空间",
+      "rule": "`ogracSpace` / SQL 中大写 `OGRACSPACE`"
+    },
+    {
+      "scenario": "SQL 提示符",
+      "rule": "`SQL>` 或 `oGRAC>`，不用 `openGauss=#`"
+    },
+    {
+      "scenario": "JDBC 负载均衡文档标题",
+      "rule": "`JDBC 多节点负载均衡`（非「主备集群」）"
+    },
+    {
+      "scenario": "堆管理标题",
+      "rule": "`# 堆管理`（非 `Heap Management`）"
+    },
+    {
+      "scenario": "仓库 URL",
+      "rule": "统一为 `https://gitcode.com/opengauss/oGRAC.git`（小写 `opengauss`）"
+    },
+    {
+      "scenario": "产品名变体",
+      "rule": "禁止 `ogRac`、`OGRAC`、`openGauss` 等变体指代 oGRAC 产品"
+    }
+  ],
+  "spacing_rules": {
+    "description": "中文正文与英文单词、数字、版本号之间应加空格；但英文与相邻的英文标点、数字单位、代码符号之间不加空格。例外：URL、文件路径、命令行参数组、连字符复合词内部不加空格，例如 `openGauss-third_party_binarylibs`、`SQL_STAGE_THRESHOLD`。",
+    "examples": [
+      {
+        "scenario": "产品名 + 中文",
+        "example": "`oGRAC 提供了`、`oGRAC 中支持`"
+      },
+      {
+        "scenario": "英文术语 + 中文",
+        "example": "`JDBC 驱动`、`SQL 语句`、`CPU 核心数`"
+      },
+      {
+        "scenario": "数字 + 中文单位",
+        "example": "`64 位时间戳`、`2 个 ITL 条目`"
+      },
+      {
+        "scenario": "版本号",
+        "example": "`JDBC 4.0 接口`"
+      },
+      {
+        "scenario": "代码符号紧邻英文",
+        "example": "`oGRAC(openGauss...)` 括号内不变、`SQL>` 提示符不变"
+      }
+    ]
+  },
+  "inline_code_terms": {
+    "category_labels": {
+      "protocols_interfaces": "协议/接口",
+      "commands_tools": "命令/工具",
+      "paths_files": "路径/文件",
+      "parameters_options": "参数/选项",
+      "code_keywords_functions": "代码片段中的关键字、函数名"
+    },
+    "terms": {
+      "protocols_interfaces": [
+        "JDBC",
+        "ODBC",
+        "SQL",
+        "DBStor",
+        "WSR"
+      ],
+      "commands_tools": [
+        "gsql",
+        "ogsql",
+        "git",
+        "make",
+        "cmake"
+      ],
+      "paths_files": [
+        "/usr/local/etc",
+        "/opt/ograc",
+        "ogjdbc.jar",
+        "_toc.yaml",
+        ".gitignore"
+      ],
+      "parameters_options": [
+        "host",
+        "port",
+        "database",
+        "M_RUNING_MODE"
+      ],
+      "code_keywords_functions": [
+        "INSERT",
+        "SELECT",
+        "pg_xlog"
+      ]
+    },
+    "notes": [
+      "不要用全角弯引号替代 `` ` ``。",
+      "同一文档中同一术语的包裹方式保持一致。"
+    ]
+  },
+  "oral_replacements": [
+    {
+      "avoid": "这里我们提供",
+      "replace": "本文提供"
+    },
+    {
+      "avoid": "当你不需要…时使用",
+      "replace": "适用于无需…的场景"
+    },
+    {
+      "avoid": "你可以指定路径",
+      "replace": "可指定路径"
+    },
+    {
+      "avoid": "如果语句中存在参数标记的话",
+      "replace": "若语句中存在参数标记"
+    },
+    {
+      "avoid": "便可以安装下面的步骤",
+      "replace": "便可按照以下步骤"
+    },
+    {
+      "avoid": "我们衷心感谢…是你们的…",
+      "replace": "衷心感谢…正是大家的…"
+    },
+    {
+      "avoid": "也就是说",
+      "replace": "即 / 因此 / 因而"
+    },
+    {
+      "avoid": "向两个节点同时执行向目标测试表",
+      "replace": "向两个节点同时对目标测试表执行"
+    },
+    {
+      "avoid": "灵活的应对",
+      "replace": "灵活地应对"
+    },
+    {
+      "avoid": "可以把不同表",
+      "replace": "可以将不同表"
+    },
+    {
+      "avoid": "进入restricted模式",
+      "replace": "进入 restricted 模式"
+    },
+    {
+      "avoid": "kill会话",
+      "replace": "终止会话"
+    },
+    {
+      "avoid": "dump数据文件",
+      "replace": "导出数据文件"
+    },
+    {
+      "avoid": "缺省的",
+      "replace": "默认的"
+    },
+    {
+      "avoid": "这一带来的",
+      "replace": "这带来的"
+    },
+    {
+      "avoid": "该字段类型",
+      "replace": "改字段类型",
+      "note": "应为修改"
+    },
+    {
+      "avoid": "在表表结构",
+      "replace": "在线表结构"
+    },
+    {
+      "avoid": "一起子句",
+      "replace": "子句"
+    },
+    {
+      "avoid": "它函数依赖",
+      "replace": "该字段函数依赖"
+    },
+    {
+      "avoid": "再数据库",
+      "replace": "在数据库"
+    },
+    {
+      "avoid": "擦或许",
+      "replace": "做写入"
+    },
+    {
+      "avoid": "最基础的",
+      "replace": "是最基础的"
+    }
+  ],
+  "typos": [
+    {
+      "wrong": "NOLOGING",
+      "correct": "NOLOGGING",
+      "note": "拼写"
+    },
+    {
+      "wrong": "COLUME",
+      "correct": "COLUMN",
+      "note": "拼写"
+    },
+    {
+      "wrong": "COLUMAN",
+      "correct": "COLUMN",
+      "note": "拼写"
+    },
+    {
+      "wrong": "Defination",
+      "correct": "Definition",
+      "note": "拼写"
+    },
+    {
+      "wrong": "DETAFILE",
+      "correct": "DATAFILE",
+      "note": "拼写"
+    },
+    {
+      "wrong": "PARITION",
+      "correct": "PARTITION",
+      "note": "拼写"
+    },
+    {
+      "wrong": "PARITIION",
+      "correct": "PARTITION",
+      "note": "拼写"
+    },
+    {
+      "wrong": "OERRDERED",
+      "correct": "ORDERED",
+      "note": "拼写"
+    },
+    {
+      "wrong": "UPADATE",
+      "correct": "UPDATE",
+      "note": "拼写"
+    },
+    {
+      "wrong": "EXLUDINGINDEXES",
+      "correct": "EXCLUDING INDEXES",
+      "note": "拼写"
+    },
+    {
+      "wrong": "UNLINITED",
+      "correct": "UNLIMITED",
+      "note": "拼写"
+    },
+    {
+      "wrong": "RLUE",
+      "correct": "RULE",
+      "note": "拼写"
+    },
+    {
+      "wrong": "truancate",
+      "correct": "TRUNCATE",
+      "note": "拼写"
+    },
+    {
+      "wrong": "golbal",
+      "correct": "global",
+      "note": "拼写"
+    },
+    {
+      "wrong": "proprity",
+      "correct": "priority",
+      "note": "拼写"
+    },
+    {
+      "wrong": "excuteUpdate",
+      "correct": "executeUpdate",
+      "note": "拼写"
+    },
+    {
+      "wrong": "ValuetType",
+      "correct": "ValueType",
+      "note": "拼写"
+    },
+    {
+      "wrong": "snopshot",
+      "correct": "snapshot",
+      "note": "拼写"
+    },
+    {
+      "wrong": "socre",
+      "correct": "score",
+      "note": "拼写"
+    },
+    {
+      "wrong": "评诂",
+      "correct": "评估",
+      "note": "别字"
+    },
+    {
+      "wrong": "边长",
+      "correct": "变长",
+      "note": "指数据类型"
+    },
+    {
+      "wrong": "微妙",
+      "correct": "微秒",
+      "note": "指时间单位"
+    },
+    {
+      "wrong": "同名词",
+      "correct": "同义词",
+      "note": "术语"
+    },
+    {
+      "wrong": "数字字典",
+      "correct": "数据字典",
+      "note": "术语"
+    },
+    {
+      "wrong": "共享内存服务",
+      "correct": "分布式内存服务（DMS）",
+      "note": "术语"
+    },
+    {
+      "wrong": "统计试图",
+      "correct": "统计视图",
+      "note": "别字"
+    },
+    {
+      "wrong": "该特面",
+      "correct": "该页面",
+      "note": "别字"
+    },
+    {
+      "wrong": "几乎的头部",
+      "correct": "记录的头部",
+      "note": "用词"
+    },
+    {
+      "wrong": "active状态时false",
+      "correct": "active状态为false",
+      "note": "用词"
+    },
+    {
+      "wrong": "扩展、扩展或缩小",
+      "correct": "扩展或缩小",
+      "note": "重复"
+    },
+    {
+      "wrong": "表的空间",
+      "correct": "表空间",
+      "note": "术语"
+    },
+    {
+      "wrong": "执行序列",
+      "correct": "指定序列",
+      "note": "用词"
+    },
+    {
+      "wrong": "unto",
+      "correct": "undo",
+      "note": "拼写"
+    },
+    {
+      "wrong": "DRIOP",
+      "correct": "DROP",
+      "note": "拼写"
+    },
+    {
+      "wrong": "birthday_data",
+      "correct": "birthday_date",
+      "note": "示例一致性"
+    },
+    {
+      "wrong": "CHECK_NAME",
+      "correct": "CONSTRAINT_NAME",
+      "note": "列名"
+    },
+    {
+      "wrong": "DETETE",
+      "correct": "DELETE",
+      "note": "拼写"
+    },
+    {
+      "wrong": "改制",
+      "correct": "该值",
+      "note": "别字"
+    },
+    {
+      "wrong": "既",
+      "correct": "即",
+      "note": "表「即」意"
+    },
+    {
+      "wrong": "装失败",
+      "correct": "安装失败",
+      "note": "缺字"
+    },
+    {
+      "wrong": "不提供于",
+      "correct": "可用于",
+      "note": "语义"
+    }
+  ],
+  "sql_keywords": [
+    {
+      "lowercase": "create table",
+      "uppercase": "CREATE TABLE"
+    },
+    {
+      "lowercase": "select * from",
+      "uppercase": "SELECT * FROM"
+    },
+    {
+      "lowercase": "insert into",
+      "uppercase": "INSERT INTO"
+    },
+    {
+      "lowercase": "alter system set",
+      "uppercase": "ALTER SYSTEM SET"
+    },
+    {
+      "lowercase": "group by",
+      "uppercase": "GROUP BY"
+    }
+  ],
+  "code_block_languages": {
+    "description": "代码块应尽量带语言标签，避免无标签的裸围栏。",
+    "allowed": {
+      "sql": [
+        "sql"
+      ],
+      "shell": [
+        "shell",
+        "bash"
+      ],
+      "text": [
+        "text"
+      ],
+      "java": [
+        "java"
+      ],
+      "c": [
+        "c"
+      ],
+      "bnf": [
+        "bnf"
+      ]
+    },
+    "forbidden": [
+      "SQL",
+      "Sql",
+      "BNF",
+      "Bnf"
+    ]
+  },
+  "search_patterns": [
+    {
+      "name": "产品名变体",
+      "description": "检查 oGRAC 产品名的错误大小写/变体。",
+      "command": "rg -n \"(?i)(?<![\\w/])\\b(ogRac|OGRAC)(?!\\w)\" docs/zh"
+    },
+    {
+      "name": "错别字/拼写",
+      "description": "批量检索常见错别字与拼写错误。",
+      "command": "rg -n \"NOLOGING|proprity|COLUME|COLUMAN|Defination|同名词|统计试图|DETAFILE|PARITION|golbal|OERRDERED|artitioned_tables|UNLINITED|UPADATE|EXLUDING|RLUE|truancate|snopshot|评诂|边长|微妙|数字字典|DETETE|DRIOP| unto \" docs/zh"
+    },
+    {
+      "name": "命名残留",
+      "description": "检查 openGauss/oGRAC 命名 copy-paste 残留。",
+      "command": "rg -n \"openGaussSpace|OPENGAUSSSPACE|ograc提供|ogracDB|OpenGauss oGRAC|共享内存服务|ODBC在研|jdbc主备\" docs/zh"
+    },
+    {
+      "name": "Markdown 代码块标签",
+      "description": "检查代码块语言标签大小写或无标签。",
+      "command": "rg -n '^```[A-Z]{2,}$|^```\\s*$|```SQL|```Sql|```BNF|```Bnf' docs/zh"
+    },
+    {
+      "name": "弯引号/Unicode 引号",
+      "description": "检查代码/参数中是否出现 Unicode 弯引号。",
+      "command": "rg -n '[“”‘’]' docs/zh"
+    },
+    {
+      "name": "英文专有名词未包裹",
+      "description": "按常用词抽查英文专有名词是否未用行内代码包裹。",
+      "command": "rg -n '(?<!`)\\b(JDBC|ODBC|DBStor|WSR|SQL|gsql|ogsql|SGA|PGA|DMS|DSS|CMS|DRC|DLS|DCS|MVCC|ITL|SCN|TXN|XID|Redo|Undo|CKPT|CBO|API|LOB)\\b(?!`)' docs/zh"
+    },
+    {
+      "name": "中英文混排缺空格",
+      "description": "中文后紧跟 2 个以上字母/数字，或字母/数字后紧跟中文。",
+      "command": "rg -n '[\\x{4e00}-\\x{9fff}][a-zA-Z0-9]{2,}[\\x{4e00}-\\x{9fff}]|[\\x{4e00}-\\x{9fff}][0-9]+[\\x{4e00}-\\x{9fff}]' docs/zh"
+    },
+    {
+      "name": "SQL 关键字小写",
+      "description": "仅在 SQL> 提示符后检查 SQL 关键字是否小写。",
+      "command": "rg -n '^\\s*SQL>\\s+(create|select|insert|update|delete|drop|alter|grant|revoke|commit|rollback|begin|end|declare|set|show|analyze|explain|truncate|merge|replace)\\s+' docs/zh"
+    },
+    {
+      "name": "有序列表使用中文顿号",
+      "description": "检查有序列表是否误用中文顿号。",
+      "command": "rg -n '^\\s*\\d+\\s*、\\s' docs/zh"
+    },
+    {
+      "name": "HTML 残留规模",
+      "description": "检查 HTML 残留文件范围。",
+      "command": "rg -l \"zh-cn_topic|cellrowborder\" docs/zh"
+    },
+    {
+      "name": "行尾空格",
+      "description": "检查行尾多余空格。",
+      "command": "rg -n '\\s+$' docs/zh"
+    },
+    {
+      "name": "连续空行",
+      "description": "检查连续空行。",
+      "command": "rg -n '^\\s*$' -A 1 '^\\s*$' docs/zh"
+    }
+  ],
+  "manual_checks": [
+    {
+      "name": "TOC 一致性",
+      "description": "检查 `_toc.yaml` 中的 `href` 路径与 `docs/zh` 下实际文件名一致。"
+    },
+    {
+      "name": "Shell 代码块可一键复制",
+      "description": "抽查 ```shell / ```bash 代码块，确认行首无 `$` / `#` 提示符。"
+    }
+  ]
+}

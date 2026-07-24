@@ -1,0 +1,1 @@
+yum install -y zlib gcc g++ cmake maven make tar git autoconf boost-devel git-lfs

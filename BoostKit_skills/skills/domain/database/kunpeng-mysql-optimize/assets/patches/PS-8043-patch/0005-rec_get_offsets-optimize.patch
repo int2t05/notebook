@@ -1,0 +1,269 @@
+From 623cd8e93adc7f12361126307e96fa3581a009b8 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 30 Sep 2025 16:24:26 +0800
+Subject: [PATCH 5/9] rec_get_offsets optimize
+
+---
+ storage/innobase/page/page0cur.cc |  9 +++++
+ storage/innobase/rem/rec.cc       | 58 +++++++++++++++++++++++++++++++
+ storage/innobase/rem/rec.h        |  8 +++++
+ storage/innobase/row/row0sel.cc   | 56 ++++++++++++++++++++++++++++-
+ 4 files changed, 130 insertions(+), 1 deletion(-)
+
+diff --git a/storage/innobase/page/page0cur.cc b/storage/innobase/page/page0cur.cc
+index 5c8606be2..df4eccafc 100644
+--- a/storage/innobase/page/page0cur.cc
++++ b/storage/innobase/page/page0cur.cc
+@@ -2145,6 +2145,9 @@ void page_copy_rec_list_end_to_created_page(
+   ulint rec_size;
+   byte *log_ptr = nullptr;
+   ulint log_data_len;
++#if defined(__aarch64__) && defined(__linux__)
++  bool compact = dict_table_is_comp(index->table);
++#endif
+   mem_heap_t *heap = nullptr;
+   ulint offsets_[REC_OFFS_NORMAL_SIZE];
+   ulint *offsets = offsets_;
+@@ -2197,8 +2200,14 @@ void page_copy_rec_list_end_to_created_page(
+   n_recs = 0;
+ 
+   do {
++#if defined(__aarch64__) && defined(__linux__)
++    offsets = rec_get_offsets_with_comp(rec, compact, index, offsets,
++                                        ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                        &heap);
++#else
+     offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED,
+                               UT_LOCATION_HERE, &heap);
++#endif
+     insert_rec = rec_copy(heap_top, rec, offsets);
+ 
+     if (page_is_comp(new_page)) {
+diff --git a/storage/innobase/rem/rec.cc b/storage/innobase/rem/rec.cc
+index 6f6973fb7..c9a00da11 100644
+--- a/storage/innobase/rem/rec.cc
++++ b/storage/innobase/rem/rec.cc
+@@ -400,6 +400,64 @@ ulint *rec_get_offsets(const rec_t *rec, const dict_index_t *index,
+   return (offsets);
+ }
+ 
++#if defined(__aarch64__) && defined(__linux__)
++ulint *rec_get_offsets_with_comp(const rec_t *rec, bool compact,
++                                 const dict_index_t *index, ulint *offsets,
++                                 ulint n_fields, ut::Location location,
++                                 mem_heap_t **heap) {
++  ulint n;
++
++  ut_ad(rec);
++  ut_ad(index);
++  ut_ad(heap);
++
++  if (compact) {
++    switch (UNIV_EXPECT(rec_get_status(rec), REC_STATUS_ORDINARY)) {
++      case REC_STATUS_ORDINARY:
++        n = dict_index_get_n_fields(index);
++        break;
++      case REC_STATUS_NODE_PTR:
++        /* Node pointer records consist of the
++        uniquely identifying fields of the record
++        followed by a child page number field. */
++        n = dict_index_get_n_unique_in_tree_nonleaf(index) + 1;
++        break;
++      case REC_STATUS_INFIMUM:
++      case REC_STATUS_SUPREMUM:
++        /* infimum or supremum record */
++        n = 1;
++        break;
++      default:
++        ut_error;
++    }
++  } else {
++    n = rec_get_n_fields_old(rec, index);
++  }
++
++  if (UNIV_UNLIKELY(n_fields < n)) {
++    n = n_fields;
++  }
++
++  /* The offsets header consists of the allocation size at
++  offsets[0] and the REC_OFFS_HEADER_SIZE bytes. */
++  ulint size = n + (1 + REC_OFFS_HEADER_SIZE);
++
++  if (UNIV_UNLIKELY(!offsets) ||
++      UNIV_UNLIKELY(rec_offs_get_n_alloc(offsets) < size)) {
++    if (UNIV_UNLIKELY(!*heap)) {
++      *heap = mem_heap_create(size * sizeof(ulint), location);
++    }
++    offsets = static_cast<ulint *>(mem_heap_alloc(*heap, size * sizeof(ulint)));
++
++    rec_offs_set_n_alloc(offsets, size);
++  }
++
++  rec_offs_set_n_fields(offsets, n);
++  rec_init_offsets(rec, index, offsets);
++  return (offsets);
++}
++#endif
++
+ /** The following function determines the offsets to each field
+  in the record.  It can reuse a previously allocated array. */
+ void rec_get_offsets_reverse(
+diff --git a/storage/innobase/rem/rec.h b/storage/innobase/rem/rec.h
+index 3a6f43628..9c1e08f65 100644
+--- a/storage/innobase/rem/rec.h
++++ b/storage/innobase/rem/rec.h
+@@ -232,6 +232,14 @@ static const uint8_t REC_N_FIELDS_ONE_BYTE_MAX = 0x7F;
+                                      ulint n_fields, ut::Location location,
+                                      mem_heap_t **heap);
+ 
++#if defined(__aarch64__) && defined(__linux__)
++[[nodiscard]] ulint *rec_get_offsets_with_comp(const rec_t *rec, bool compact,
++                                               const dict_index_t *index,
++                                               ulint *offsets, ulint n_fields,
++                                               ut::Location location,
++                                               mem_heap_t **heap);
++#endif
++
+ /** The following function determines the offsets to each field
+  in the record.  It can reuse a previously allocated array. */
+ void rec_get_offsets_reverse(
+diff --git a/storage/innobase/row/row0sel.cc b/storage/innobase/row/row0sel.cc
+index 4e5d50bd4..9ab5101a1 100644
+--- a/storage/innobase/row/row0sel.cc
++++ b/storage/innobase/row/row0sel.cc
+@@ -4801,8 +4801,14 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
+       to prevent phantoms in ORDER BY ... DESC queries */
+       const rec_t *next_rec = page_rec_get_next_const(rec);
+ 
++#if defined(__aarch64__) && defined(__linux__)
++      offsets = rec_get_offsets_with_comp(next_rec, comp, index, offsets,
++                                          ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                          &heap);
++#else
+       offsets = rec_get_offsets(next_rec, index, offsets, ULINT_UNDEFINED,
+                                 UT_LOCATION_HERE, &heap);
++#endif
+       err = sel_set_rec_lock(pcur, next_rec, index, offsets,
+                              prebuilt->select_mode, prebuilt->select_lock_type,
+                              LOCK_GAP, thr, &mtr);
+@@ -4890,8 +4896,14 @@ rec_loop:
+       }
+ 
+       /** Create offsets based on prebuilt index. */
++#if defined(__aarch64__) && defined(__linux__)
++      offsets = rec_get_offsets_with_comp(prev_rec, comp, prebuilt->index,
++                                          offsets, ULINT_UNDEFINED,
++                                          UT_LOCATION_HERE, &heap);
++#else
+       offsets = rec_get_offsets(prev_rec, prebuilt->index, offsets,
+                                 ULINT_UNDEFINED, UT_LOCATION_HERE, &heap);
++#endif
+ 
+       if (row_sel_store_mysql_rec(end_range_cache, prebuilt, prev_rec,
+                                   prev_vrow, clust_templ_for_sec, key_index,
+@@ -4919,8 +4931,14 @@ rec_loop:
+         !dict_index_is_spatial(index)) {
+       /* Try to place a lock on the index record */
+ 
++#if defined(__aarch64__) && defined(__linux__)
++      offsets = rec_get_offsets_with_comp(rec, comp, index, offsets,
++                                          ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                          &heap);
++#else
+       offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED,
+                                 UT_LOCATION_HERE, &heap);
++#endif
+       err = sel_set_rec_lock(pcur, rec, index, offsets, prebuilt->select_mode,
+                              prebuilt->select_lock_type, LOCK_ORDINARY, thr,
+                              &mtr);
+@@ -5011,8 +5029,14 @@ rec_loop:
+   ut_ad(fil_page_index_page_check(pcur->get_page()));
+   ut_ad(btr_page_get_index_id(pcur->get_page()) == index->id);
+ 
++#if defined(__aarch64__) && defined(__linux__)
++  offsets = rec_get_offsets_with_comp(rec, comp, index, offsets,
++                                      ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                      &heap);
++#else
+   offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED,
+                             UT_LOCATION_HERE, &heap);
++#endif
+ 
+   if (UNIV_UNLIKELY(srv_force_recovery > 0 || (index->table->is_corrupt &&
+                                                srv_pass_corrupt_table == 2))) {
+@@ -5504,8 +5528,15 @@ rec_loop:
+       index_entry = row_build_index_entry(clust_row, ext, index, heap);
+       rtr_get_mbr_from_tuple(index_entry, &clust_mbr);
+ 
++#if defined(__aarch64__) && defined(__linux__)
++      index_offsets = rec_get_offsets_with_comp(rec, comp, index, nullptr,
++                                                ULINT_UNDEFINED,
++                                                UT_LOCATION_HERE,
++                                                &heap);
++#else
+       index_offsets = rec_get_offsets(rec, index, nullptr, ULINT_UNDEFINED,
+                                       UT_LOCATION_HERE, &heap);
++#endif
+       rtr_get_mbr_from_rec(rec, index_offsets, &index_mbr);
+ 
+       /* We use mbr_equal_physically() because we are comparing
+@@ -5619,9 +5650,16 @@ rec_loop:
+             rec_offs_init(sec_offsets_);
+             sec_offsets = sec_offsets_;
+           }
++#if defined(__aarch64__) && defined(__linux__)
++          sec_offsets =
++              rec_get_offsets_with_comp(rec, comp, index, sec_offsets,
++                                        ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                        &heap);
++#else
+           sec_offsets =
+               rec_get_offsets(rec, index, sec_offsets, ULINT_UNDEFINED,
+                               UT_LOCATION_HERE, &heap);
++#endif
+         }
+ 
+         if (row_search_end_range_check(next_buf, rec, prebuilt,
+@@ -5660,8 +5698,14 @@ rec_loop:
+       if (result_rec != rec && !prebuilt->need_to_access_clustered) {
+         /* We used 'offsets' for the clust
+         rec, recalculate them for 'rec' */
++#if defined(__aarch64__) && defined(__linux__)
++        offsets = rec_get_offsets_with_comp(rec, comp, index, offsets,
++                                            ULINT_UNDEFINED, UT_LOCATION_HERE,
++                                            &heap);
++#else
+         offsets = rec_get_offsets(rec, index, offsets, ULINT_UNDEFINED,
+                                   UT_LOCATION_HERE, &heap);
++#endif
+         result_rec = rec;
+       }
+ 
+@@ -5814,13 +5858,23 @@ next_rec:
+ 
+         auto heap_tmp = mem_heap_create(256, UT_LOCATION_HERE);
+ 
+-        offsets1 = rec_get_offsets(prev_rec_debug, index, nullptr,
++#if defiend(__aarch64__) && defined(__linux__)
++        offsets1 = rec_get_offsets_with_comp(prev_rec_debug, comp, index,
++                                             nullptr, prev_rec_debug_n_fields,
++                                             UT_LOCATION_HERE, &heap_tmp);
++
++        offsets2 =
++            rec_get_offsets_with_comp(prev_rec, comp, index, nullptr,
++                                      prev_rec_debug_n_fields,
++                                      UT_LOCATION_HERE, &heap_tmp);
++#else        offsets1 = rec_get_offsets(prev_rec_debug, index, nullptr,
+                                    prev_rec_debug_n_fields, UT_LOCATION_HERE,
+                                    &heap_tmp);
+ 
+         offsets2 =
+             rec_get_offsets(prev_rec, index, nullptr, prev_rec_debug_n_fields,
+                             UT_LOCATION_HERE, &heap_tmp);
++#endif
+ 
+         ut_ad(!cmp_rec_rec(prev_rec_debug, prev_rec, offsets1, offsets2, index,
+                            page_is_spatial_non_leaf(prev_rec, index), nullptr,
+-- 
+2.31.1.windows.1
+

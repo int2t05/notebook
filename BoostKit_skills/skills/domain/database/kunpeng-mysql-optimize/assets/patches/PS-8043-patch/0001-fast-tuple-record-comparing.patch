@@ -1,0 +1,484 @@
+From 39a3e2703283f41ee49539ded51a65c2704e0c2d Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Tue, 30 Sep 2025 14:48:45 +0800
+Subject: [PATCH] fast tuple record comparing
+
+---
+ storage/innobase/btr/btr0cur.cc       |  16 +++-
+ storage/innobase/include/data0type.ic |  37 ++++++++
+ storage/innobase/include/page0cur.h   |   7 +-
+ storage/innobase/include/rem0cmp.h    |   4 +
+ storage/innobase/include/rem0cmp.ic   | 131 ++++++++++++++++++++++++++
+ storage/innobase/page/page0cur.cc     |  83 ++++++++++++++--
+ storage/innobase/row/row0sel.cc       |  34 ++++++-
+ 7 files changed, 298 insertions(+), 14 deletions(-)
+
+diff --git a/storage/innobase/btr/btr0cur.cc b/storage/innobase/btr/btr0cur.cc
+index cdbf1003d35..53a7aa8b317 100644
+--- a/storage/innobase/btr/btr0cur.cc
++++ b/storage/innobase/btr/btr0cur.cc
+@@ -701,6 +701,13 @@ void btr_cur_search_to_nth_level(
+   bool mbr_adj = false;
+   bool found = false;
+ 
++  /* Get the partial comparing record from searched dtuple. */
++  const byte* dtuple_rec = nullptr;
++  ulint dtuple_rec_size = 0;
++#ifndef PAGE_CUR_LE_OR_EXTENDS
++  byte dtuple_rec_buf[PARTIAL_FAST_CMP_RECORD_SIZE];
++#endif
++
+   DBUG_TRACE;
+ 
+   mem_heap_t *heap = nullptr;
+@@ -726,6 +733,12 @@ void btr_cur_search_to_nth_level(
+   cursor->low_match = ULINT_UNDEFINED;
+ #endif /* UNIV_DEBUG */
+ 
++#ifndef PAGE_CUR_LE_OR_EXTENDS
++  dtuple_rec =
++    dtuple_fetch_partial_cmp_rec(index, tuple, &dtuple_rec_size,
++                                 dtuple_rec_buf, PARTIAL_FAST_CMP_RECORD_SIZE);
++#endif
++
+   bool s_latch_by_caller = latch_mode & BTR_ALREADY_S_LATCHED;
+   latch_mode &= ~BTR_ALREADY_S_LATCHED;
+ 
+@@ -1295,7 +1308,8 @@ retry_page_get:
+     up_bytes = low_bytes = 0;
+     page_cur_search_with_match(block, index, tuple, page_mode, &up_match,
+                                &low_match, page_cursor,
+-                               need_path ? cursor->rtr_info : nullptr);
++                               need_path ? cursor->rtr_info : nullptr,
++                               dtuple_rec, dtuple_rec_size);
+   }
+ 
+   if (estimate) {
+diff --git a/storage/innobase/include/data0type.ic b/storage/innobase/include/data0type.ic
+index 797a3a54cd5..218864a6e92 100644
+--- a/storage/innobase/include/data0type.ic
++++ b/storage/innobase/include/data0type.ic
+@@ -589,6 +589,43 @@ static inline ulint dtype_get_sql_null_size(
+ #endif /* !UNIV_HOTBACKUP */
+ }
+ 
++/** Whether or not the type is deterministric in memory conparing.
++ @param[in]   dtype   the dtype of one dtuple.
++ @return  true  if the dtype is deterministric in memory comparing. */
++static ALWAYS_INLINE bool dtype_is_memcmp_deterministric(const dtype_t *&dtype) {
++  switch (dtype->mtype) {
++    case DATA_FIXBINARY:
++    case DATA_BINARY:
++    case DATA_INT:
++    case DATA_SYS_CHILD:
++    case DATA_SYS:
++      return true;
++
++    case DATA_POINT:
++    case DATA_VAR_POINT:
++    case DATA_GEOMETRY: {
++      if (dtype->prtype & DATA_GIS_MBR) {
++        return false;
++      }
++
++      return true;
++    }
++
++    case DATA_BLOB: {
++      if (dtype->prtype & DATA_BINARY_TYPE) {
++        return true;
++      }
++
++      return false;
++    }
++
++    default:
++      return false;
++  }
++
++  return false;
++}
++
+ /**
+ Calculates the number of extra bytes needed for compression header
+ depending on precise column type.
+diff --git a/storage/innobase/include/page0cur.h b/storage/innobase/include/page0cur.h
+index 120b76b569a..65d77e64b04 100644
+--- a/storage/innobase/include/page0cur.h
++++ b/storage/innobase/include/page0cur.h
+@@ -240,7 +240,9 @@ static inline ulint page_cur_search(const buf_block_t *block,
+ @param[in,out] iup_matched_fields Already matched fields in upper limit record
+ @param[in,out] ilow_matched_fields Already matched fields in lower limit record
+ @param[out] cursor Page cursor
+-@param[in,out] rtr_info Rtree search stack */
++@param[in,out] rtr_info Rtree search stack
++@param[in] tuple_rec the partial record for tuple fast comparing
++@param[in] tuple_rec_size  the size of tuple_rec. */
+ void page_cur_search_with_match(const buf_block_t *block,
+                                 const dict_index_t *index,
+                                 const dtuple_t *tuple, page_cur_mode_t mode,
+@@ -248,7 +250,8 @@ void page_cur_search_with_match(const buf_block_t *block,
+ 
+                                 ulint *ilow_matched_fields,
+ 
+-                                page_cur_t *cursor, rtr_info_t *rtr_info);
++                                page_cur_t *cursor, rtr_info_t *rtr_info,
++                                const byte *tuple_rec = nullptr, ulint tuple_rec_size = 0);
+ 
+ /** Search the right position for a page cursor.
+ @param[in]      block                   buffer block
+diff --git a/storage/innobase/include/rem0cmp.h b/storage/innobase/include/rem0cmp.h
+index c6cd8accb99..efbb936b25a 100644
+--- a/storage/innobase/include/rem0cmp.h
++++ b/storage/innobase/include/rem0cmp.h
+@@ -44,6 +44,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
+ /** Disable the min flag during row comparisons. */
+ constexpr auto DISABLE_MIN_REC_FLAG_CHECK = ULINT_UNDEFINED;
+ 
++/** The buffer size of partial fast record comparing. if the paritial comparing
++size is greater than this, we will disable it */
++constexpr size_t PARTIAL_FAST_CMP_RECORD_SIZE = 255;
++
+ // Forward declaration
+ namespace dd {
+ class Spatial_reference_system;
+diff --git a/storage/innobase/include/rem0cmp.ic b/storage/innobase/include/rem0cmp.ic
+index d8e24aab170..8eef9aac094 100644
+--- a/storage/innobase/include/rem0cmp.ic
++++ b/storage/innobase/include/rem0cmp.ic
+@@ -165,4 +165,135 @@ static inline bool cmp_dfield_dfield_eq_prefix(const dfield_t *dfield1,
+ 
+   return (false);
+ }
++
++/** Fetch the 'record' only contains fields participated in comparing from
++ the complete dtuple record.
++ @param[in]     index       the index owned the record
++ @param[in]     dtuple      the complete dtuple record
++ @param[out]    size        the size of 'fast cmp rec'
++ @param[in]     buf         the memory buffer for the 'fast cmp rec' if needed
++ @param[in]     buf_size    the buffer size.
++ @return  the partial record of dtuple for comparing. */
++ALWAYS_INLINE byte* dtuple_fetch_partial_cmp_rec(const dict_index_t *index,
++  const dtuple_t *dtuple,
++  ulint *size, byte* buf,
++  ulint buf_size) {
++  ut_ad(size != nullptr);
++  ut_ad(buf != nullptr);
++  byte *last_pos = nullptr;
++  bool inplace_rec = true;
++
++  ulint info_bits = dtuple_get_info_bits(dtuple);
++
++  if (!index->cached || !dict_table_is_comp(index->table) ||
++      index->has_instant_cols_or_row_versions() || dtuple->n_fields == 0 ||
++      (info_bits & REC_INFO_MIN_REC_FLAG)) {
++    return nullptr;
++  }
++
++  *size = 0;
++
++  for (ulint i = 0; i < dtuple_get_n_fields_cmp(dtuple); i++) {
++    const dfield_t *dfield = dtuple_get_nth_field(dtuple, i);
++    const dtype_t *field_type = dfield_get_type(dfield);
++    const dict_field_t *field = index->get_field(i);
++
++    if (dfield->len != field->fixed_len || !(field->col->prtype & DATA_NOT_NULL) ||
++        !dtype_is_memcmp_deterministric(field_type) || dfield_is_multi_value(dfield) ||
++        !field->is_ascending) {
++      return nullptr;
++    }
++
++    if (inplace_rec && i < dtuple_get_n_fields_cmp(dtuple) - 1) {
++      last_pos = static_cast<byte *>(dfield->data);
++      byte* next_field = static_cast<byte *>(dtuple_get_nth_field(dtuple, i + 1)->data);
++
++      /* those fields in record is not continus, should copy those fields into buf. */
++      if (last_pos + dfield->len != next_field) {
++        inplace_rec = false;
++      }
++    }
++
++    *size += dfield->len;
++  }
++
++  if (inplace_rec) {
++    return static_cast<byte *>(dtuple_get_nth_field(dtuple, 0)->data);
++  }
++
++  if (*size > buf_size) {
++    return nullptr;
++  }
++
++  byte *ptr = buf;
++  for (ulint i = 0; i < dtuple_get_n_fields_cmp(dtuple); i++) {
++    const dfield_t *dfield = dtuple_get_nth_field(dtuple, i);
++    ut_memcpy(ptr, dfield->data, dfield->len);
++    ptr += dfield->len;
++  }
++
++  return buf;
++}
++
++/** Directly compare record's memory without collocation.
++ @param[in]   rec1          the first record for memory comparing
++ @param[in]   rec2          the second record for memory comparing
++ @param[in]   len           the minimum length of the comparing records
++ @param[out]  matched_bytes matched length the two records.
++ @return  the memory comparing result. */
++static inline int rec_direct_memcmp(const byte *rec1, const byte *rec2,
++                                    ulint len, ulint *matched_bytes) {
++  ut_ad(matched_bytes != nullptr);
++  for (ulint i = 0; i < len; i++) {
++    int cmp =  (int)(*rec1) - (int)(*rec2);
++    if (cmp != 0) {
++      *matched_bytes = i;
++      return cmp;
++    }
++
++    rec1++;
++    rec2++;
++  }
++
++  *matched_bytes = len;
++  return 0;
++}
++
++/** convert matched fields to matched bytes in dtuple record comparing.
++ @param[in]   dtuple          the tuple record.
++ @param[in]   matched_fields  the comparing matched fields in tuple comparing.
++ @return matched bytes. */
++static inline int dtuple_matched_fields_to_bytes(const dtuple_t *dtuple,
++                                                 ulint matched_fields) {
++  ulint matched_bytes = 0;
++  ut_ad(matched_fields <= dtuple_get_n_fields_cmp(dtuple));
++
++  for (ulint i = 0; i < matched_fields; i++) {
++    matched_bytes += dtuple_get_nth_field(dtuple, i)->len;
++  }
++
++  return matched_bytes;
++}
++
++/** convert matched bytes to matched fields in dtuple record comparing.
++ @param[in]   dtuple        the tuple record.
++ @param[in]   matched_bytes the comparing matched bytes in tuple comparing.
++ @return matched fields. */
++static inline int dtuple_matched_bytes_to_fields(const dtuple_t *dtuple,
++                                                 ulint matched_bytes) {
++  ulint matched_fields = 0;
++
++  for (; matched_fields < dtuple_get_n_fields_cmp(dtuple); matched_fields++) {
++
++    const dfield_t *dfield = dtuple_get_nth_field(dtuple, matched_fields);
++    if (matched_bytes < dfield->len) {
++      return matched_fields;
++    }
++
++    matched_bytes -= dfield->len;
++  }
++
++  return matched_fields;
++}
++
+ #endif /* UNIV_HOTBACKUP */
+diff --git a/storage/innobase/page/page0cur.cc b/storage/innobase/page/page0cur.cc
+index fdb630c230c..5c8606be23f 100644
+--- a/storage/innobase/page/page0cur.cc
++++ b/storage/innobase/page/page0cur.cc
+@@ -324,7 +324,9 @@ static bool page_cur_has_null(const rec_t *rec, const dict_index_t *index) {
+ @param[in,out] iup_matched_fields Already matched fields in upper limit record
+ @param[in,out] ilow_matched_fields Already matched fields in lower limit record
+ @param[out] cursor Page cursor
+-@param[in,out] rtr_info Rtree search stack */
++@param[in,out] rtr_info Rtree search stack
++@param[in] tuple_rec the partial record for tuple fast comparing
++@param[in] tuple_rec_size  the size of tuple_rec. */
+ void page_cur_search_with_match(const buf_block_t *block,
+                                 const dict_index_t *index,
+                                 const dtuple_t *tuple, page_cur_mode_t mode,
+@@ -332,7 +334,8 @@ void page_cur_search_with_match(const buf_block_t *block,
+ 
+                                 ulint *ilow_matched_fields,
+ 
+-                                page_cur_t *cursor, rtr_info_t *rtr_info) {
++                                page_cur_t *cursor, rtr_info_t *rtr_info,
++                                const byte *tuple_rec, ulint tuple_rec_size) {
+   ulint up;
+   ulint low;
+   ulint mid;
+@@ -414,8 +417,15 @@ void page_cur_search_with_match(const buf_block_t *block,
+   the page. We want to position the cursor on the first X which
+   satisfies the condition. */
+ 
+-  up_matched_fields = *iup_matched_fields;
+-  low_matched_fields = *ilow_matched_fields;
++  if (tuple_rec != nullptr) {
++    up_matched_fields =
++        dtuple_matched_fields_to_bytes(tuple, *iup_matched_fields);
++    low_matched_fields =
++        dtuple_matched_fields_to_bytes(tuple, *ilow_matched_fields);
++  } else {
++    up_matched_fields = *iup_matched_fields;
++    low_matched_fields = *ilow_matched_fields;
++  }
+ 
+   /* Perform binary search. First the search is done through the page
+   directory, after that as a linear search in the list of records
+@@ -492,9 +502,30 @@ void page_cur_search_with_match(const buf_block_t *block,
+ 
+     cur_matched_fields = std::min(low_matched_fields, up_matched_fields);
+ 
+-    auto offsets = get_mid_rec_offsets();
++    const ulint * offsets = offsets_;
++
++    if (tuple_rec == nullptr) {
++      offsets = get_mid_rec_offsets();
++      cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
++    } else {
++      ulint matched_bytes = 0;
++      cmp = rec_direct_memcmp(tuple_rec + cur_matched_fields,
++                              mid_rec + cur_matched_fields,
++                              tuple_rec_size - cur_matched_fields,
++                              &matched_bytes);
++      cur_matched_fields += matched_bytes;
+ 
+-    cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
++#ifdef UNIV_DEBUG
++      ulint rec_info = rec_get_info_bits(mid_rec,
++                                         dict_table_is_comp(index->table));
++      ut_ad(!(rec_info & REC_INFO_MIN_REC_FLAG));
++      offsets = get_mid_rec_offsets();
++      int cmp2 = cmp_dtuple_rec(tuple, mid_rec, index, offsets);
++      ut_ad((cmp > 0 && cmp2 > 0) ||
++            (cmp == 0 && cmp2 ==0) ||
++            (cmp < 0 && cmp2 < 0));
++#endif
++    }
+ 
+     if (cmp > 0) {
+     low_slot_match:
+@@ -537,9 +568,32 @@ void page_cur_search_with_match(const buf_block_t *block,
+ 
+     cur_matched_fields = std::min(low_matched_fields, up_matched_fields);
+ 
+-    auto offsets = get_mid_rec_offsets();
++    const ulint * offsets = offsets_;
++    if (tuple_rec == nullptr) {
++      offsets = get_mid_rec_offsets();
++      cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
++    } else {
++      ulint rec_info = rec_get_info_bits(mid_rec,
++                                         dict_table_is_comp(index->table));
++      if (likely(!(rec_info & REC_INFO_MIN_REC_FLAG))) {
++        ulint matched_bytes = 0;
++        cmp = rec_direct_memcmp(tuple_rec + cur_matched_fields,
++                                mid_rec + cur_matched_fields,
++                                tuple_rec_size - cur_matched_fields,
++                                &matched_bytes);
++        cur_matched_fields += matched_bytes;
++      } else {
++        cmp = 1;
++      }
+ 
+-    cmp = tuple->compare(mid_rec, index, offsets, &cur_matched_fields);
++#ifdef UNIV_DEBUG
++      offsets = get_mid_rec_offsets();
++      int cmp2 = cmp_dtuple_rec(tuple, mid_rec, index, offsets);
++      ut_ad((cmp > 0 && cmp2 > 0) ||
++            (cmp == 0 && cmp2 ==0) ||
++            (cmp < 0 && cmp2 < 0));
++#endif
++    }
+ 
+     if (cmp > 0) {
+     low_rec_match:
+@@ -575,6 +629,7 @@ void page_cur_search_with_match(const buf_block_t *block,
+         mtr_commit(&mtr);
+ #endif
+ 
++        ut_ad(tuple_rec == nullptr);
+         cur_matched_fields = dtuple_get_n_fields_cmp(tuple);
+       }
+ 
+@@ -590,8 +645,16 @@ void page_cur_search_with_match(const buf_block_t *block,
+     page_cur_position(low_rec, block, cursor);
+   }
+ 
+-  *iup_matched_fields = up_matched_fields;
+-  *ilow_matched_fields = low_matched_fields;
++  if (tuple_rec != nullptr) {
++    *iup_matched_fields =
++        dtuple_matched_bytes_to_fields(tuple, up_matched_fields);
++    *ilow_matched_fields =
++        dtuple_matched_bytes_to_fields(tuple, low_matched_fields);
++  } else {
++    *iup_matched_fields = up_matched_fields;
++    *ilow_matched_fields = low_matched_fields;
++  }
++
+   if (UNIV_LIKELY_NULL(heap)) {
+     mem_heap_free(heap);
+   }
+diff --git a/storage/innobase/row/row0sel.cc b/storage/innobase/row/row0sel.cc
+index bcd8fdf1c6e..51226ca379e 100644
+--- a/storage/innobase/row/row0sel.cc
++++ b/storage/innobase/row/row0sel.cc
+@@ -4352,6 +4352,13 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
+   bool use_clustered_index = false;
+   ulint end_loop = 0;
+ 
++  /* Get the partial comparing record from searched dtuple. */
++  const byte* dtuple_rec = nullptr;
++  ulint dtuple_rec_size = 0;
++#ifndef PAGE_CUR_LE_OR_EXTENDS
++  byte dtuple_rec_buf[PARTIAL_FAST_CMP_RECORD_SIZE];
++#endif
++
+   rec_offs_init(offsets_);
+ 
+   ut_ad(index && pcur && search_tuple);
+@@ -4517,6 +4524,12 @@ dberr_t row_search_mvcc(byte *buf, page_cur_mode_t mode,
+     goto func_exit;
+   }
+ 
++#ifndef PAGE_CUR_LE_OR_EXTENDS
++  dtuple_rec =
++    dtuple_fetch_partial_cmp_rec(index, search_tuple, &dtuple_rec_size,
++                                 dtuple_rec_buf, PARTIAL_FAST_CMP_RECORD_SIZE);
++#endif
++
+   mtr_start(&mtr);
+ 
+   /*-------------------------------------------------------------*/
+@@ -5036,7 +5049,26 @@ rec_loop:
+ 
+     /* fputs("Comparing rec and search tuple\n", stderr); */
+ 
+-    if (0 != cmp_dtuple_rec(search_tuple, rec, index, offsets)) {
++    int cmp = -1;
++    if (dtuple_rec != nullptr) {
++      ulint info = rec_get_info_bits(rec, dict_table_is_comp(index->table));
++      if (info & REC_INFO_MIN_REC_FLAG) {
++        cmp = 1;
++      } else {
++        cmp = ut_memcmp(dtuple_rec, rec, dtuple_rec_size);
++      }
++
++#ifdef UNIV_DEBUG
++      int cmp2 = cmp_dtuple_rec(search_tuple, rec, index, offsets);
++      ut_ad((cmp > 0 && cmp2 > 0) ||
++            (cmp == 0 && cmp2 ==0) ||
++            (cmp < 0 && cmp2 < 0));
++#endif
++    } else {
++      cmp = cmp_dtuple_rec(search_tuple, rec, index, offsets);
++    }
++
++    if (0 != cmp) {
+       if (set_also_gap_locks && !trx->skip_gap_locks() &&
+           prebuilt->select_lock_type != LOCK_NONE &&
+           !dict_index_is_spatial(index)) {
+-- 
+2.27.0
+

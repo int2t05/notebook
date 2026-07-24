@@ -1,0 +1,62 @@
+{
+  "skill_name": "knowledge-base",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "整理成知识卡片：SVE2 的 compact 指令可以把 bitmap 位提取从串行变并行，microbench 显示 2-4x 加速",
+      "expected_output": "创建一张知识卡片到 {knowledge_root}/<category>/ 目录，含 frontmatter (title, category, tags, created, related, source)，更新 INDEX.md 和分类 _INDEX.md",
+      "files": [],
+      "assertions": [
+        "输出包含卡片文件路径",
+        "卡片包含 --- frontmatter ---",
+        "INDEX.md 被更新（新增一行）",
+        "分类 _INDEX.md 被更新"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/kb search bitmap",
+      "expected_output": "搜索 {knowledge_root} 目录下所有包含 'bitmap' 的卡片，列出命中卡片的标题、标签和摘要",
+      "files": [],
+      "assertions": [
+        "输出列出匹配的卡片标题",
+        "输出包含卡片的 tags",
+        "输出包含文件路径"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "/kb list",
+      "expected_output": "列出知识库所有分类目录和卡片计数",
+      "files": [],
+      "assertions": [
+        "输出包含分类名称",
+        "输出包含每个分类的卡片数",
+        "输出包含总计"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "/kb index",
+      "expected_output": "扫描所有 .md 卡片文件，重建 INDEX.md 和各分类 _INDEX.md",
+      "files": [],
+      "assertions": [
+        "INDEX.md 内容与实际卡片一致",
+        "每个含卡片的分类目录都有 _INDEX.md",
+        "输出报告处理了多少张卡片"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "写一张知识卡片到 workflow/token-saving.md：对比问答后整理 vs 直接输出 MD 的 token 消耗",
+      "expected_output": "在 {knowledge_root}/workflow/ 下创建 token-saving.md，若目录不存在则自动创建，卡片含标准 frontmatter，更新两层索引",
+      "files": [],
+      "assertions": [
+        "workflow/ 目录被创建",
+        "token-saving.md 存在且含 frontmatter",
+        "INDEX.md 新增 workflow 分类条目",
+        "workflow/_INDEX.md 被创建或更新"
+      ]
+    }
+  ]
+}

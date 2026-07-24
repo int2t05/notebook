@@ -1,0 +1,62 @@
+From 5bf49776158efe6b50352730f9a0bfe3907bf192 Mon Sep 17 00:00:00 2001
+From: zheng_yuanyue <1139292071@qq.com>
+Date: Mon, 28 Jul 2025 20:02:52 +0800
+Subject: [PATCH] non-aligned memory access optimize for aarch64
+
+---
+ include/my_byteorder.h          | 2 +-
+ storage/innobase/rem/rem0cmp.cc | 4 ++--
+ strings/ctype.c                 | 2 +-
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/include/my_byteorder.h b/include/my_byteorder.h
+index ba10f55b..579b8d46 100644
+--- a/include/my_byteorder.h
++++ b/include/my_byteorder.h
+@@ -34,7 +34,7 @@
+   format (low byte first). There are 'korr' (assume 'corrector') variants
+   for integer types, but 'get' (assume 'getter') for floating point types.
+ */
+-#if defined(__i386__) || defined(_WIN32) || defined(__x86_64__)
++#if defined(__i386__) || defined(_WIN32) || defined(__x86_64__) || defined(__aarch64__)
+ #include "byte_order_generic_x86.h"
+ #else
+ #include "byte_order_generic.h"
+diff --git a/storage/innobase/rem/rem0cmp.cc b/storage/innobase/rem/rem0cmp.cc
+index 50e9a1fe..1cfddc55 100644
+--- a/storage/innobase/rem/rem0cmp.cc
++++ b/storage/innobase/rem/rem0cmp.cc
+@@ -490,7 +490,7 @@ cmp_data(
+ 	}
+ 
+ 	if (len) {
+-#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64
++#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64 || defined __aarch64__
+ 		/* Compare the first bytes with a loop to avoid the call
+ 		overhead of memcmp(). On x86 and x86-64, the GCC built-in
+ 		(repz cmpsb) seems to be very slow, so we will be calling the
+@@ -529,7 +529,7 @@ cmp_data(
+ 
+ 			data1 += len;
+ 			data2 += len;
+-#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64
++#if defined __i386__ || defined __x86_64__ || defined _M_IX86 || defined _M_X64 || defined __aarch64__
+ 		}
+ #endif /* IA32 or AMD64 */
+ 	}
+diff --git a/strings/ctype.c b/strings/ctype.c
+index e420172b..621e4a16 100644
+--- a/strings/ctype.c
++++ b/strings/ctype.c
+@@ -1051,7 +1051,7 @@ my_convert(char *to, size_t to_length, const CHARSET_INFO *to_cs,
+ 
+   length= length2= MY_MIN(to_length, from_length);
+ 
+-#if defined(__i386__)
++#if defined(__i386__) || defined(__aarch64__)
+   /*
+     Special loop for i386, it allows to refer to a
+     non-aligned memory block as UINT32, which makes
+-- 
+2.31.1.windows.1
+

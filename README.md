@@ -13,19 +13,40 @@ omni学习用的前端网页
 
 #  需求
 表达式开发涉及三个主要仓库：
+
 Adaptor:A 
+
 https://gitcode.com/openeuler/OmniAdaptor
+
 Operator:O
+
 https://gitcode.com/openeuler/OmniOperator
+
 Stream: S
+
 https://gitcode.com/openeuler/OmniStream
+
 ## 实习生已开发的需求：
+在fork仓库的分支：
+
+https://gitcode.com/int2t/OmniOperator
+
+https://gitcode.com/int2t/OmniStream
+
+https://gitcode.com/int2t/OmniAdaptor
+
 IFNULL  已合入A 完成
+
 LEFT/RIGHT 已合入O  待解决A(等待重构)
+
 (NOT)  BETWEEN 已提O 待提A
+
 (NOT) LIKE 待提A
+
 (NOT) SIMILAR 已提O 待提A
+
 (NOT)  IN 待提A
+
 EXIST 已提S 待提A
 
 本地fork这三个仓库
@@ -57,8 +78,9 @@ https://gitcode.com/dashboard
 
 ## 远程服务器信息
 前置软件：UniVpn Xshell
-服务器环境：
-两个文件
+
+服务器环境(用于开发和测试)：两个文件教程配置
+
 动态验证码申请：朱天伟
 
 ## 密码
@@ -67,5 +89,6 @@ ssh root@193.65.4.2
 
 
 # 咨询
-开发问题咨询： 李嘉荣
+开发问题咨询：李嘉荣
+
 其他问题咨询pl: 朱天伟

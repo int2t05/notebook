@@ -1,0 +1,34 @@
+-- 表达式测试模板 — <FUNC_NAME> native vs vanilla 黄金对比
+-- 本地存放: flink-test/test/<EXPR_NAME>/<EXPR_NAME>.sql (csv path 须为 /tmp/<EXPR_NAME>.csv)
+-- 语义: <FUNC_SEMANTICS> (参考 flink/docs/data/sql_functions.yml)
+-- 向量化实现: <REGISTER_LOCATION> (OmniOperator Register*.cpp + vectorization/functions/*.h)
+-- 注册名核对: RegisterFunction(prefix + "<REGISTER_NAME>", ...) 必须与 SQL <FUNC_NAME> 一致
+--   反例: char_length 注册名是 "length"(RegisterString.cpp:42), SQL 用 char_length -> not supported
+
+SET 'parallelism.default' = '1';
+SET 'table.local-time-zone' = 'UTC';
+
+CREATE TABLE src (
+  row_id STRING,
+  x      <INPUT_TYPE>
+) WITH (
+  'connector' = 'filesystem',
+  'path' = '/tmp/<EXPR_NAME>.csv',
+  'format' = 'csv',
+  'csv.null-literal' = 'null'
+);
+
+CREATE TABLE sink (
+  row_id STRING,
+  r      <OUTPUT_TYPE>
+) WITH ('connector' = 'print');
+
+INSERT INTO sink
+SELECT row_id, CAST(<FUNC_NAME>(x) AS <OUTPUT_TYPE>)
+FROM src;
+
+-- 期望输出 (按 row_id 对照, 用于人工核对 + vanilla 基准):
+-- r01 | <EXPECTED_1>
+-- r02 | <EXPECTED_2>
+-- r03 | NULL          -- NULL 传播
+-- r04 | <EXPECTED_4>  -- 边界/越界 (如 NaN)

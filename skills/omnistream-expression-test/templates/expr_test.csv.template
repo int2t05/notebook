@@ -1,0 +1,9 @@
+# CSV 输入模板 — 适配任意表达式 (复制时去掉本行注释)
+# 本地存放: flink-test/test/<EXPR_NAME>/<EXPR_NAME>.csv (run_local.sh 会 scp 到 /tmp/<EXPR_NAME>.csv)
+# 占位符按表达式入参填; 建议覆盖: 正常值 / 边界值 / NULL / 越界(如 ACOS(2.0)->NaN)
+# null 由 sql 的 csv.null-literal='null' 表示为 NULL
+# 参考: csv_test/acos/verify_expr_acos.csv
+r01,<NORMAL_VALUE>
+r02,<BOUNDARY_VALUE>
+r03,null
+r04,<EDGE_OR_OUT_OF_DOMAIN_VALUE>
